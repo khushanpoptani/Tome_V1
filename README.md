@@ -5,10 +5,12 @@ client keeps repositories and deterministic execution on the user's machine whil
 delegating all AI reasoning to agents hosted by an Ollama server.
 
 This repository contains the production-ready project foundation and functional desktop
-shell. Navigation, local records, settings, server management, Ollama model management,
-streaming chat, history, task progress, and diagnostic logging are operational. AI agents,
-training, datasets, code generation, repair, and deterministic execution workflows remain
-intentionally deferred.
+shell. Navigation, project-owned chat trees, local records, settings, server management,
+Ollama model management, streaming chat, history, task progress, and diagnostic logging
+are operational. Dataset validation, resumable upload sessions, training job
+orchestration, monitoring, resources, and logs are implemented against an external
+Training Manager contract. AI agents, actual fine-tuning, code generation, repair, and
+deterministic execution workflows remain intentionally deferred.
 
 ## Architecture at a glance
 
@@ -16,6 +18,7 @@ intentionally deferred.
 flowchart LR
     User --> Desktop["Tome desktop client"]
     Desktop <-->|"HTTP + WebSocket"| Ollama["Ollama server"]
+    Desktop <-->|"tome-training/v1"| Training["External Training Manager"]
     Desktop --> Local["Local repository + SQLite"]
 
     subgraph Client["Deterministic client services"]
@@ -84,6 +87,10 @@ pnpm rust:check
 
 The architecture summary, open decisions, repository map, and staged delivery plan are in
 [`docs/`](docs/).
+
+The external training protocol, upload state machine, monitoring behavior, and security
+boundary are documented in
+[`docs/architecture/training-management.md`](docs/architecture/training-management.md).
 
 ## Supported release targets
 

@@ -60,6 +60,7 @@ function ollamaImages(attachments: readonly Attachment[]): string[] {
 
 export function ChatPage(): React.JSX.Element {
   const activeConversation = useShellStore((state) => state.activeConversation);
+  const activeProject = useShellStore((state) => state.activeProject);
   const activeServer = useShellStore((state) => state.activeServer);
   const pendingPrompt = useShellStore((state) => state.pendingPrompt);
   const selectedModel = useShellStore((state) => state.selectedModel);
@@ -102,6 +103,7 @@ export function ChatPage(): React.JSX.Element {
       if (activeConversation === null) {
         conversation = await backend.saveConversation({
           model: selectedModel,
+          projectId: activeProject?.id ?? null,
           title:
             prompt.text.trim().slice(0, 64) ||
             prompt.attachments[0]?.name ||
@@ -190,6 +192,7 @@ export function ChatPage(): React.JSX.Element {
     });
   }, [
     activeConversation,
+    activeProject?.id,
     activeServer,
     messages.data,
     pendingPrompt,

@@ -147,12 +147,190 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
         INSERT OR IGNORE INTO schema_migrations(version, applied_at)
         VALUES (2, datetime('now'));
         "#,
+    )?;
+
+    let has_v3 = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 3)",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if has_v3 {
+        return Ok(());
+    }
+
+    connection.execute_batch(
+        r#"
+        PRAGMA foreign_keys = OFF;
+        BEGIN IMMEDIATE;
+
+        CREATE TABLE projects_v3 (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT,
+            name TEXT NOT NULL,
+            path TEXT NOT NULL,
+            archived_at TEXT,
+            duplicate_of TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_opened_at TEXT NOT NULL,
+            FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE SET NULL,
+            FOREIGN KEY(duplicate_of) REFERENCES projects_v3(id) ON DELETE SET NULL
+        );
+
+        INSERT INTO projects_v3(
+            id, workspace_id, name, path, archived_at, duplicate_of,
+            created_at, updated_at, last_opened_at
+        )
+        SELECT id, workspace_id, name, path, NULL, NULL,
+               created_at, updated_at, last_opened_at
+        FROM projects;
+
+        DROP TABLE projects;
+        ALTER TABLE projects_v3 RENAME TO projects;
+        CREATE INDEX idx_projects_archived ON projects(archived_at, last_opened_at DESC);
+
+        ALTER TABLE conversations
+            ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL;
+        ALTER TABLE conversations ADD COLUMN archived_at TEXT;
+        ALTER TABLE conversations
+            ADD COLUMN duplicate_of TEXT REFERENCES conversations(id) ON DELETE SET NULL;
+        CREATE INDEX idx_conversations_project
+            ON conversations(project_id, archived_at, updated_at DESC);
+
+        CREATE TABLE training_servers (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL UNIQUE,
+            adapter TEXT NOT NULL DEFAULT 'tome-training-v1',
+            credential_ref TEXT,
+            is_active INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'unknown',
+            version TEXT,
+            capabilities_json TEXT NOT NULL DEFAULT '{}',
+            last_error TEXT,
+            last_checked_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE training_datasets (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            artifact_path TEXT,
+            format TEXT NOT NULL,
+            size INTEGER NOT NULL DEFAULT 0,
+            file_count INTEGER NOT NULL DEFAULT 0,
+            checksum TEXT,
+            compressed INTEGER NOT NULL DEFAULT 0,
+            validation_status TEXT NOT NULL DEFAULT 'pending',
+            validation_errors_json TEXT NOT NULL DEFAULT '[]',
+            preview TEXT,
+            remote_dataset_id TEXT,
+            training_server_id TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(training_server_id) REFERENCES training_servers(id) ON DELETE SET NULL
+        );
+        CREATE INDEX idx_training_datasets_updated
+            ON training_datasets(updated_at DESC);
+
+        CREATE TABLE dataset_uploads (
+            id TEXT PRIMARY KEY,
+            dataset_id TEXT NOT NULL,
+            training_server_id TEXT NOT NULL,
+            remote_upload_id TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            bytes_uploaded INTEGER NOT NULL DEFAULT 0,
+            total_bytes INTEGER NOT NULL DEFAULT 0,
+            chunk_size INTEGER NOT NULL DEFAULT 4194304,
+            speed_bps REAL NOT NULL DEFAULT 0,
+            eta_seconds INTEGER,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            started_at TEXT,
+            finished_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(dataset_id) REFERENCES training_datasets(id) ON DELETE CASCADE,
+            FOREIGN KEY(training_server_id) REFERENCES training_servers(id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_dataset_uploads_status
+            ON dataset_uploads(status, updated_at DESC);
+
+        CREATE TABLE training_jobs (
+            id TEXT PRIMARY KEY,
+            training_server_id TEXT,
+            remote_job_id TEXT,
+            dataset_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            backend TEXT NOT NULL,
+            parameters_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'draft',
+            stage TEXT NOT NULL DEFAULT 'Draft',
+            progress REAL NOT NULL DEFAULT 0,
+            eta_seconds INTEGER,
+            started_at TEXT,
+            finished_at TEXT,
+            gpu_usage REAL,
+            cpu_usage REAL,
+            ram_usage INTEGER,
+            disk_usage INTEGER,
+            current_epoch INTEGER NOT NULL DEFAULT 0,
+            total_epochs INTEGER NOT NULL DEFAULT 0,
+            loss REAL,
+            learning_rate REAL,
+            heartbeat_at TEXT,
+            warning TEXT,
+            error TEXT,
+            retry_of TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(training_server_id) REFERENCES training_servers(id) ON DELETE SET NULL,
+            FOREIGN KEY(dataset_id) REFERENCES training_datasets(id) ON DELETE RESTRICT,
+            FOREIGN KEY(retry_of) REFERENCES training_jobs(id) ON DELETE SET NULL
+        );
+        CREATE INDEX idx_training_jobs_status
+            ON training_jobs(status, updated_at DESC);
+
+        CREATE TABLE training_resources (
+            training_server_id TEXT PRIMARY KEY,
+            gpu_json TEXT NOT NULL DEFAULT '[]',
+            cpu_usage REAL,
+            ram_total INTEGER,
+            ram_used INTEGER,
+            disk_total INTEGER,
+            disk_used INTEGER,
+            queue_length INTEGER NOT NULL DEFAULT 0,
+            captured_at TEXT NOT NULL,
+            FOREIGN KEY(training_server_id) REFERENCES training_servers(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE training_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            training_job_id TEXT,
+            level TEXT NOT NULL,
+            message TEXT NOT NULL,
+            cursor TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(training_job_id) REFERENCES training_jobs(id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_training_logs_job
+            ON training_logs(training_job_id, id DESC);
+
+        INSERT INTO schema_migrations(version, applied_at)
+        VALUES (3, datetime('now'));
+
+        COMMIT;
+        PRAGMA foreign_keys = ON;
+        "#,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::open_connection;
+    use rusqlite::Connection;
     use std::path::Path;
 
     #[test]
@@ -160,5 +338,53 @@ mod tests {
         let connection = open_connection(Path::new(":memory:"));
 
         assert!(connection.is_ok());
+    }
+
+    #[test]
+    fn installs_project_hierarchy_and_training_schema() {
+        let connection = open_connection(Path::new(":memory:")).expect("database should open");
+
+        let version = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("schema version should be readable");
+        assert_eq!(version, 3);
+        for table in [
+            "training_servers",
+            "training_datasets",
+            "dataset_uploads",
+            "training_jobs",
+            "training_resources",
+            "training_logs",
+        ] {
+            assert!(has_table(&connection, table), "missing table {table}");
+        }
+        assert!(has_column(&connection, "projects", "archived_at"));
+        assert!(has_column(&connection, "conversations", "project_id"));
+    }
+
+    fn has_table(connection: &Connection, table: &str) -> bool {
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+                 )",
+                [table],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok_and(|value| value == 1)
+    }
+
+    fn has_column(connection: &Connection, table: &str, column: &str) -> bool {
+        connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .and_then(|mut statement| {
+                let values = statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(values)
+            })
+            .is_ok_and(|values| values.iter().any(|value| value == column))
     }
 }

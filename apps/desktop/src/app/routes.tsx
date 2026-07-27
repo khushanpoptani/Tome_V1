@@ -25,6 +25,11 @@ const TaskQueuePage = lazy(() =>
     default: module.TaskQueuePage,
   })),
 );
+const TrainingPage = lazy(() =>
+  import("@/features/training/training-page").then((module) => ({
+    default: module.TrainingPage,
+  })),
+);
 const WorkspacePage = lazy(() =>
   import("@/features/workspace/workspace-page").then((module) => ({
     default: module.WorkspacePage,
@@ -119,6 +124,14 @@ export function AppRoutes(): React.JSX.Element {
             element={
               <LazyPage>
                 <TaskQueuePage />
+              </LazyPage>
+            }
+          />
+          <Route
+            path="training"
+            element={
+              <LazyPage>
+                <TrainingPage />
               </LazyPage>
             }
           />

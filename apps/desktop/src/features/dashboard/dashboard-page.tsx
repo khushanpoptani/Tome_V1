@@ -23,7 +23,7 @@ export function DashboardPage(): React.JSX.Element {
   const navigate = useNavigate();
   const projects = useQuery({
     enabled: isTauriRuntime(),
-    queryFn: backend.listProjects,
+    queryFn: () => backend.listProjects(),
     queryKey: ["projects"],
   });
   const conversations = useQuery({

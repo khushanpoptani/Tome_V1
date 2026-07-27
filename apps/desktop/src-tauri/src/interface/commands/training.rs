@@ -1,0 +1,2026 @@
+use std::{
+    fs::{self, File},
+    io::{BufRead, BufReader, Read},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+
+use chrono::{DateTime, Utc};
+use reqwest::header::{CONTENT_RANGE, CONTENT_TYPE};
+use rusqlite::{params, OptionalExtension, Row};
+use serde::Serialize;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tauri::{ipc::Channel, State};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use uuid::Uuid;
+use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
+
+use crate::{
+    domain::records::{
+        DatasetUploadRecord, TrainingDatasetInput, TrainingDatasetRecord, TrainingJobInput,
+        TrainingJobRecord, TrainingLogRecord, TrainingResourceRecord, TrainingServerInput,
+        TrainingServerRecord,
+    },
+    infrastructure::state::AppState,
+    interface::commands::data::add_log,
+};
+
+const DEFAULT_FORMATS: &[&str] = &["jsonl", "json", "csv", "parquet", "txt", "md"];
+const DEFAULT_CHUNK_SIZE: i64 = 4 * 1024 * 1024;
+
+fn now() -> String {
+    Utc::now().to_rfc3339()
+}
+
+fn database_error(context: &str, error: rusqlite::Error) -> String {
+    format!("Database error while {context}: {error}")
+}
+
+fn api_url(base: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+fn map_training_server(row: &Row<'_>) -> rusqlite::Result<TrainingServerRecord> {
+    Ok(TrainingServerRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        url: row.get(2)?,
+        adapter: row.get(3)?,
+        is_active: row.get::<_, i64>(4)? != 0,
+        status: row.get(5)?,
+        version: row.get(6)?,
+        capabilities_json: row.get(7)?,
+        last_error: row.get(8)?,
+        last_checked_at: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+fn map_dataset(row: &Row<'_>) -> rusqlite::Result<TrainingDatasetRecord> {
+    Ok(TrainingDatasetRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        source_path: row.get(2)?,
+        artifact_path: row.get(3)?,
+        format: row.get(4)?,
+        size: row.get(5)?,
+        file_count: row.get(6)?,
+        checksum: row.get(7)?,
+        compressed: row.get::<_, i64>(8)? != 0,
+        validation_status: row.get(9)?,
+        validation_errors_json: row.get(10)?,
+        preview: row.get(11)?,
+        remote_dataset_id: row.get(12)?,
+        training_server_id: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+    })
+}
+
+fn map_upload(row: &Row<'_>) -> rusqlite::Result<DatasetUploadRecord> {
+    Ok(DatasetUploadRecord {
+        id: row.get(0)?,
+        dataset_id: row.get(1)?,
+        training_server_id: row.get(2)?,
+        remote_upload_id: row.get(3)?,
+        status: row.get(4)?,
+        bytes_uploaded: row.get(5)?,
+        total_bytes: row.get(6)?,
+        chunk_size: row.get(7)?,
+        speed_bps: row.get(8)?,
+        eta_seconds: row.get(9)?,
+        retry_count: row.get(10)?,
+        last_error: row.get(11)?,
+        started_at: row.get(12)?,
+        finished_at: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+    })
+}
+
+fn map_job(row: &Row<'_>) -> rusqlite::Result<TrainingJobRecord> {
+    Ok(TrainingJobRecord {
+        id: row.get(0)?,
+        training_server_id: row.get(1)?,
+        remote_job_id: row.get(2)?,
+        dataset_id: row.get(3)?,
+        model: row.get(4)?,
+        backend: row.get(5)?,
+        parameters_json: row.get(6)?,
+        status: row.get(7)?,
+        stage: row.get(8)?,
+        progress: row.get(9)?,
+        eta_seconds: row.get(10)?,
+        started_at: row.get(11)?,
+        finished_at: row.get(12)?,
+        gpu_usage: row.get(13)?,
+        cpu_usage: row.get(14)?,
+        ram_usage: row.get(15)?,
+        disk_usage: row.get(16)?,
+        current_epoch: row.get(17)?,
+        total_epochs: row.get(18)?,
+        loss: row.get(19)?,
+        learning_rate: row.get(20)?,
+        heartbeat_at: row.get(21)?,
+        warning: row.get(22)?,
+        error: row.get(23)?,
+        retry_of: row.get(24)?,
+        created_at: row.get(25)?,
+        updated_at: row.get(26)?,
+    })
+}
+
+#[tauri::command]
+pub fn list_training_servers(
+    state: State<'_, AppState>,
+) -> Result<Vec<TrainingServerRecord>, String> {
+    let database = state.database.lock().map_err(|error| error.to_string())?;
+    let mut statement = database
+        .prepare(
+            "SELECT id, name, url, adapter, is_active, status, version,
+                    capabilities_json, last_error, last_checked_at, created_at, updated_at
+             FROM training_servers ORDER BY is_active DESC, updated_at DESC",
+        )
+        .map_err(|error| database_error("preparing training servers", error))?;
+    let records = statement
+        .query_map([], map_training_server)
+        .map_err(|error| database_error("reading training servers", error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| database_error("reading training servers", error))?;
+    Ok(records)
+}
+
+#[tauri::command]
+pub fn save_training_server(
+    state: State<'_, AppState>,
+    input: TrainingServerInput,
+) -> Result<TrainingServerRecord, String> {
+    let url = input.url.trim_end_matches('/').to_owned();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("Training server URL must start with http:// or https://".into());
+    }
+    let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let timestamp = now();
+    let mut database = state.database.lock().map_err(|error| error.to_string())?;
+    let transaction = database
+        .transaction()
+        .map_err(|error| database_error("starting training server update", error))?;
+    if input.is_active {
+        transaction
+            .execute("UPDATE training_servers SET is_active = 0", [])
+            .map_err(|error| database_error("clearing active training server", error))?;
+    }
+    transaction
+        .execute(
+            "INSERT INTO training_servers(
+                id, name, url, adapter, is_active, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name, url=excluded.url, adapter=excluded.adapter,
+                is_active=excluded.is_active, updated_at=excluded.updated_at",
+            params![
+                id,
+                input.name.trim(),
+                url,
+                input.adapter.unwrap_or_else(|| "tome-training-v1".into()),
+                i64::from(input.is_active),
+                timestamp
+            ],
+        )
+        .map_err(|error| database_error("saving training server", error))?;
+    transaction
+        .commit()
+        .map_err(|error| database_error("committing training server", error))?;
+    drop(database);
+    list_training_servers(state)?
+        .into_iter()
+        .find(|server| server.id == id)
+        .ok_or_else(|| "Saved training server could not be reloaded".into())
+}
+
+#[tauri::command]
+pub fn set_active_training_server(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let mut database = state.database.lock().map_err(|error| error.to_string())?;
+    let transaction = database
+        .transaction()
+        .map_err(|error| database_error("starting active training server update", error))?;
+    transaction
+        .execute("UPDATE training_servers SET is_active = 0", [])
+        .map_err(|error| database_error("clearing active training server", error))?;
+    let affected = transaction
+        .execute(
+            "UPDATE training_servers SET is_active = 1, updated_at = ?2 WHERE id = ?1",
+            params![id, now()],
+        )
+        .map_err(|error| database_error("setting active training server", error))?;
+    if affected == 0 {
+        return Err("The selected training server no longer exists".into());
+    }
+    transaction
+        .commit()
+        .map_err(|error| database_error("committing active training server", error))
+}
+
+#[tauri::command]
+pub fn delete_training_server(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let database = state.database.lock().map_err(|error| error.to_string())?;
+    database
+        .execute("DELETE FROM training_servers WHERE id = ?1", [id])
+        .map_err(|error| database_error("deleting training server", error))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn test_training_server(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<TrainingServerRecord, String> {
+    let server = list_training_servers(state.clone())?
+        .into_iter()
+        .find(|server| server.id == id)
+        .ok_or_else(|| "The selected training server no longer exists".to_string())?;
+    let health = state
+        .http
+        .get(api_url(&server.url, "/v1/health"))
+        .send()
+        .await;
+    let checked_at = now();
+    let (status, version, capabilities, error) = match health {
+        Ok(response) if response.status().is_success() => {
+            let health_json = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+            match state
+                .http
+                .get(api_url(&server.url, "/v1/capabilities"))
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    let capabilities = response
+                        .json::<Value>()
+                        .await
+                        .unwrap_or_else(|_| json!({}));
+                    (
+                        "connected",
+                        health_json["version"].as_str().map(ToOwned::to_owned),
+                        capabilities.to_string(),
+                        None,
+                    )
+                }
+                Ok(response) => (
+                    "degraded",
+                    health_json["version"].as_str().map(ToOwned::to_owned),
+                    "{}".into(),
+                    Some(format!(
+                        "Training server capability request returned HTTP {}",
+                        response.status()
+                    )),
+                ),
+                Err(error) => (
+                    "degraded",
+                    health_json["version"].as_str().map(ToOwned::to_owned),
+                    "{}".into(),
+                    Some(format!("Training server capabilities are unavailable: {error}")),
+                ),
+            }
+        }
+        Ok(response) => (
+            "disconnected",
+            None,
+            "{}".into(),
+            Some(format!(
+                "Training server health request returned HTTP {}",
+                response.status()
+            )),
+        ),
+        Err(error) => (
+            "disconnected",
+            None,
+            "{}".into(),
+            Some(format!(
+                "Could not reach {}. Confirm the external Training Manager is running and accessible: {error}",
+                server.url
+            )),
+        ),
+    };
+    {
+        let database = state.database.lock().map_err(|value| value.to_string())?;
+        database
+            .execute(
+                "UPDATE training_servers SET status=?2, version=?3,
+                    capabilities_json=?4, last_error=?5, last_checked_at=?6,
+                    updated_at=?6 WHERE id=?1",
+                params![id, status, version, capabilities, error, checked_at],
+            )
+            .map_err(|value| database_error("saving training server diagnostics", value))?;
+    }
+    add_log(
+        &state,
+        "training-server",
+        if status == "connected" {
+            "info"
+        } else {
+            "error"
+        },
+        "Training server connection test",
+        error.as_deref().or(Some(&server.url)),
+    );
+    list_training_servers(state)?
+        .into_iter()
+        .find(|value| value.id == id)
+        .ok_or_else(|| "Tested training server could not be reloaded".into())
+}
+
+#[derive(Debug)]
+struct DatasetInspection {
+    artifact_path: Option<String>,
+    checksum: Option<String>,
+    compressed: bool,
+    file_count: i64,
+    format: String,
+    preview: Option<String>,
+    size: i64,
+    status: String,
+    errors: Vec<String>,
+}
+
+fn collect_dataset_files(
+    root: &Path,
+    path: &Path,
+    formats: &[String],
+    output: &mut Vec<(PathBuf, String)>,
+) {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return,
+    };
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+    if metadata.is_file() {
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        if formats.iter().any(|format| format == &extension) {
+            let relative = path
+                .strip_prefix(root)
+                .ok()
+                .filter(|value| !value.as_os_str().is_empty())
+                .unwrap_or_else(|| path.file_name().map(Path::new).unwrap_or(path))
+                .to_string_lossy()
+                .to_string();
+            output.push((path.to_path_buf(), relative));
+        }
+        return;
+    }
+    if !metadata.is_dir() {
+        return;
+    }
+    let mut entries = match fs::read_dir(path) {
+        Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
+        Err(_) => return,
+    };
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.')
+            || matches!(name.as_ref(), "node_modules" | "target" | "__pycache__")
+        {
+            continue;
+        }
+        collect_dataset_files(root, &entry.path(), formats, output);
+    }
+}
+
+fn validate_structured_file(path: &Path, extension: &str, errors: &mut Vec<String>) {
+    if extension == "json" {
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                if let Err(error) = serde_json::from_str::<Value>(&content) {
+                    errors.push(format!("{}: invalid JSON ({error})", path.display()));
+                }
+            }
+            Err(error) => errors.push(format!("{}: could not be read ({error})", path.display())),
+        }
+    } else if extension == "jsonl" {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) => {
+                errors.push(format!("{}: could not be read ({error})", path.display()));
+                return;
+            }
+        };
+        for (index, line) in BufReader::new(file).lines().enumerate() {
+            match line {
+                Ok(line) if line.trim().is_empty() => continue,
+                Ok(line) => {
+                    if let Err(error) = serde_json::from_str::<Value>(&line) {
+                        errors.push(format!(
+                            "{} line {}: invalid JSON ({error})",
+                            path.display(),
+                            index + 1
+                        ));
+                        break;
+                    }
+                }
+                Err(error) => {
+                    errors.push(format!("{}: could not be read ({error})", path.display()));
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file =
+        File::open(path).map_err(|error| format!("Could not open upload artifact: {error}"))?;
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("Could not checksum upload artifact: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn inspect_dataset(
+    id: &str,
+    source_path: &Path,
+    formats: &[String],
+    compress: bool,
+    data_dir: &Path,
+) -> Result<DatasetInspection, String> {
+    if !source_path.exists() {
+        return Err(format!(
+            "Dataset path does not exist: {}",
+            source_path.display()
+        ));
+    }
+    let root = if source_path.is_dir() {
+        source_path
+    } else {
+        source_path.parent().unwrap_or_else(|| Path::new("."))
+    };
+    let mut files = Vec::new();
+    collect_dataset_files(root, source_path, formats, &mut files);
+    if files.is_empty() {
+        return Ok(DatasetInspection {
+            artifact_path: None,
+            checksum: None,
+            compressed: false,
+            file_count: 0,
+            format: "unknown".into(),
+            preview: None,
+            size: 0,
+            status: "invalid".into(),
+            errors: vec![format!(
+                "No supported dataset files were found. Supported formats: {}",
+                formats.join(", ")
+            )],
+        });
+    }
+    let mut errors = Vec::new();
+    let mut total_size = 0_i64;
+    let mut extensions = Vec::new();
+    let mut preview = None;
+    for (path, _) in &files {
+        let metadata = fs::metadata(path)
+            .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
+        if metadata.len() == 0 {
+            errors.push(format!("{} is empty", path.display()));
+        }
+        total_size = total_size.saturating_add(metadata.len() as i64);
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        extensions.push(extension.clone());
+        validate_structured_file(path, &extension, &mut errors);
+        if preview.is_none()
+            && matches!(extension.as_str(), "jsonl" | "json" | "csv" | "txt" | "md")
+        {
+            let mut file = File::open(path)
+                .map_err(|error| format!("Could not preview {}: {error}", path.display()))?;
+            let mut bytes = vec![0_u8; 4096];
+            let count = file
+                .read(&mut bytes)
+                .map_err(|error| format!("Could not preview {}: {error}", path.display()))?;
+            preview = Some(String::from_utf8_lossy(&bytes[..count]).to_string());
+        }
+    }
+    extensions.sort();
+    extensions.dedup();
+    let format = if extensions.len() == 1 {
+        extensions[0].clone()
+    } else {
+        "mixed".into()
+    };
+
+    let (artifact_path, checksum, size) = if compress {
+        let artifact_dir = data_dir.join("training").join("datasets");
+        fs::create_dir_all(&artifact_dir)
+            .map_err(|error| format!("Could not create dataset artifact directory: {error}"))?;
+        let artifact = artifact_dir.join(format!("{id}.zip"));
+        let file = File::create(&artifact)
+            .map_err(|error| format!("Could not create compressed dataset: {error}"))?;
+        let mut archive = ZipWriter::new(file);
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (path, relative) in &files {
+            archive
+                .start_file(relative.replace('\\', "/"), options)
+                .map_err(|error| format!("Could not add a file to the dataset archive: {error}"))?;
+            let mut source = File::open(path)
+                .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+            std::io::copy(&mut source, &mut archive)
+                .map_err(|error| format!("Could not compress {}: {error}", path.display()))?;
+        }
+        archive
+            .finish()
+            .map_err(|error| format!("Could not finalize compressed dataset: {error}"))?;
+        let size = fs::metadata(&artifact)
+            .map_err(|error| format!("Could not inspect compressed dataset: {error}"))?
+            .len() as i64;
+        (
+            Some(artifact.to_string_lossy().to_string()),
+            Some(sha256_file(&artifact)?),
+            size,
+        )
+    } else if source_path.is_file() {
+        (
+            Some(source_path.to_string_lossy().to_string()),
+            Some(sha256_file(source_path)?),
+            total_size,
+        )
+    } else {
+        (None, None, total_size)
+    };
+    Ok(DatasetInspection {
+        artifact_path,
+        checksum,
+        compressed: compress,
+        file_count: files.len() as i64,
+        format,
+        preview,
+        size,
+        status: if errors.is_empty() {
+            "valid".into()
+        } else {
+            "invalid".into()
+        },
+        errors,
+    })
+}
+
+#[tauri::command]
+pub fn list_training_datasets(
+    state: State<'_, AppState>,
+) -> Result<Vec<TrainingDatasetRecord>, String> {
+    let database = state.database.lock().map_err(|error| error.to_string())?;
+    let mut statement = database
+        .prepare(
+            "SELECT id, name, source_path, artifact_path, format, size, file_count,
+                    checksum, compressed, validation_status, validation_errors_json,
+                    preview, remote_dataset_id, training_server_id, created_at, updated_at
+             FROM training_datasets ORDER BY updated_at DESC",
+        )
+        .map_err(|error| database_error("preparing training datasets", error))?;
+    let records = statement
+        .query_map([], map_dataset)
+        .map_err(|error| database_error("reading training datasets", error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| database_error("reading training datasets", error))?;
+    Ok(records)
+}
+
+#[tauri::command]
+pub async fn save_training_dataset(
+    state: State<'_, AppState>,
+    input: TrainingDatasetInput,
+) -> Result<TrainingDatasetRecord, String> {
+    let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let source_path = PathBuf::from(input.source_path.trim());
+    let formats = input
+        .supported_formats
+        .filter(|formats| !formats.is_empty())
+        .unwrap_or_else(|| DEFAULT_FORMATS.iter().map(ToString::to_string).collect());
+    let data_dir = state.data_dir.clone();
+    let inspection_id = id.clone();
+    let inspection = tokio::task::spawn_blocking(move || {
+        inspect_dataset(
+            &inspection_id,
+            &source_path,
+            &formats
+                .into_iter()
+                .map(|value| value.trim_start_matches('.').to_lowercase())
+                .collect::<Vec<_>>(),
+            input.compress,
+            &data_dir,
+        )
+    })
+    .await
+    .map_err(|error| format!("Dataset validation worker failed: {error}"))??;
+    let timestamp = now();
+    let errors_json = serde_json::to_string(&inspection.errors)
+        .map_err(|error| format!("Could not serialize dataset validation results: {error}"))?;
+    let database = state.database.lock().map_err(|error| error.to_string())?;
+    database
+        .execute(
+            "INSERT INTO training_datasets(
+                id, name, source_path, artifact_path, format, size, file_count,
+                checksum, compressed, validation_status, validation_errors_json,
+                preview, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
+             ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name, source_path=excluded.source_path,
+                artifact_path=excluded.artifact_path, format=excluded.format,
+                size=excluded.size, file_count=excluded.file_count,
+                checksum=excluded.checksum, compressed=excluded.compressed,
+                validation_status=excluded.validation_status,
+                validation_errors_json=excluded.validation_errors_json,
+                preview=excluded.preview, remote_dataset_id=NULL,
+                training_server_id=NULL, updated_at=excluded.updated_at",
+            params![
+                id,
+                input.name.trim(),
+                input.source_path.trim(),
+                inspection.artifact_path,
+                inspection.format,
+                inspection.size,
+                inspection.file_count,
+                inspection.checksum,
+                i64::from(inspection.compressed),
+                inspection.status,
+                errors_json,
+                inspection.preview,
+                timestamp
+            ],
+        )
+        .map_err(|error| database_error("saving training dataset", error))?;
+    drop(database);
+    add_log(
+        &state,
+        "training-dataset",
+        if inspection.errors.is_empty() {
+            "info"
+        } else {
+            "warning"
+        },
+        "Dataset validation completed",
+        Some(input.source_path.trim()),
+    );
+    list_training_datasets(state)?
+        .into_iter()
+        .find(|dataset| dataset.id == id)
+        .ok_or_else(|| "Saved dataset could not be reloaded".into())
+}
+
+#[tauri::command]
+pub fn delete_training_dataset(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let artifact = {
+        let database = state.database.lock().map_err(|error| error.to_string())?;
+        database
+            .query_row(
+                "SELECT artifact_path FROM training_datasets WHERE id = ?1",
+                [&id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| database_error("reading dataset artifact", error))?
+            .flatten()
+    };
+    if let Some(artifact) = artifact {
+        let path = PathBuf::from(artifact);
+        if path.starts_with(state.data_dir.join("training").join("datasets")) && path.is_file() {
+            fs::remove_file(&path)
+                .map_err(|error| format!("Could not remove managed dataset artifact: {error}"))?;
+        }
+    }
+    let database = state.database.lock().map_err(|error| error.to_string())?;
+    database
+        .execute("DELETE FROM training_datasets WHERE id = ?1", [id])
+        .map_err(|error| database_error("deleting training dataset", error))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum TrainingStreamEvent {
+    Status {
+        message: String,
+    },
+    UploadProgress {
+        upload_id: String,
+        bytes_uploaded: i64,
+        total_bytes: i64,
+        progress: f64,
+        speed_bps: f64,
+        eta_seconds: Option<i64>,
+    },
+    Complete {
+        message: String,
+    },
+    Error {
+        message: String,
+    },
+    Cancelled,
+}
+
+#[tauri::command]
+pub fn list_dataset_uploads(
+    state: State<'_, AppState>,
+) -> Result<Vec<DatasetUploadRecord>, String> {
+    let database = state.database.lock().map_err(|error| error.to_string())?;
+    let mut statement = database
+        .prepare(
+            "SELECT id, dataset_id, training_server_id, remote_upload_id, status,
+                    bytes_uploaded, total_bytes, chunk_size, speed_bps, eta_seconds,
+                    retry_count, last_error, started_at, finished_at, created_at, updated_at
+             FROM dataset_uploads ORDER BY created_at DESC",
+        )
+        .map_err(|error| database_error("preparing dataset uploads", error))?;
+    let records = statement
+        .query_map([], map_upload)
+        .map_err(|error| database_error("reading dataset uploads", error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| database_error("reading dataset uploads", error))?;
+    Ok(records)
+}
+
+struct UploadProgress<'a> {
+    id: &'a str,
+    status: &'a str,
+    remote_upload_id: Option<&'a str>,
+    bytes_uploaded: i64,
+    total_bytes: i64,
+    chunk_size: i64,
+    speed_bps: f64,
+    eta_seconds: Option<i64>,
+    retry_count: i64,
+    last_error: Option<&'a str>,
+    finished: bool,
+}
+
+fn save_upload_progress(state: &AppState, progress: UploadProgress<'_>) -> Result<(), String> {
+    let timestamp = now();
+    let database = state.database.lock().map_err(|error| error.to_string())?;
+    database
+        .execute(
+            "UPDATE dataset_uploads SET
+                status=?2, remote_upload_id=COALESCE(?3, remote_upload_id),
+                bytes_uploaded=?4, total_bytes=?5, chunk_size=?6,
+                speed_bps=?7, eta_seconds=?8, retry_count=?9, last_error=?10,
+                started_at=COALESCE(started_at, ?11),
+                finished_at=CASE WHEN ?12 = 1 THEN ?11 ELSE NULL END,
+                updated_at=?11
+             WHERE id=?1",
+            params![
+                progress.id,
+                progress.status,
+                progress.remote_upload_id,
+                progress.bytes_uploaded,
+                progress.total_bytes,
+                progress.chunk_size,
+                progress.speed_bps,
+                progress.eta_seconds,
+                progress.retry_count,
+                progress.last_error,
+                timestamp,
+                i64::from(progress.finished)
+            ],
+        )
+        .map_err(|error| database_error("saving dataset upload progress", error))?;
+    Ok(())
+}
+
+fn fail_upload(
+    state: &AppState,
+    on_event: &Channel<TrainingStreamEvent>,
+    progress: UploadProgress<'_>,
+) -> Result<(), String> {
+    let message = progress
+        .last_error
+        .unwrap_or("The dataset upload failed")
+        .to_string();
+    let upload_id = progress.id.to_string();
+    save_upload_progress(state, progress)?;
+    let _ = on_event.send(TrainingStreamEvent::Error {
+        message: message.clone(),
+    });
+    state
+        .cancellations
+        .lock()
+        .map_err(|error| error.to_string())?
+        .remove(&upload_id);
+    Err(message)
+}
+
+async fn response_failure(response: reqwest::Response, operation: &str) -> String {
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let detail = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|value| value["error"].as_str().map(ToOwned::to_owned))
+        .filter(|value| !value.is_empty())
+        .unwrap_or(body);
+    format!("{operation} returned HTTP {status}: {detail}")
+}
+
+#[tauri::command]
+pub async fn start_dataset_upload(
+    state: State<'_, AppState>,
+    dataset_id: String,
+    training_server_id: String,
+    on_event: Channel<TrainingStreamEvent>,
+) -> Result<(), String> {
+    let (dataset, server) = {
+        let datasets = list_training_datasets(state.clone())?;
+        let servers = list_training_servers(state.clone())?;
+        (
+            datasets
+                .into_iter()
+                .find(|dataset| dataset.id == dataset_id)
+                .ok_or_else(|| "The selected dataset no longer exists".to_string())?,
+            servers
+                .into_iter()
+                .find(|server| server.id == training_server_id)
+                .ok_or_else(|| "The selected training server no longer exists".to_string())?,
+        )
+    };
+    if dataset.validation_status != "valid" {
+        return Err("Only a valid dataset can be uploaded".into());
+    }
+    let artifact_path = dataset.artifact_path.clone().ok_or_else(|| {
+        "Directory datasets must be compressed before upload so Tome has one resumable artifact"
+            .to_string()
+    })?;
+    let checksum = dataset
+        .checksum
+        .clone()
+        .ok_or_else(|| "The dataset artifact has no checksum; validate it again".to_string())?;
+    let total_bytes = fs::metadata(&artifact_path)
+        .map_err(|error| format!("The dataset artifact is unavailable: {error}"))?
+        .len() as i64;
+
+    let existing = list_dataset_uploads(state.clone())?
+        .into_iter()
+        .find(|upload| {
+            upload.dataset_id == dataset.id
+                && upload.training_server_id == server.id
+                && upload.status != "completed"
+                && upload.status != "cancelled"
+        });
+    let upload_id = existing
+        .as_ref()
+        .map(|upload| upload.id.clone())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    if existing.is_none() {
+        let timestamp = now();
+        let database = state.database.lock().map_err(|error| error.to_string())?;
+        database
+            .execute(
+                "INSERT INTO dataset_uploads(
+                    id, dataset_id, training_server_id, status, total_bytes,
+                    chunk_size, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?6)",
+                params![
+                    upload_id,
+                    dataset.id,
+                    server.id,
+                    total_bytes,
+                    DEFAULT_CHUNK_SIZE,
+                    timestamp
+                ],
+            )
+            .map_err(|error| database_error("creating dataset upload", error))?;
+    }
+
+    let cancellation = Arc::new(AtomicBool::new(false));
+    state
+        .cancellations
+        .lock()
+        .map_err(|error| error.to_string())?
+        .insert(upload_id.clone(), Arc::clone(&cancellation));
+    let _ = on_event.send(TrainingStreamEvent::Status {
+        message: "Negotiating a resumable upload session".into(),
+    });
+    let handshake = state
+        .http
+        .post(api_url(&server.url, "/v1/uploads"))
+        .header("Idempotency-Key", &upload_id)
+        .json(&json!({
+            "clientUploadId": upload_id,
+            "datasetId": dataset.id,
+            "name": dataset.name,
+            "format": dataset.format,
+            "size": total_bytes,
+            "sha256": checksum
+        }))
+        .send()
+        .await;
+    let handshake = match handshake {
+        Ok(response) if response.status().is_success() => response,
+        Ok(response) => {
+            let error = response_failure(response, "Creating the upload session").await;
+            save_upload_progress(
+                &state,
+                UploadProgress {
+                    id: &upload_id,
+                    status: "failed",
+                    remote_upload_id: None,
+                    bytes_uploaded: existing.as_ref().map_or(0, |upload| upload.bytes_uploaded),
+                    total_bytes,
+                    chunk_size: DEFAULT_CHUNK_SIZE,
+                    speed_bps: 0.0,
+                    eta_seconds: None,
+                    retry_count: existing.as_ref().map_or(0, |upload| upload.retry_count),
+                    last_error: Some(&error),
+                    finished: false,
+                },
+            )?;
+            let _ = on_event.send(TrainingStreamEvent::Error {
+                message: error.clone(),
+            });
+            state
+                .cancellations
+                .lock()
+                .map_err(|value| value.to_string())?
+                .remove(&upload_id);
+            return Err(error);
+        }
+        Err(error) => {
+            let message = format!(
+                "Could not create a training upload at {}. The external Training Manager must implement tome-training/v1: {error}",
+                server.url
+            );
+            save_upload_progress(
+                &state,
+                UploadProgress {
+                    id: &upload_id,
+                    status: "failed",
+                    remote_upload_id: None,
+                    bytes_uploaded: existing.as_ref().map_or(0, |upload| upload.bytes_uploaded),
+                    total_bytes,
+                    chunk_size: DEFAULT_CHUNK_SIZE,
+                    speed_bps: 0.0,
+                    eta_seconds: None,
+                    retry_count: existing.as_ref().map_or(0, |upload| upload.retry_count),
+                    last_error: Some(&message),
+                    finished: false,
+                },
+            )?;
+            state
+                .cancellations
+                .lock()
+                .map_err(|value| value.to_string())?
+                .remove(&upload_id);
+            return Err(message);
+        }
+    };
+    let handshake = match handshake.json::<Value>().await {
+        Ok(value) => value,
+        Err(error) => {
+            let message = format!("Training Manager returned invalid upload JSON: {error}");
+            return fail_upload(
+                &state,
+                &on_event,
+                UploadProgress {
+                    id: &upload_id,
+                    status: "failed",
+                    remote_upload_id: None,
+                    bytes_uploaded: existing.as_ref().map_or(0, |upload| upload.bytes_uploaded),
+                    total_bytes,
+                    chunk_size: DEFAULT_CHUNK_SIZE,
+                    speed_bps: 0.0,
+                    eta_seconds: None,
+                    retry_count: existing.as_ref().map_or(0, |upload| upload.retry_count),
+                    last_error: Some(&message),
+                    finished: false,
+                },
+            );
+        }
+    };
+    let remote_upload_id = match handshake["uploadId"]
+        .as_str()
+        .or_else(|| handshake["id"].as_str())
+    {
+        Some(id) => id.to_string(),
+        None => {
+            let message = "Training Manager did not return an uploadId".to_string();
+            return fail_upload(
+                &state,
+                &on_event,
+                UploadProgress {
+                    id: &upload_id,
+                    status: "failed",
+                    remote_upload_id: None,
+                    bytes_uploaded: existing.as_ref().map_or(0, |upload| upload.bytes_uploaded),
+                    total_bytes,
+                    chunk_size: DEFAULT_CHUNK_SIZE,
+                    speed_bps: 0.0,
+                    eta_seconds: None,
+                    retry_count: existing.as_ref().map_or(0, |upload| upload.retry_count),
+                    last_error: Some(&message),
+                    finished: false,
+                },
+            );
+        }
+    };
+    let mut bytes_uploaded = handshake["uploadedBytes"]
+        .as_i64()
+        .or_else(|| existing.as_ref().map(|upload| upload.bytes_uploaded))
+        .unwrap_or(0)
+        .clamp(0, total_bytes);
+    let chunk_size = handshake["chunkSize"]
+        .as_i64()
+        .unwrap_or(DEFAULT_CHUNK_SIZE)
+        .clamp(256 * 1024, 64 * 1024 * 1024);
+    save_upload_progress(
+        &state,
+        UploadProgress {
+            id: &upload_id,
+            status: "uploading",
+            remote_upload_id: Some(&remote_upload_id),
+            bytes_uploaded,
+            total_bytes,
+            chunk_size,
+            speed_bps: 0.0,
+            eta_seconds: None,
+            retry_count: 0,
+            last_error: None,
+            finished: false,
+        },
+    )?;
+
+    let mut file = match tokio::fs::File::open(&artifact_path).await {
+        Ok(file) => file,
+        Err(error) => {
+            let message = format!("Could not open the dataset artifact: {error}");
+            return fail_upload(
+                &state,
+                &on_event,
+                UploadProgress {
+                    id: &upload_id,
+                    status: "failed",
+                    remote_upload_id: Some(&remote_upload_id),
+                    bytes_uploaded,
+                    total_bytes,
+                    chunk_size,
+                    speed_bps: 0.0,
+                    eta_seconds: None,
+                    retry_count: 0,
+                    last_error: Some(&message),
+                    finished: false,
+                },
+            );
+        }
+    };
+    if let Err(error) = file
+        .seek(std::io::SeekFrom::Start(bytes_uploaded as u64))
+        .await
+    {
+        let message = format!("Could not resume the dataset artifact: {error}");
+        return fail_upload(
+            &state,
+            &on_event,
+            UploadProgress {
+                id: &upload_id,
+                status: "failed",
+                remote_upload_id: Some(&remote_upload_id),
+                bytes_uploaded,
+                total_bytes,
+                chunk_size,
+                speed_bps: 0.0,
+                eta_seconds: None,
+                retry_count: 0,
+                last_error: Some(&message),
+                finished: false,
+            },
+        );
+    }
+    let started = Instant::now();
+    let starting_offset = bytes_uploaded;
+    let mut retry_count = 0_i64;
+    while bytes_uploaded < total_bytes {
+        if cancellation.load(Ordering::Relaxed) {
+            save_upload_progress(
+                &state,
+                UploadProgress {
+                    id: &upload_id,
+                    status: "cancelled",
+                    remote_upload_id: Some(&remote_upload_id),
+                    bytes_uploaded,
+                    total_bytes,
+                    chunk_size,
+                    speed_bps: 0.0,
+                    eta_seconds: None,
+                    retry_count,
+                    last_error: None,
+                    finished: true,
+                },
+            )?;
+            let _ = on_event.send(TrainingStreamEvent::Cancelled);
+            state
+                .cancellations
+                .lock()
+                .map_err(|error| error.to_string())?
+                .remove(&upload_id);
+            return Ok(());
+        }
+        let remaining = (total_bytes - bytes_uploaded) as usize;
+        let mut chunk = vec![0_u8; remaining.min(chunk_size as usize)];
+        let count = match file.read(&mut chunk).await {
+            Ok(count) => count,
+            Err(error) => {
+                let message = format!("Could not read the dataset artifact: {error}");
+                return fail_upload(
+                    &state,
+                    &on_event,
+                    UploadProgress {
+                        id: &upload_id,
+                        status: "failed",
+                        remote_upload_id: Some(&remote_upload_id),
+                        bytes_uploaded,
+                        total_bytes,
+                        chunk_size,
+                        speed_bps: 0.0,
+                        eta_seconds: None,
+                        retry_count,
+                        last_error: Some(&message),
+                        finished: false,
+                    },
+                );
+            }
+        };
+        if count == 0 {
+            let message = "Dataset artifact ended before the expected byte count".to_string();
+            return fail_upload(
+                &state,
+                &on_event,
+                UploadProgress {
+                    id: &upload_id,
+                    status: "failed",
+                    remote_upload_id: Some(&remote_upload_id),
+                    bytes_uploaded,
+                    total_bytes,
+                    chunk_size,
+                    speed_bps: 0.0,
+                    eta_seconds: None,
+                    retry_count,
+                    last_error: Some(&message),
+                    finished: false,
+                },
+            );
+        }
+        chunk.truncate(count);
+        let start = bytes_uploaded;
+        let end = start + count as i64 - 1;
+        let chunk_index = start / chunk_size;
+        let chunk_hash = format!("{:x}", Sha256::digest(&chunk));
+        let mut accepted = false;
+        let mut last_error = String::new();
+        for attempt in 0..3 {
+            let response = state
+                .http
+                .put(api_url(
+                    &server.url,
+                    &format!("/v1/uploads/{remote_upload_id}/chunks/{chunk_index}"),
+                ))
+                .header("Idempotency-Key", format!("{upload_id}:{chunk_index}"))
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .header(CONTENT_RANGE, format!("bytes {start}-{end}/{total_bytes}"))
+                .header("X-Content-SHA256", &chunk_hash)
+                .body(chunk.clone())
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    accepted = true;
+                    break;
+                }
+                Ok(response) => {
+                    last_error = response_failure(response, "Uploading a dataset chunk").await;
+                }
+                Err(error) => {
+                    last_error = format!("Dataset chunk request failed: {error}");
+                }
+            }
+            retry_count += 1;
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_millis(250 * 4_u64.pow(attempt))).await;
+            }
+        }
+        if !accepted {
+            save_upload_progress(
+                &state,
+                UploadProgress {
+                    id: &upload_id,
+                    status: "failed",
+                    remote_upload_id: Some(&remote_upload_id),
+                    bytes_uploaded,
+                    total_bytes,
+                    chunk_size,
+                    speed_bps: 0.0,
+                    eta_seconds: None,
+                    retry_count,
+                    last_error: Some(&last_error),
+                    finished: false,
+                },
+            )?;
+            let _ = on_event.send(TrainingStreamEvent::Error {
+                message: last_error.clone(),
+            });
+            state
+                .cancellations
+                .lock()
+                .map_err(|error| error.to_string())?
+                .remove(&upload_id);
+            return Err(last_error);
+        }
+        bytes_uploaded = end + 1;
+        let elapsed = started.elapsed().as_secs_f64().max(0.001);
+        let speed_bps = (bytes_uploaded - starting_offset) as f64 / elapsed;
+        let eta_seconds = (speed_bps > 0.0)
+            .then(|| ((total_bytes - bytes_uploaded) as f64 / speed_bps).ceil() as i64);
+        let progress = bytes_uploaded as f64 / total_bytes.max(1) as f64 * 100.0;
+        save_upload_progress(
+            &state,
+            UploadProgress {
+                id: &upload_id,
+                status: "uploading",
+                remote_upload_id: Some(&remote_upload_id),
+                bytes_uploaded,
+                total_bytes,
+                chunk_size,
+                speed_bps,
+                eta_seconds,
+                retry_count,
+                last_error: None,
+                finished: false,
+            },
+        )?;
+        let _ = on_event.send(TrainingStreamEvent::UploadProgress {
+            upload_id: upload_id.clone(),
+            bytes_uploaded,
+            total_bytes,
+            progress,
+            speed_bps,
+            eta_seconds,
+        });
+    }
+    let completion = state
+        .http
+        .post(api_url(
+            &server.url,
+            &format!("/v1/uploads/{remote_upload_id}/complete"),
+        ))
+        .header("Idempotency-Key", format!("{upload_id}:complete"))
+        .json(&json!({ "sha256": checksum, "size": total_bytes }))
+        .send()
+        .await;
+    let completion = match completion {
+        Ok(response) => response,
+        Err(error) => {
+            let message = format!("Could not finalize dataset upload: {error}");
+            return fail_upload(
+                &state,
+                &on_event,
+                UploadProgress {
+                    id: &upload_id,
+                    status: "failed",
+                    remote_upload_id: Some(&remote_upload_id),
+                    bytes_uploaded,
+                    total_bytes,
+                    chunk_size,
+                    speed_bps: 0.0,
+                    eta_seconds: None,
+                    retry_count,
+                    last_error: Some(&message),
+                    finished: false,
+                },
+            );
+        }
+    };
+    if !completion.status().is_success() {
+        let message = response_failure(completion, "Finalizing the dataset upload").await;
+        return fail_upload(
+            &state,
+            &on_event,
+            UploadProgress {
+                id: &upload_id,
+                status: "failed",
+                remote_upload_id: Some(&remote_upload_id),
+                bytes_uploaded,
+                total_bytes,
+                chunk_size,
+                speed_bps: 0.0,
+                eta_seconds: None,
+                retry_count,
+                last_error: Some(&message),
+                finished: false,
+            },
+        );
+    }
+    let completion_json = completion
+        .json::<Value>()
+        .await
+        .unwrap_or_else(|_| json!({}));
+    let remote_dataset_id = completion_json["datasetId"]
+        .as_str()
+        .unwrap_or(&remote_upload_id)
+        .to_string();
+    save_upload_progress(
+        &state,
+        UploadProgress {
+            id: &upload_id,
+            status: "completed",
+            remote_upload_id: Some(&remote_upload_id),
+            bytes_uploaded: total_bytes,
+            total_bytes,
+            chunk_size,
+            speed_bps: 0.0,
+            eta_seconds: Some(0),
+            retry_count,
+            last_error: None,
+            finished: true,
+        },
+    )?;
+    {
+        let database = state.database.lock().map_err(|error| error.to_string())?;
+        database
+            .execute(
+                "UPDATE training_datasets SET remote_dataset_id=?2,
+                    training_server_id=?3, updated_at=?4 WHERE id=?1",
+                params![dataset.id, remote_dataset_id, server.id, now()],
+            )
+            .map_err(|error| database_error("linking remote dataset", error))?;
+    }
+    state
+        .cancellations
+        .lock()
+        .map_err(|error| error.to_string())?
+        .remove(&upload_id);
+    add_log(
+        &state,
+        "training-upload",
+        "info",
+        "Dataset upload completed",
+        Some(&dataset.name),
+    );
+    let _ = on_event.send(TrainingStreamEvent::Complete {
+        message: format!("{} uploaded", dataset.name),
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn cancel_dataset_upload(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    if let Some(cancellation) = state
+        .cancellations
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get(&id)
+    {
+        cancellation.store(true, Ordering::Relaxed);
+    }
+    let upload = list_dataset_uploads(state.clone())?
+        .into_iter()
+        .find(|upload| upload.id == id)
+        .ok_or_else(|| "The selected upload no longer exists".to_string())?;
+    if let Some(remote_id) = &upload.remote_upload_id {
+        if let Some(server) = list_training_servers(state.clone())?
+            .into_iter()
+            .find(|server| server.id == upload.training_server_id)
+        {
+            let _ = state
+                .http
+                .delete(api_url(&server.url, &format!("/v1/uploads/{remote_id}")))
+                .send()
+                .await;
+        }
+    }
+    save_upload_progress(
+        &state,
+        UploadProgress {
+            id: &id,
+            status: "cancelled",
+            remote_upload_id: upload.remote_upload_id.as_deref(),
+            bytes_uploaded: upload.bytes_uploaded,
+            total_bytes: upload.total_bytes,
+            chunk_size: upload.chunk_size,
+            speed_bps: 0.0,
+            eta_seconds: None,
+            retry_count: upload.retry_count,
+            last_error: None,
+            finished: true,
+        },
+    )
+}
+
+#[tauri::command]
+pub fn list_training_jobs(state: State<'_, AppState>) -> Result<Vec<TrainingJobRecord>, String> {
+    let database = state.database.lock().map_err(|error| error.to_string())?;
+    let mut statement = database
+        .prepare(
+            "SELECT id, training_server_id, remote_job_id, dataset_id, model, backend,
+                    parameters_json, status, stage, progress, eta_seconds, started_at,
+                    finished_at, gpu_usage, cpu_usage, ram_usage, disk_usage,
+                    current_epoch, total_epochs, loss, learning_rate, heartbeat_at,
+                    warning, error, retry_of, created_at, updated_at
+             FROM training_jobs ORDER BY created_at DESC",
+        )
+        .map_err(|error| database_error("preparing training jobs", error))?;
+    let records = statement
+        .query_map([], map_job)
+        .map_err(|error| database_error("reading training jobs", error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| database_error("reading training jobs", error))?;
+    Ok(records)
+}
+
+#[tauri::command]
+pub fn save_training_job(
+    state: State<'_, AppState>,
+    input: TrainingJobInput,
+) -> Result<TrainingJobRecord, String> {
+    serde_json::from_str::<Value>(&input.parameters_json)
+        .map_err(|error| format!("Training parameters must be valid JSON: {error}"))?;
+    if input.total_epochs < 1 {
+        return Err("Training epochs must be at least 1".into());
+    }
+    let datasets = list_training_datasets(state.clone())?;
+    if !datasets
+        .iter()
+        .any(|dataset| dataset.id == input.dataset_id)
+    {
+        return Err("The selected dataset no longer exists".into());
+    }
+    let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let timestamp = now();
+    let database = state.database.lock().map_err(|error| error.to_string())?;
+    database
+        .execute(
+            "INSERT INTO training_jobs(
+                id, training_server_id, dataset_id, model, backend,
+                parameters_json, status, stage, total_epochs, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'draft', 'Draft', ?7, ?8, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                training_server_id=excluded.training_server_id,
+                dataset_id=excluded.dataset_id, model=excluded.model,
+                backend=excluded.backend, parameters_json=excluded.parameters_json,
+                total_epochs=excluded.total_epochs, updated_at=excluded.updated_at",
+            params![
+                id,
+                input.training_server_id,
+                input.dataset_id,
+                input.model.trim(),
+                input.backend.trim(),
+                input.parameters_json,
+                input.total_epochs,
+                timestamp
+            ],
+        )
+        .map_err(|error| database_error("saving training job", error))?;
+    drop(database);
+    list_training_jobs(state)?
+        .into_iter()
+        .find(|job| job.id == id)
+        .ok_or_else(|| "Saved training job could not be reloaded".into())
+}
+
+#[tauri::command]
+pub fn delete_training_job(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let job = list_training_jobs(state.clone())?
+        .into_iter()
+        .find(|job| job.id == id)
+        .ok_or_else(|| "The selected training job no longer exists".to_string())?;
+    if matches!(
+        job.status.as_str(),
+        "queued" | "running" | "paused" | "cancelling"
+    ) {
+        return Err("Active jobs must be cancelled before they can be removed".into());
+    }
+    let database = state.database.lock().map_err(|error| error.to_string())?;
+    database
+        .execute("DELETE FROM training_jobs WHERE id = ?1", [id])
+        .map_err(|error| database_error("deleting training job", error))?;
+    Ok(())
+}
+
+fn active_training_server(
+    state: State<'_, AppState>,
+    preferred_id: Option<&str>,
+) -> Result<TrainingServerRecord, String> {
+    list_training_servers(state)?
+        .into_iter()
+        .find(|server| {
+            preferred_id
+                .map(|id| server.id == id)
+                .unwrap_or(server.is_active)
+        })
+        .ok_or_else(|| {
+            "Configure and activate an external Training Manager before dispatching jobs".into()
+        })
+}
+
+#[tauri::command]
+pub async fn dispatch_training_job(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<TrainingJobRecord, String> {
+    let job = list_training_jobs(state.clone())?
+        .into_iter()
+        .find(|job| job.id == id)
+        .ok_or_else(|| "The selected training job no longer exists".to_string())?;
+    if job.status != "draft" && job.status != "failed" {
+        return Err("Only draft or failed jobs can be dispatched".into());
+    }
+    let dataset = list_training_datasets(state.clone())?
+        .into_iter()
+        .find(|dataset| dataset.id == job.dataset_id)
+        .ok_or_else(|| "The job dataset no longer exists".to_string())?;
+    let remote_dataset_id = dataset.remote_dataset_id.ok_or_else(|| {
+        "Upload the validated dataset to the selected Training Manager before dispatching this job"
+            .to_string()
+    })?;
+    let server = active_training_server(state.clone(), job.training_server_id.as_deref())?;
+    let parameters = serde_json::from_str::<Value>(&job.parameters_json)
+        .map_err(|error| format!("Stored training parameters are invalid: {error}"))?;
+    let response = state
+        .http
+        .post(api_url(&server.url, "/v1/jobs"))
+        .header("Idempotency-Key", &job.id)
+        .json(&json!({
+            "clientJobId": job.id,
+            "datasetId": remote_dataset_id,
+            "model": job.model,
+            "backend": job.backend,
+            "parameters": parameters,
+            "epochs": job.total_epochs
+        }))
+        .send()
+        .await
+        .map_err(|error| {
+            format!(
+                "Could not dispatch the job to {}. No training was started: {error}",
+                server.url
+            )
+        })?;
+    if !response.status().is_success() {
+        return Err(response_failure(response, "Dispatching the training job").await);
+    }
+    let response = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Training Manager returned invalid job JSON: {error}"))?;
+    let remote_id = response["jobId"]
+        .as_str()
+        .or_else(|| response["id"].as_str())
+        .ok_or_else(|| "Training Manager did not return a jobId".to_string())?;
+    {
+        let database = state.database.lock().map_err(|error| error.to_string())?;
+        database
+            .execute(
+                "UPDATE training_jobs SET training_server_id=?2, remote_job_id=?3,
+                    status='queued', stage='Queued', progress=0, error=NULL,
+                    started_at=COALESCE(started_at, ?4), heartbeat_at=?4, updated_at=?4
+                 WHERE id=?1",
+                params![id, server.id, remote_id, now()],
+            )
+            .map_err(|error| database_error("saving dispatched training job", error))?;
+    }
+    add_log(
+        &state,
+        "training-job",
+        "info",
+        "Training job dispatched",
+        Some(&job.model),
+    );
+    list_training_jobs(state)?
+        .into_iter()
+        .find(|value| value.id == id)
+        .ok_or_else(|| "Dispatched job could not be reloaded".into())
+}
+
+fn value_f64(value: &Value, camel: &str, snake: &str) -> Option<f64> {
+    value[camel].as_f64().or_else(|| value[snake].as_f64())
+}
+
+fn value_i64(value: &Value, camel: &str, snake: &str) -> Option<i64> {
+    value[camel].as_i64().or_else(|| value[snake].as_i64())
+}
+
+fn value_string(value: &Value, camel: &str, snake: &str) -> Option<String> {
+    value[camel]
+        .as_str()
+        .or_else(|| value[snake].as_str())
+        .map(ToOwned::to_owned)
+}
+
+#[tauri::command]
+pub async fn refresh_training_job(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<TrainingJobRecord, String> {
+    let job = list_training_jobs(state.clone())?
+        .into_iter()
+        .find(|job| job.id == id)
+        .ok_or_else(|| "The selected training job no longer exists".to_string())?;
+    let remote_id = job
+        .remote_job_id
+        .clone()
+        .ok_or_else(|| "Draft jobs have no remote status".to_string())?;
+    let server = active_training_server(state.clone(), job.training_server_id.as_deref())?;
+    let response = state
+        .http
+        .get(api_url(&server.url, &format!("/v1/jobs/{remote_id}")))
+        .send()
+        .await
+        .map_err(|error| format!("Training job heartbeat failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(response_failure(response, "Refreshing the training job").await);
+    }
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Training Manager returned invalid job status JSON: {error}"))?;
+    let status = value_string(&value, "status", "status").unwrap_or_else(|| job.status.clone());
+    let stage = value_string(&value, "stage", "stage").unwrap_or_else(|| job.stage.clone());
+    let progress = value_f64(&value, "progress", "progress")
+        .unwrap_or(job.progress)
+        .clamp(0.0, 100.0);
+    let elapsed_seconds = job
+        .started_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|started| {
+            (Utc::now() - started.with_timezone(&Utc))
+                .num_seconds()
+                .max(0)
+        });
+    let estimated_eta = value_i64(&value, "etaSeconds", "eta_seconds").or_else(|| {
+        elapsed_seconds
+            .filter(|_| progress > 0.0 && progress < 100.0)
+            .map(|elapsed| ((elapsed as f64 / progress) * (100.0 - progress)).round() as i64)
+    });
+    let terminal = matches!(status.as_str(), "completed" | "failed" | "cancelled");
+    let timestamp = now();
+    {
+        let database = state.database.lock().map_err(|error| error.to_string())?;
+        database
+            .execute(
+                "UPDATE training_jobs SET
+                    status=?2, stage=?3, progress=?4, eta_seconds=?5,
+                    gpu_usage=?6, cpu_usage=?7, ram_usage=?8, disk_usage=?9,
+                    current_epoch=?10, total_epochs=COALESCE(?11, total_epochs),
+                    loss=?12, learning_rate=?13, heartbeat_at=?14,
+                    warning=?15, error=?16,
+                    finished_at=CASE WHEN ?17=1 THEN COALESCE(finished_at, ?14) ELSE NULL END,
+                    updated_at=?14 WHERE id=?1",
+                params![
+                    id,
+                    status,
+                    stage,
+                    progress,
+                    estimated_eta,
+                    value_f64(&value, "gpuUsage", "gpu_usage"),
+                    value_f64(&value, "cpuUsage", "cpu_usage"),
+                    value_i64(&value, "ramUsage", "ram_usage"),
+                    value_i64(&value, "diskUsage", "disk_usage"),
+                    value_i64(&value, "currentEpoch", "current_epoch").unwrap_or(job.current_epoch),
+                    value_i64(&value, "totalEpochs", "total_epochs"),
+                    value_f64(&value, "loss", "loss"),
+                    value_f64(&value, "learningRate", "learning_rate"),
+                    timestamp,
+                    value_string(&value, "warning", "warning"),
+                    value_string(&value, "error", "error"),
+                    i64::from(terminal)
+                ],
+            )
+            .map_err(|error| database_error("saving training job heartbeat", error))?;
+    }
+    if let Some(logs) = value["logs"].as_array() {
+        let database = state.database.lock().map_err(|error| error.to_string())?;
+        for log in logs.iter().take(500) {
+            let message = log["message"].as_str().unwrap_or_default();
+            if message.is_empty() {
+                continue;
+            }
+            let cursor = log["cursor"].as_str();
+            database
+                .execute(
+                    "INSERT INTO training_logs(
+                        training_job_id, level, message, cursor, created_at
+                     )
+                     SELECT ?1, ?2, ?3, ?4, ?5
+                     WHERE NOT EXISTS(
+                        SELECT 1 FROM training_logs
+                        WHERE training_job_id=?1 AND cursor IS ?4 AND message=?3
+                     )",
+                    params![
+                        id,
+                        log["level"].as_str().unwrap_or("info"),
+                        message,
+                        cursor,
+                        log["createdAt"].as_str().unwrap_or(&timestamp)
+                    ],
+                )
+                .map_err(|error| database_error("saving training job logs", error))?;
+        }
+    }
+    list_training_jobs(state)?
+        .into_iter()
+        .find(|value| value.id == id)
+        .ok_or_else(|| "Refreshed job could not be reloaded".into())
+}
+
+#[tauri::command]
+pub async fn cancel_training_job(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<TrainingJobRecord, String> {
+    let job = list_training_jobs(state.clone())?
+        .into_iter()
+        .find(|job| job.id == id)
+        .ok_or_else(|| "The selected training job no longer exists".to_string())?;
+    let remote_id = job
+        .remote_job_id
+        .clone()
+        .ok_or_else(|| "Draft jobs can be removed without remote cancellation".to_string())?;
+    let server = active_training_server(state.clone(), job.training_server_id.as_deref())?;
+    let response = state
+        .http
+        .post(api_url(
+            &server.url,
+            &format!("/v1/jobs/{remote_id}/cancel"),
+        ))
+        .header("Idempotency-Key", format!("{}:cancel", job.id))
+        .send()
+        .await
+        .map_err(|error| format!("Could not request training job cancellation: {error}"))?;
+    if !response.status().is_success() {
+        return Err(response_failure(response, "Cancelling the training job").await);
+    }
+    {
+        let database = state.database.lock().map_err(|error| error.to_string())?;
+        database
+            .execute(
+                "UPDATE training_jobs SET status='cancelling', stage='Cancelling',
+                    updated_at=?2 WHERE id=?1",
+                params![id, now()],
+            )
+            .map_err(|error| database_error("saving training cancellation", error))?;
+    }
+    list_training_jobs(state)?
+        .into_iter()
+        .find(|value| value.id == id)
+        .ok_or_else(|| "Cancelled job could not be reloaded".into())
+}
+
+#[tauri::command]
+pub async fn retry_training_job(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<TrainingJobRecord, String> {
+    let source = list_training_jobs(state.clone())?
+        .into_iter()
+        .find(|job| job.id == id)
+        .ok_or_else(|| "The selected training job no longer exists".to_string())?;
+    if source.status != "failed" && source.status != "cancelled" {
+        return Err("Only failed or cancelled jobs can be retried".into());
+    }
+    let remote_id = source
+        .remote_job_id
+        .clone()
+        .ok_or_else(|| "The failed job has no remote identifier".to_string())?;
+    let server = active_training_server(state.clone(), source.training_server_id.as_deref())?;
+    let retry_id = Uuid::new_v4().to_string();
+    let response = state
+        .http
+        .post(api_url(&server.url, &format!("/v1/jobs/{remote_id}/retry")))
+        .header("Idempotency-Key", &retry_id)
+        .send()
+        .await
+        .map_err(|error| format!("Could not retry the training job: {error}"))?;
+    if !response.status().is_success() {
+        return Err(response_failure(response, "Retrying the training job").await);
+    }
+    let response = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    let new_remote_id = response["jobId"]
+        .as_str()
+        .or_else(|| response["id"].as_str())
+        .ok_or_else(|| "Training Manager did not return a retry jobId".to_string())?;
+    let timestamp = now();
+    {
+        let database = state.database.lock().map_err(|error| error.to_string())?;
+        database
+            .execute(
+                "INSERT INTO training_jobs(
+                    id, training_server_id, remote_job_id, dataset_id, model, backend,
+                    parameters_json, status, stage, progress, started_at,
+                    current_epoch, total_epochs, retry_of, created_at, updated_at
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', 'Queued', 0, ?8,
+                    0, ?9, ?10, ?8, ?8
+                 )",
+                params![
+                    retry_id,
+                    server.id,
+                    new_remote_id,
+                    source.dataset_id,
+                    source.model,
+                    source.backend,
+                    source.parameters_json,
+                    timestamp,
+                    source.total_epochs,
+                    source.id
+                ],
+            )
+            .map_err(|error| database_error("saving retried training job", error))?;
+    }
+    list_training_jobs(state)?
+        .into_iter()
+        .find(|value| value.id == retry_id)
+        .ok_or_else(|| "Retried job could not be reloaded".into())
+}
+
+#[tauri::command]
+pub fn list_training_logs(
+    state: State<'_, AppState>,
+    training_job_id: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<TrainingLogRecord>, String> {
+    let database = state.database.lock().map_err(|error| error.to_string())?;
+    let mut statement = database
+        .prepare(
+            "SELECT id, training_job_id, level, message, cursor, created_at
+             FROM training_logs
+             WHERE (?1 IS NULL OR training_job_id = ?1)
+             ORDER BY id DESC LIMIT ?2",
+        )
+        .map_err(|error| database_error("preparing training logs", error))?;
+    let records = statement
+        .query_map(params![training_job_id, limit.unwrap_or(1000)], |row| {
+            Ok(TrainingLogRecord {
+                id: row.get(0)?,
+                training_job_id: row.get(1)?,
+                level: row.get(2)?,
+                message: row.get(3)?,
+                cursor: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })
+        .map_err(|error| database_error("reading training logs", error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| database_error("reading training logs", error))?;
+    Ok(records)
+}
+
+#[tauri::command]
+pub async fn refresh_training_resources(
+    state: State<'_, AppState>,
+    training_server_id: String,
+) -> Result<TrainingResourceRecord, String> {
+    let server = active_training_server(state.clone(), Some(&training_server_id))?;
+    let response = state
+        .http
+        .get(api_url(&server.url, "/v1/resources"))
+        .send()
+        .await
+        .map_err(|error| format!("Could not refresh training server resources: {error}"))?;
+    if !response.status().is_success() {
+        return Err(response_failure(response, "Refreshing training resources").await);
+    }
+    let value = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Training Manager returned invalid resource JSON: {error}"))?;
+    let captured_at = now();
+    let gpu_json = value["gpus"].as_array().cloned().unwrap_or_default();
+    let gpu_json = serde_json::to_string(&gpu_json)
+        .map_err(|error| format!("Could not serialize GPU resources: {error}"))?;
+    {
+        let database = state.database.lock().map_err(|error| error.to_string())?;
+        database
+            .execute(
+                "INSERT INTO training_resources(
+                    training_server_id, gpu_json, cpu_usage, ram_total, ram_used,
+                    disk_total, disk_used, queue_length, captured_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(training_server_id) DO UPDATE SET
+                    gpu_json=excluded.gpu_json, cpu_usage=excluded.cpu_usage,
+                    ram_total=excluded.ram_total, ram_used=excluded.ram_used,
+                    disk_total=excluded.disk_total, disk_used=excluded.disk_used,
+                    queue_length=excluded.queue_length, captured_at=excluded.captured_at",
+                params![
+                    server.id,
+                    gpu_json,
+                    value_f64(&value, "cpuUsage", "cpu_usage"),
+                    value_i64(&value, "ramTotal", "ram_total"),
+                    value_i64(&value, "ramUsed", "ram_used"),
+                    value_i64(&value, "diskTotal", "disk_total"),
+                    value_i64(&value, "diskUsed", "disk_used"),
+                    value_i64(&value, "queueLength", "queue_length").unwrap_or(0),
+                    captured_at
+                ],
+            )
+            .map_err(|error| database_error("saving training resources", error))?;
+    }
+    get_training_resources(state, training_server_id)?
+        .ok_or_else(|| "Training resources could not be reloaded".into())
+}
+
+#[tauri::command]
+pub fn get_training_resources(
+    state: State<'_, AppState>,
+    training_server_id: String,
+) -> Result<Option<TrainingResourceRecord>, String> {
+    let database = state.database.lock().map_err(|error| error.to_string())?;
+    database
+        .query_row(
+            "SELECT training_server_id, gpu_json, cpu_usage, ram_total, ram_used,
+                    disk_total, disk_used, queue_length, captured_at
+             FROM training_resources WHERE training_server_id = ?1",
+            [training_server_id],
+            |row| {
+                Ok(TrainingResourceRecord {
+                    training_server_id: row.get(0)?,
+                    gpu_json: row.get(1)?,
+                    cpu_usage: row.get(2)?,
+                    ram_total: row.get(3)?,
+                    ram_used: row.get(4)?,
+                    disk_total: row.get(5)?,
+                    disk_used: row.get(6)?,
+                    queue_length: row.get(7)?,
+                    captured_at: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| database_error("reading training resources", error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inspect_dataset;
+    use std::fs;
+    use uuid::Uuid;
+
+    #[test]
+    fn validates_and_compresses_jsonl_datasets() {
+        let root = std::env::temp_dir().join(format!("tome-dataset-test-{}", Uuid::new_v4()));
+        let dataset = root.join("instructions.jsonl");
+        fs::create_dir_all(&root).expect("test directory should be created");
+        fs::write(
+            &dataset,
+            "{\"prompt\":\"Hello\",\"response\":\"Hi\"}\n{\"prompt\":\"Bye\",\"response\":\"Goodbye\"}\n",
+        )
+        .expect("test dataset should be written");
+
+        let result = inspect_dataset("fixture", &dataset, &["jsonl".into()], true, &root)
+            .expect("dataset should be inspected");
+
+        assert_eq!(result.status, "valid");
+        assert_eq!(result.file_count, 1);
+        assert!(result.checksum.is_some());
+        assert!(result
+            .artifact_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("fixture.zip")));
+        fs::remove_dir_all(&root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn reports_invalid_jsonl_with_a_line_number() {
+        let root = std::env::temp_dir().join(format!("tome-dataset-test-{}", Uuid::new_v4()));
+        let dataset = root.join("invalid.jsonl");
+        fs::create_dir_all(&root).expect("test directory should be created");
+        fs::write(&dataset, "{\"valid\":true}\nnot-json\n")
+            .expect("test dataset should be written");
+
+        let result = inspect_dataset("invalid", &dataset, &["jsonl".into()], false, &root)
+            .expect("dataset should be inspected");
+
+        assert_eq!(result.status, "invalid");
+        assert!(result.errors.iter().any(|error| error.contains("line 2")));
+        fs::remove_dir_all(&root).expect("test directory should be removed");
+    }
+}

@@ -57,4 +57,22 @@ describe("Tome application shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Security" }));
     expect(screen.getByRole("heading", { name: "Execution mode" })).toBeInTheDocument();
   });
+
+  it("renders the separated training management workspace", async () => {
+    render(
+      <AppProviders>
+        <MemoryRouter initialEntries={["/training"]}>
+          <AppRoutes />
+        </MemoryRouter>
+      </AppProviders>,
+    );
+
+    expect(await screen.findByRole("heading", { name: "Training" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("navigation", { name: "Training sections" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Training Manager servers")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Datasets" }));
+    expect(screen.getByRole("heading", { name: "Datasets" })).toBeInTheDocument();
+  });
 });

@@ -135,6 +135,7 @@ export function HistoryPage(): React.JSX.Element {
               save.mutate({
                 id: renaming.id,
                 model: renaming.model,
+                projectId: renaming.projectId,
                 title,
               });
             }}

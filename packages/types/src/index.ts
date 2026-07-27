@@ -52,6 +52,7 @@ export interface NavigationItem {
     | "projects"
     | "history"
     | "task-queue"
+    | "training"
     | "settings";
   readonly label: string;
   readonly path: string;
@@ -155,6 +156,8 @@ export interface ProjectRecord {
   readonly workspaceId: string | null;
   readonly name: string;
   readonly path: string;
+  readonly archivedAt: string | null;
+  readonly duplicateOf: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly lastOpenedAt: string;
@@ -165,6 +168,7 @@ export interface ProjectInput {
   readonly workspaceId?: string | null;
   readonly name: string;
   readonly path: string;
+  readonly archivedAt?: string | null;
   readonly createDirectory?: boolean;
 }
 
@@ -177,8 +181,11 @@ export interface FileTreeNode {
 
 export interface ConversationRecord {
   readonly id: string;
+  readonly projectId: string | null;
   readonly title: string;
   readonly model: string | null;
+  readonly archivedAt: string | null;
+  readonly duplicateOf: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly messageCount: number;
@@ -187,9 +194,167 @@ export interface ConversationRecord {
 
 export interface ConversationInput {
   readonly id?: string;
+  readonly projectId?: string | null;
   readonly title: string;
   readonly model?: string | null;
 }
+
+export interface TrainingServerRecord {
+  readonly id: string;
+  readonly name: string;
+  readonly url: string;
+  readonly adapter: string;
+  readonly isActive: boolean;
+  readonly status: "unknown" | "connected" | "degraded" | "disconnected";
+  readonly version: string | null;
+  readonly capabilitiesJson: string;
+  readonly lastError: string | null;
+  readonly lastCheckedAt: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface TrainingServerInput {
+  readonly id?: string;
+  readonly name: string;
+  readonly url: string;
+  readonly adapter?: string;
+  readonly isActive: boolean;
+}
+
+export interface TrainingDatasetRecord {
+  readonly id: string;
+  readonly name: string;
+  readonly sourcePath: string;
+  readonly artifactPath: string | null;
+  readonly format: string;
+  readonly size: number;
+  readonly fileCount: number;
+  readonly checksum: string | null;
+  readonly compressed: boolean;
+  readonly validationStatus: "pending" | "valid" | "invalid";
+  readonly validationErrorsJson: string;
+  readonly preview: string | null;
+  readonly remoteDatasetId: string | null;
+  readonly trainingServerId: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface TrainingDatasetInput {
+  readonly id?: string;
+  readonly name: string;
+  readonly sourcePath: string;
+  readonly compress: boolean;
+  readonly supportedFormats?: readonly string[];
+}
+
+export interface DatasetUploadRecord {
+  readonly id: string;
+  readonly datasetId: string;
+  readonly trainingServerId: string;
+  readonly remoteUploadId: string | null;
+  readonly status:
+    "pending" | "uploading" | "paused" | "completed" | "failed" | "cancelled";
+  readonly bytesUploaded: number;
+  readonly totalBytes: number;
+  readonly chunkSize: number;
+  readonly speedBps: number;
+  readonly etaSeconds: number | null;
+  readonly retryCount: number;
+  readonly lastError: string | null;
+  readonly startedAt: string | null;
+  readonly finishedAt: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export type TrainingJobStatus =
+  | "draft"
+  | "queued"
+  | "running"
+  | "paused"
+  | "cancelling"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "unreachable";
+
+export interface TrainingJobRecord {
+  readonly id: string;
+  readonly trainingServerId: string | null;
+  readonly remoteJobId: string | null;
+  readonly datasetId: string;
+  readonly model: string;
+  readonly backend: string;
+  readonly parametersJson: string;
+  readonly status: TrainingJobStatus;
+  readonly stage: string;
+  readonly progress: number;
+  readonly etaSeconds: number | null;
+  readonly startedAt: string | null;
+  readonly finishedAt: string | null;
+  readonly gpuUsage: number | null;
+  readonly cpuUsage: number | null;
+  readonly ramUsage: number | null;
+  readonly diskUsage: number | null;
+  readonly currentEpoch: number;
+  readonly totalEpochs: number;
+  readonly loss: number | null;
+  readonly learningRate: number | null;
+  readonly heartbeatAt: string | null;
+  readonly warning: string | null;
+  readonly error: string | null;
+  readonly retryOf: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface TrainingJobInput {
+  readonly id?: string;
+  readonly trainingServerId?: string | null;
+  readonly datasetId: string;
+  readonly model: string;
+  readonly backend: string;
+  readonly parametersJson: string;
+  readonly totalEpochs: number;
+}
+
+export interface TrainingResourceRecord {
+  readonly trainingServerId: string;
+  readonly gpuJson: string;
+  readonly cpuUsage: number | null;
+  readonly ramTotal: number | null;
+  readonly ramUsed: number | null;
+  readonly diskTotal: number | null;
+  readonly diskUsed: number | null;
+  readonly queueLength: number;
+  readonly capturedAt: string;
+}
+
+export interface TrainingLogRecord {
+  readonly id: number;
+  readonly trainingJobId: string | null;
+  readonly level: "debug" | "info" | "warning" | "error";
+  readonly message: string;
+  readonly cursor: string | null;
+  readonly createdAt: string;
+}
+
+export type TrainingStreamEvent =
+  | {
+      readonly type: "uploadProgress";
+      readonly uploadId: string;
+      readonly bytesUploaded: number;
+      readonly totalBytes: number;
+      readonly progress: number;
+      readonly speedBps: number;
+      readonly etaSeconds: number | null;
+    }
+  | { readonly type: "status"; readonly message: string }
+  | { readonly type: "error"; readonly message: string }
+  | { readonly type: "cancelled" }
+  | { readonly type: "complete"; readonly message: string };
 
 export interface Attachment {
   readonly id: string;

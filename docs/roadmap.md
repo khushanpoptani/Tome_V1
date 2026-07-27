@@ -73,11 +73,15 @@ Dependencies: Phase 2, Phase 4.
 
 Dependencies: Phase 5 and approved agent schemas.
 
-## Phase 7 - Models, datasets, and training
+## Phase 7 - Models, datasets, and training (management foundation complete)
 
 - Implement model install/compare/benchmark views.
-- Implement dataset manifests, upload policy, progress, and training controls.
-- Add Recharts-based resource, token, queue, and training metrics.
+- Implemented dataset inspection, configurable formats, preview, validation, compression,
+  checksums, resumable chunk uploads, retries, cancellation, speed, and ETA.
+- Implemented external Training Manager adapters, job drafts, dispatch, status heartbeat,
+  monitoring, retry/cancel, resource snapshots, and persistent logs.
+- Actual fine-tuning and the external Training Manager runtime remain intentionally out of
+  scope until a backend and deployment environment are selected.
 
 Dependencies: Phase 2, Phase 4, and explicit server management/training APIs.
 

@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc, Mutex},
 };
 
@@ -13,6 +13,7 @@ pub struct AppState {
     pub database: Mutex<Connection>,
     pub http: Client,
     pub cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    pub data_dir: PathBuf,
 }
 
 impl AppState {
@@ -29,6 +30,10 @@ impl AppState {
             database: Mutex::new(database),
             http,
             cancellations: Mutex::new(HashMap::new()),
+            data_dir: database_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
         })
     }
 }

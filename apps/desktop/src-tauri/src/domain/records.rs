@@ -65,6 +65,8 @@ pub struct ProjectRecord {
     pub workspace_id: Option<String>,
     pub name: String,
     pub path: String,
+    pub archived_at: Option<String>,
+    pub duplicate_of: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub last_opened_at: String,
@@ -77,6 +79,7 @@ pub struct ProjectInput {
     pub workspace_id: Option<String>,
     pub name: String,
     pub path: String,
+    pub archived_at: Option<String>,
     #[serde(default)]
     pub create_directory: bool,
 }
@@ -85,8 +88,11 @@ pub struct ProjectInput {
 #[serde(rename_all = "camelCase")]
 pub struct ConversationRecord {
     pub id: String,
+    pub project_id: Option<String>,
     pub title: String,
     pub model: Option<String>,
+    pub archived_at: Option<String>,
+    pub duplicate_of: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub message_count: i64,
@@ -97,8 +103,158 @@ pub struct ConversationRecord {
 #[serde(rename_all = "camelCase")]
 pub struct ConversationInput {
     pub id: Option<String>,
+    pub project_id: Option<String>,
     pub title: String,
     pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingServerRecord {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub adapter: String,
+    pub is_active: bool,
+    pub status: String,
+    pub version: Option<String>,
+    pub capabilities_json: String,
+    pub last_error: Option<String>,
+    pub last_checked_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingServerInput {
+    pub id: Option<String>,
+    pub name: String,
+    pub url: String,
+    pub adapter: Option<String>,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingDatasetRecord {
+    pub id: String,
+    pub name: String,
+    pub source_path: String,
+    pub artifact_path: Option<String>,
+    pub format: String,
+    pub size: i64,
+    pub file_count: i64,
+    pub checksum: Option<String>,
+    pub compressed: bool,
+    pub validation_status: String,
+    pub validation_errors_json: String,
+    pub preview: Option<String>,
+    pub remote_dataset_id: Option<String>,
+    pub training_server_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingDatasetInput {
+    pub id: Option<String>,
+    pub name: String,
+    pub source_path: String,
+    #[serde(default)]
+    pub compress: bool,
+    pub supported_formats: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetUploadRecord {
+    pub id: String,
+    pub dataset_id: String,
+    pub training_server_id: String,
+    pub remote_upload_id: Option<String>,
+    pub status: String,
+    pub bytes_uploaded: i64,
+    pub total_bytes: i64,
+    pub chunk_size: i64,
+    pub speed_bps: f64,
+    pub eta_seconds: Option<i64>,
+    pub retry_count: i64,
+    pub last_error: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingJobRecord {
+    pub id: String,
+    pub training_server_id: Option<String>,
+    pub remote_job_id: Option<String>,
+    pub dataset_id: String,
+    pub model: String,
+    pub backend: String,
+    pub parameters_json: String,
+    pub status: String,
+    pub stage: String,
+    pub progress: f64,
+    pub eta_seconds: Option<i64>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub gpu_usage: Option<f64>,
+    pub cpu_usage: Option<f64>,
+    pub ram_usage: Option<i64>,
+    pub disk_usage: Option<i64>,
+    pub current_epoch: i64,
+    pub total_epochs: i64,
+    pub loss: Option<f64>,
+    pub learning_rate: Option<f64>,
+    pub heartbeat_at: Option<String>,
+    pub warning: Option<String>,
+    pub error: Option<String>,
+    pub retry_of: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingJobInput {
+    pub id: Option<String>,
+    pub training_server_id: Option<String>,
+    pub dataset_id: String,
+    pub model: String,
+    pub backend: String,
+    pub parameters_json: String,
+    pub total_epochs: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingResourceRecord {
+    pub training_server_id: String,
+    pub gpu_json: String,
+    pub cpu_usage: Option<f64>,
+    pub ram_total: Option<i64>,
+    pub ram_used: Option<i64>,
+    pub disk_total: Option<i64>,
+    pub disk_used: Option<i64>,
+    pub queue_length: i64,
+    pub captured_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingLogRecord {
+    pub id: i64,
+    pub training_job_id: Option<String>,
+    pub level: String,
+    pub message: String,
+    pub cursor: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

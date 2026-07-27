@@ -19,6 +19,16 @@ import type {
   StreamEvent,
   TaskInput,
   TaskRecord,
+  DatasetUploadRecord,
+  TrainingDatasetInput,
+  TrainingDatasetRecord,
+  TrainingJobInput,
+  TrainingJobRecord,
+  TrainingLogRecord,
+  TrainingResourceRecord,
+  TrainingServerInput,
+  TrainingServerRecord,
+  TrainingStreamEvent,
   WorkspaceInput,
   WorkspaceRecord,
 } from "@tome/types";
@@ -54,14 +64,29 @@ export const backend = {
   clearLogs: () => command<void>("clear_logs"),
   deleteConversation: (id: string) => command<void>("delete_conversation", { id }),
   deleteProject: (id: string) => command<void>("delete_project", { id }),
+  archiveProject: (id: string, archived: boolean) =>
+    command<ProjectRecord>("archive_project", { id, archived }),
+  duplicateProject: (id: string) => command<ProjectRecord>("duplicate_project", { id }),
+  moveConversation: (id: string, projectId: string | null) =>
+    command<ConversationRecord>("move_conversation", { id, projectId }),
+  duplicateConversation: (id: string, projectId?: string | null) =>
+    command<ConversationRecord>("duplicate_conversation", { id, projectId }),
   deleteServer: (id: string) => command<void>("delete_server", { id }),
   deleteWorkspace: (id: string) => command<void>("delete_workspace", { id }),
   deleteModel: (url: string, model: string) =>
     command<void>("delete_ollama_model", { url, model }),
   getActiveServer: () => command<ServerRecord | null>("get_active_server"),
   getSettings: () => command<Array<[string, string]>>("get_settings"),
-  listConversations: (search?: string) =>
-    command<ConversationRecord[]>("list_conversations", { search }),
+  listConversations: (
+    search?: string,
+    projectId?: string | null,
+    includeArchived = false,
+  ) =>
+    command<ConversationRecord[]>("list_conversations", {
+      search,
+      projectId,
+      includeArchived,
+    }),
   listConnectionHistory: (serverId: string) =>
     command<ConnectionHistoryRecord[]>("list_connection_history", { serverId }),
   listLogs: (limit = 200) => command<LogRecord[]>("list_logs", { limit }),
@@ -70,7 +95,8 @@ export const backend = {
   listModels: (url: string) => command<OllamaModel[]>("list_ollama_models", { url }),
   listModelTests: (serverId: string) =>
     command<ModelTestRecord[]>("list_model_tests", { serverId }),
-  listProjects: () => command<ProjectRecord[]>("list_projects"),
+  listProjects: (includeArchived = false) =>
+    command<ProjectRecord[]>("list_projects", { includeArchived }),
   listServers: () => command<ServerRecord[]>("list_servers"),
   listTasks: () => command<TaskRecord[]>("list_tasks"),
   listWorkspaces: () => command<WorkspaceRecord[]>("list_workspaces"),
@@ -96,7 +122,56 @@ export const backend = {
     command<OllamaModelInformation>("show_ollama_model", { url, model }),
   testServer: (input: { serverId?: string; url: string; verifyStreaming?: boolean }) =>
     command<ServerDiagnostics>("test_ollama_server", { input }),
+  listTrainingServers: () => command<TrainingServerRecord[]>("list_training_servers"),
+  saveTrainingServer: (input: TrainingServerInput) =>
+    command<TrainingServerRecord>("save_training_server", { input }),
+  setActiveTrainingServer: (id: string) =>
+    command<void>("set_active_training_server", { id }),
+  deleteTrainingServer: (id: string) => command<void>("delete_training_server", { id }),
+  testTrainingServer: (id: string) =>
+    command<TrainingServerRecord>("test_training_server", { id }),
+  listTrainingDatasets: () => command<TrainingDatasetRecord[]>("list_training_datasets"),
+  saveTrainingDataset: (input: TrainingDatasetInput) =>
+    command<TrainingDatasetRecord>("save_training_dataset", { input }),
+  deleteTrainingDataset: (id: string) => command<void>("delete_training_dataset", { id }),
+  listDatasetUploads: () => command<DatasetUploadRecord[]>("list_dataset_uploads"),
+  cancelDatasetUpload: (id: string) => command<void>("cancel_dataset_upload", { id }),
+  listTrainingJobs: () => command<TrainingJobRecord[]>("list_training_jobs"),
+  saveTrainingJob: (input: TrainingJobInput) =>
+    command<TrainingJobRecord>("save_training_job", { input }),
+  deleteTrainingJob: (id: string) => command<void>("delete_training_job", { id }),
+  dispatchTrainingJob: (id: string) =>
+    command<TrainingJobRecord>("dispatch_training_job", { id }),
+  refreshTrainingJob: (id: string) =>
+    command<TrainingJobRecord>("refresh_training_job", { id }),
+  cancelTrainingJob: (id: string) =>
+    command<TrainingJobRecord>("cancel_training_job", { id }),
+  retryTrainingJob: (id: string) =>
+    command<TrainingJobRecord>("retry_training_job", { id }),
+  listTrainingLogs: (trainingJobId?: string, limit = 500) =>
+    command<TrainingLogRecord[]>("list_training_logs", { trainingJobId, limit }),
+  refreshTrainingResources: (trainingServerId: string) =>
+    command<TrainingResourceRecord>("refresh_training_resources", {
+      trainingServerId,
+    }),
+  getTrainingResources: (trainingServerId: string) =>
+    command<TrainingResourceRecord | null>("get_training_resources", {
+      trainingServerId,
+    }),
 };
+
+export async function startDatasetUpload(
+  datasetId: string,
+  trainingServerId: string,
+  onEvent: (event: TrainingStreamEvent) => void,
+): Promise<void> {
+  const onEventChannel = new Channel<TrainingStreamEvent>(onEvent);
+  await command<void>("start_dataset_upload", {
+    datasetId,
+    trainingServerId,
+    onEvent: onEventChannel,
+  });
+}
 
 export async function pullModel(
   requestId: string,

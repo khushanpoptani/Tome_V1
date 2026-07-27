@@ -1,0 +1,1333 @@
+import {
+  EmptyState,
+  inputClassName,
+  Modal,
+  PageHeader,
+  textAreaClassName,
+} from "@/components/common/page";
+import { backend, isTauriRuntime, startDatasetUpload } from "@/lib/backend";
+import { errorMessage, formatBytes, formatDate } from "@/lib/format";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import type {
+  TrainingDatasetRecord,
+  TrainingJobRecord,
+  TrainingStreamEvent,
+} from "@tome/types";
+import { Badge, Button, Card, cn } from "@tome/ui";
+import {
+  Activity,
+  Archive,
+  Ban,
+  CheckCircle2,
+  CircleAlert,
+  Clock3,
+  Database,
+  FileArchive,
+  Gauge,
+  HardDrive,
+  History,
+  ListChecks,
+  Logs,
+  MemoryStick,
+  Pencil,
+  Play,
+  Plus,
+  RefreshCw,
+  RotateCcw,
+  Server,
+  Square,
+  Trash2,
+  UploadCloud,
+  XCircle,
+} from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { toast } from "sonner";
+
+const sections = [
+  ["dashboard", "Dashboard", Gauge],
+  ["datasets", "Datasets", Database],
+  ["jobs", "Training Jobs", ListChecks],
+  ["running", "Running Jobs", Activity],
+  ["completed", "Completed Jobs", CheckCircle2],
+  ["failed", "Failed Jobs", XCircle],
+  ["history", "Training History", History],
+  ["resources", "Server Resources", MemoryStick],
+  ["logs", "Logs", Logs],
+] as const;
+
+type SectionId = (typeof sections)[number][0];
+
+interface ServerForm {
+  readonly id?: string;
+  readonly name: string;
+  readonly url: string;
+  readonly isActive: boolean;
+}
+
+interface DatasetForm {
+  readonly id?: string;
+  readonly name: string;
+  readonly sourcePath: string;
+  readonly compress: boolean;
+  readonly supportedFormats: string;
+}
+
+interface JobForm {
+  readonly datasetId: string;
+  readonly model: string;
+  readonly backend: string;
+  readonly totalEpochs: number;
+  readonly parametersJson: string;
+}
+
+function percent(value: number | null | undefined): string {
+  return `${Math.round(Math.max(0, Math.min(100, value ?? 0)))}%`;
+}
+
+function duration(seconds: number | null): string {
+  if (seconds === null || !Number.isFinite(seconds)) {
+    return "Calculating";
+  }
+  if (seconds < 60) {
+    return `${Math.max(0, Math.round(seconds))}s`;
+  }
+  const minutes = Math.round(seconds / 60);
+  return minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+function Metric({
+  detail,
+  icon: Icon,
+  label,
+  value,
+}: {
+  readonly detail: string;
+  readonly icon: typeof Gauge;
+  readonly label: string;
+  readonly value: string;
+}): React.JSX.Element {
+  return (
+    <Card className="p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="text-[10px] font-medium uppercase tracking-[0.12em] text-muted-foreground">
+            {label}
+          </p>
+          <p className="mt-2 text-xl font-semibold">{value}</p>
+          <p className="mt-1 text-[10px] text-muted-foreground">{detail}</p>
+        </div>
+        <span className="grid size-8 place-items-center rounded-lg bg-violet-500/10 text-violet-400">
+          <Icon className="size-4" />
+        </span>
+      </div>
+    </Card>
+  );
+}
+
+function ProgressBar({ value }: { readonly value: number }): React.JSX.Element {
+  return (
+    <div
+      aria-label={`${Math.round(value)} percent complete`}
+      className="h-1.5 overflow-hidden rounded-full bg-secondary"
+      role="progressbar"
+    >
+      <div
+        className="h-full rounded-full bg-violet-500 transition-[width] duration-300"
+        style={{ width: percent(value) }}
+      />
+    </div>
+  );
+}
+
+function StatusBadge({ value }: { readonly value: string }): React.JSX.Element {
+  const tone =
+    value === "completed" || value === "valid" || value === "connected"
+      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+      : value === "failed" || value === "invalid" || value === "disconnected"
+        ? "border-red-500/30 bg-red-500/10 text-red-400"
+        : value === "running" || value === "uploading"
+          ? "border-blue-500/30 bg-blue-500/10 text-blue-400"
+          : "text-muted-foreground";
+  return <Badge className={tone}>{value}</Badge>;
+}
+
+function parseValidationErrors(dataset: TrainingDatasetRecord): readonly string[] {
+  try {
+    const value: unknown = JSON.parse(dataset.validationErrorsJson);
+    return Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === "string")
+      : [];
+  } catch {
+    return ["Validation details could not be decoded."];
+  }
+}
+
+export function TrainingPage(): React.JSX.Element {
+  const queryClient = useQueryClient();
+  const [section, setSection] = useState<SectionId>("dashboard");
+  const [serverForm, setServerForm] = useState<ServerForm | null>(null);
+  const [datasetForm, setDatasetForm] = useState<DatasetForm | null>(null);
+  const [jobForm, setJobForm] = useState<JobForm | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<
+    Readonly<Record<string, TrainingStreamEvent>>
+  >({});
+
+  const servers = useQuery({
+    enabled: isTauriRuntime(),
+    queryFn: backend.listTrainingServers,
+    queryKey: ["training-servers"],
+  });
+  const datasets = useQuery({
+    enabled: isTauriRuntime(),
+    queryFn: backend.listTrainingDatasets,
+    queryKey: ["training-datasets"],
+  });
+  const uploads = useQuery({
+    enabled: isTauriRuntime(),
+    queryFn: backend.listDatasetUploads,
+    queryKey: ["dataset-uploads"],
+    refetchInterval: 2_000,
+  });
+  const jobs = useQuery({
+    enabled: isTauriRuntime(),
+    queryFn: backend.listTrainingJobs,
+    queryKey: ["training-jobs"],
+    refetchInterval: 5_000,
+  });
+  const logs = useQuery({
+    enabled: isTauriRuntime(),
+    queryFn: () => backend.listTrainingLogs(undefined, 500),
+    queryKey: ["training-logs"],
+    refetchInterval: section === "logs" ? 3_000 : false,
+  });
+  const activeServer = servers.data?.find((server) => server.isActive) ?? null;
+  const resources = useQuery({
+    enabled: isTauriRuntime() && activeServer !== null,
+    queryFn: () => backend.getTrainingResources(activeServer?.id ?? ""),
+    queryKey: ["training-resources", activeServer?.id],
+  });
+
+  const refreshAll = (): void => {
+    void Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["training-servers"] }),
+      queryClient.invalidateQueries({ queryKey: ["training-datasets"] }),
+      queryClient.invalidateQueries({ queryKey: ["dataset-uploads"] }),
+      queryClient.invalidateQueries({ queryKey: ["training-jobs"] }),
+      queryClient.invalidateQueries({ queryKey: ["training-logs"] }),
+      queryClient.invalidateQueries({ queryKey: ["training-resources"] }),
+    ]);
+  };
+
+  useEffect(() => {
+    const activeJobs = (jobs.data ?? []).filter(
+      (job) =>
+        job.remoteJobId !== null &&
+        ["queued", "running", "paused", "cancelling", "unreachable"].includes(job.status),
+    );
+    if (activeJobs.length === 0) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void Promise.allSettled(
+        activeJobs.map(async (job) => backend.refreshTrainingJob(job.id)),
+      ).then(() => {
+        void queryClient.invalidateQueries({ queryKey: ["training-jobs"] });
+        void queryClient.invalidateQueries({ queryKey: ["training-logs"] });
+      });
+    }, 5_000);
+    return () => window.clearInterval(timer);
+  }, [jobs.data, queryClient]);
+
+  useEffect(() => {
+    if (activeServer === null || activeServer.status !== "connected") {
+      return;
+    }
+    const refresh = (): void => {
+      void backend
+        .refreshTrainingResources(activeServer.id)
+        .then(() => queryClient.invalidateQueries({ queryKey: ["training-resources"] }))
+        .catch(() => undefined);
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 10_000);
+    return () => window.clearInterval(timer);
+  }, [activeServer, queryClient]);
+
+  const saveServer = useMutation({
+    mutationFn: backend.saveTrainingServer,
+    onError: (error) => toast.error(errorMessage(error)),
+    onSuccess: () => {
+      setServerForm(null);
+      refreshAll();
+      toast.success("Training server saved.");
+    },
+  });
+  const serverAction = useMutation({
+    mutationFn: async ({
+      action,
+      id,
+    }: {
+      readonly action: "activate" | "delete" | "test";
+      readonly id: string;
+    }) => {
+      if (action === "activate") {
+        await backend.setActiveTrainingServer(id);
+      } else if (action === "delete") {
+        await backend.deleteTrainingServer(id);
+      } else {
+        await backend.testTrainingServer(id);
+      }
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+    onSuccess: (_, value) => {
+      refreshAll();
+      toast.success(
+        value.action === "test"
+          ? "Training server diagnostics updated."
+          : value.action === "activate"
+            ? "Active training server updated."
+            : "Training server removed.",
+      );
+    },
+  });
+  const saveDataset = useMutation({
+    mutationFn: backend.saveTrainingDataset,
+    onError: (error) => toast.error(errorMessage(error)),
+    onSuccess: (dataset) => {
+      setDatasetForm(null);
+      refreshAll();
+      if (dataset.validationStatus === "valid") {
+        toast.success("Dataset validated and saved.");
+      } else {
+        toast.warning("Dataset saved with validation errors.");
+      }
+    },
+  });
+  const removeDataset = useMutation({
+    mutationFn: backend.deleteTrainingDataset,
+    onError: (error) => toast.error(errorMessage(error)),
+    onSuccess: () => {
+      refreshAll();
+      toast.success("Dataset and managed archive removed.");
+    },
+  });
+  const saveJob = useMutation({
+    mutationFn: backend.saveTrainingJob,
+    onError: (error) => toast.error(errorMessage(error)),
+    onSuccess: () => {
+      setJobForm(null);
+      refreshAll();
+      toast.success("Training job draft saved. No training has started.");
+    },
+  });
+  const jobAction = useMutation({
+    mutationFn: async ({
+      action,
+      id,
+    }: {
+      readonly action: "cancel" | "delete" | "dispatch" | "refresh" | "retry";
+      readonly id: string;
+    }) => {
+      if (action === "cancel") return backend.cancelTrainingJob(id);
+      if (action === "delete") return backend.deleteTrainingJob(id);
+      if (action === "dispatch") return backend.dispatchTrainingJob(id);
+      if (action === "refresh") return backend.refreshTrainingJob(id);
+      return backend.retryTrainingJob(id);
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+    onSuccess: (_, value) => {
+      refreshAll();
+      toast.success(
+        value.action === "dispatch"
+          ? "Job submitted to the external Training Manager."
+          : `Training job ${value.action} completed.`,
+      );
+    },
+  });
+
+  const visibleJobs = useMemo(() => {
+    const all = jobs.data ?? [];
+    if (section === "running") {
+      return all.filter((job) =>
+        ["queued", "running", "paused", "cancelling", "unreachable"].includes(job.status),
+      );
+    }
+    if (section === "completed") return all.filter((job) => job.status === "completed");
+    if (section === "failed") return all.filter((job) => job.status === "failed");
+    if (section === "history")
+      return all.filter((job) =>
+        ["completed", "failed", "cancelled"].includes(job.status),
+      );
+    return all;
+  }, [jobs.data, section]);
+  const running = (jobs.data ?? []).filter((job) =>
+    ["queued", "running", "paused", "cancelling"].includes(job.status),
+  );
+  const completed = (jobs.data ?? []).filter((job) => job.status === "completed");
+  const failed = (jobs.data ?? []).filter((job) => job.status === "failed");
+  const averageSeconds =
+    completed.length === 0
+      ? null
+      : completed.reduce((total, job) => {
+          if (job.startedAt === null || job.finishedAt === null) return total;
+          return total + (Date.parse(job.finishedAt) - Date.parse(job.startedAt)) / 1000;
+        }, 0) / completed.length;
+  const earliestEta =
+    running
+      .map((job) => job.etaSeconds)
+      .filter((value): value is number => value !== null)
+      .sort((left, right) => left - right)[0] ?? null;
+
+  const beginUpload = (dataset: TrainingDatasetRecord): void => {
+    if (activeServer === null) {
+      toast.error("Configure and activate an external Training Manager first.");
+      return;
+    }
+    void startDatasetUpload(dataset.id, activeServer.id, (event) => {
+      setUploadProgress((current) => ({ ...current, [dataset.id]: event }));
+      if (event.type === "complete") {
+        toast.success(event.message);
+        refreshAll();
+      } else if (event.type === "error") {
+        toast.error(event.message);
+        refreshAll();
+      }
+    }).catch((error: unknown) => toast.error(errorMessage(error)));
+  };
+
+  return (
+    <div className="min-h-full">
+      <PageHeader
+        actions={
+          <Button onClick={refreshAll} size="sm" variant="outline">
+            <RefreshCw className="size-3.5" />
+            Refresh
+          </Button>
+        }
+        description="Manage external fine-tuning infrastructure without running training on this desktop."
+        icon={Activity}
+        title="Training"
+      />
+      <div className="grid min-h-[650px] lg:grid-cols-[190px_minmax(0,1fr)]">
+        <nav
+          aria-label="Training sections"
+          className="border-b border-border bg-panel p-3 lg:border-b-0 lg:border-r"
+        >
+          <div className="grid grid-cols-2 gap-1 sm:grid-cols-3 lg:grid-cols-1">
+            {sections.map(([id, label, Icon]) => (
+              <button
+                className={cn(
+                  "flex h-9 items-center gap-2 rounded-md px-3 text-left text-[11px] text-muted-foreground transition hover:bg-accent hover:text-foreground",
+                  section === id && "bg-accent text-foreground",
+                )}
+                key={id}
+                onClick={() => setSection(id)}
+                type="button"
+              >
+                <Icon className="size-3.5 shrink-0" />
+                <span className="truncate">{label}</span>
+              </button>
+            ))}
+          </div>
+        </nav>
+        <main className="min-w-0 p-5 lg:p-7">
+          {section === "dashboard" ? (
+            <div className="space-y-6">
+              <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                <Metric
+                  detail="Queued or actively training"
+                  icon={Activity}
+                  label="Active Jobs"
+                  value={String(running.length)}
+                />
+                <Metric
+                  detail={`${failed.length} failed`}
+                  icon={CheckCircle2}
+                  label="Completed Jobs"
+                  value={String(completed.length)}
+                />
+                <Metric
+                  detail={duration(averageSeconds)}
+                  icon={Clock3}
+                  label="Average Training"
+                  value={
+                    averageSeconds === null ? "No history" : duration(averageSeconds)
+                  }
+                />
+                <Metric
+                  detail="Earliest active job estimate"
+                  icon={Gauge}
+                  label="Next Completion"
+                  value={earliestEta === null ? "Unknown" : duration(earliestEta)}
+                />
+              </section>
+              <section>
+                <div className="mb-3 flex items-center justify-between">
+                  <div>
+                    <h2 className="text-sm font-semibold">Training Manager servers</h2>
+                    <p className="mt-1 text-[10px] text-muted-foreground">
+                      Uses the documented tome-training/v1 adapter; Ollama remains the
+                      inference and model registry endpoint.
+                    </p>
+                  </div>
+                  <Button
+                    onClick={() =>
+                      setServerForm({
+                        isActive: (servers.data?.length ?? 0) === 0,
+                        name: "",
+                        url: "",
+                      })
+                    }
+                    size="sm"
+                  >
+                    <Plus className="size-3.5" />
+                    Add server
+                  </Button>
+                </div>
+                {(servers.data?.length ?? 0) === 0 ? (
+                  <Card>
+                    <EmptyState
+                      action={
+                        <Button
+                          onClick={() =>
+                            setServerForm({
+                              isActive: true,
+                              name: "Training Manager",
+                              url: "",
+                            })
+                          }
+                          size="sm"
+                        >
+                          Configure server
+                        </Button>
+                      }
+                      description="Tome will store datasets and job drafts locally, but upload and dispatch require an external Training Manager implementing tome-training/v1."
+                      icon={Server}
+                      title="No training server configured"
+                    />
+                  </Card>
+                ) : (
+                  <div className="grid gap-3">
+                    {servers.data?.map((server) => (
+                      <Card
+                        className="flex flex-wrap items-center gap-3 p-4"
+                        key={server.id}
+                      >
+                        <span className="grid size-9 place-items-center rounded-lg bg-secondary">
+                          <Server className="size-4 text-violet-400" />
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="text-xs font-semibold">{server.name}</span>
+                            <StatusBadge value={server.status} />
+                            {server.isActive ? <Badge>Active</Badge> : null}
+                          </div>
+                          <p className="mt-1 truncate font-mono text-[9px] text-muted-foreground">
+                            {server.url} · {server.adapter}
+                          </p>
+                          {server.lastError === null ? null : (
+                            <p className="mt-1 text-[10px] text-red-400">
+                              {server.lastError}
+                            </p>
+                          )}
+                        </div>
+                        <div className="flex gap-1">
+                          <Button
+                            disabled={serverAction.isPending}
+                            onClick={() =>
+                              serverAction.mutate({ action: "test", id: server.id })
+                            }
+                            size="sm"
+                            variant="outline"
+                          >
+                            Test
+                          </Button>
+                          {server.isActive ? null : (
+                            <Button
+                              onClick={() =>
+                                serverAction.mutate({
+                                  action: "activate",
+                                  id: server.id,
+                                })
+                              }
+                              size="sm"
+                              variant="ghost"
+                            >
+                              Activate
+                            </Button>
+                          )}
+                          <Button
+                            aria-label={`Edit ${server.name}`}
+                            onClick={() =>
+                              setServerForm({
+                                id: server.id,
+                                isActive: server.isActive,
+                                name: server.name,
+                                url: server.url,
+                              })
+                            }
+                            size="icon"
+                            variant="ghost"
+                          >
+                            <Pencil className="size-3.5" />
+                          </Button>
+                          <Button
+                            aria-label={`Delete ${server.name}`}
+                            onClick={() => {
+                              if (window.confirm(`Remove "${server.name}"?`)) {
+                                serverAction.mutate({
+                                  action: "delete",
+                                  id: server.id,
+                                });
+                              }
+                            }}
+                            size="icon"
+                            variant="ghost"
+                          >
+                            <Trash2 className="size-3.5" />
+                          </Button>
+                        </div>
+                      </Card>
+                    ))}
+                  </div>
+                )}
+              </section>
+            </div>
+          ) : null}
+
+          {section === "datasets" ? (
+            <section>
+              <div className="mb-4 flex items-center justify-between">
+                <div>
+                  <h2 className="text-sm font-semibold">Datasets</h2>
+                  <p className="mt-1 text-[10px] text-muted-foreground">
+                    Validate local files, optionally create a managed ZIP, then upload in
+                    resumable chunks.
+                  </p>
+                </div>
+                <Button
+                  onClick={() =>
+                    setDatasetForm({
+                      compress: true,
+                      name: "",
+                      sourcePath: "",
+                      supportedFormats: "jsonl,json,csv,parquet,txt,md",
+                    })
+                  }
+                  size="sm"
+                >
+                  <Plus className="size-3.5" />
+                  Add dataset
+                </Button>
+              </div>
+              {(datasets.data?.length ?? 0) === 0 ? (
+                <Card>
+                  <EmptyState
+                    description="Add a local dataset file or directory. Tome validates it before any network upload."
+                    icon={FileArchive}
+                    title="No datasets"
+                  />
+                </Card>
+              ) : (
+                <div className="grid gap-3">
+                  {datasets.data?.map((dataset) => {
+                    const latest = uploads.data?.find(
+                      (upload) => upload.datasetId === dataset.id,
+                    );
+                    const event = uploadProgress[dataset.id];
+                    const progress =
+                      event?.type === "uploadProgress"
+                        ? event.progress
+                        : latest === undefined || latest.totalBytes === 0
+                          ? 0
+                          : (latest.bytesUploaded / latest.totalBytes) * 100;
+                    return (
+                      <Card className="p-4" key={dataset.id}>
+                        <div className="flex flex-wrap items-start gap-3">
+                          <span className="grid size-9 place-items-center rounded-lg bg-secondary">
+                            {dataset.compressed ? (
+                              <Archive className="size-4 text-violet-400" />
+                            ) : (
+                              <Database className="size-4 text-violet-400" />
+                            )}
+                          </span>
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-xs font-semibold">
+                                {dataset.name}
+                              </span>
+                              <StatusBadge value={dataset.validationStatus} />
+                              <Badge>{dataset.format}</Badge>
+                            </div>
+                            <p className="mt-1 truncate font-mono text-[9px] text-muted-foreground">
+                              {dataset.sourcePath}
+                            </p>
+                            <p className="mt-1 text-[10px] text-muted-foreground">
+                              {formatBytes(dataset.size)} · {dataset.fileCount} files ·{" "}
+                              {dataset.compressed ? "compressed" : "original"}
+                            </p>
+                          </div>
+                          <div className="flex flex-wrap gap-1">
+                            <Button
+                              disabled={
+                                dataset.validationStatus !== "valid" ||
+                                activeServer === null ||
+                                latest?.status === "uploading"
+                              }
+                              onClick={() => beginUpload(dataset)}
+                              size="sm"
+                              variant="outline"
+                            >
+                              <UploadCloud className="size-3.5" />
+                              {latest?.status === "failed" ||
+                              latest?.status === "cancelled" ||
+                              latest?.status === "paused"
+                                ? "Resume"
+                                : latest?.status === "completed"
+                                  ? "Replace remote"
+                                  : "Upload"}
+                            </Button>
+                            {latest?.status === "uploading" ? (
+                              <Button
+                                onClick={() => {
+                                  void backend
+                                    .cancelDatasetUpload(latest.id)
+                                    .then(refreshAll)
+                                    .catch((error: unknown) =>
+                                      toast.error(errorMessage(error)),
+                                    );
+                                }}
+                                size="sm"
+                                variant="ghost"
+                              >
+                                <Square className="size-3" />
+                                Cancel
+                              </Button>
+                            ) : null}
+                            <Button
+                              aria-label={`Replace ${dataset.name}`}
+                              onClick={() =>
+                                setDatasetForm({
+                                  compress: dataset.compressed,
+                                  id: dataset.id,
+                                  name: dataset.name,
+                                  sourcePath: dataset.sourcePath,
+                                  supportedFormats: "jsonl,json,csv,parquet,txt,md",
+                                })
+                              }
+                              size="icon"
+                              variant="ghost"
+                            >
+                              <Pencil className="size-3.5" />
+                            </Button>
+                            <Button
+                              aria-label={`Delete ${dataset.name}`}
+                              onClick={() => {
+                                if (window.confirm(`Remove dataset "${dataset.name}"?`)) {
+                                  removeDataset.mutate(dataset.id);
+                                }
+                              }}
+                              size="icon"
+                              variant="ghost"
+                            >
+                              <Trash2 className="size-3.5" />
+                            </Button>
+                          </div>
+                        </div>
+                        {latest === undefined ? null : (
+                          <div className="mt-3 rounded-lg border border-border bg-background/50 p-3">
+                            <div className="mb-2 flex items-center justify-between text-[10px]">
+                              <span>
+                                <StatusBadge value={latest.status} />
+                              </span>
+                              <span className="text-muted-foreground">
+                                {formatBytes(latest.speedBps)}/s · ETA{" "}
+                                {duration(latest.etaSeconds)}
+                              </span>
+                            </div>
+                            <ProgressBar value={progress} />
+                            {latest.lastError === null ? null : (
+                              <p className="mt-2 text-[10px] text-red-400">
+                                {latest.lastError}
+                              </p>
+                            )}
+                          </div>
+                        )}
+                        {dataset.preview === null ? null : (
+                          <details className="mt-3 text-[10px]">
+                            <summary className="text-muted-foreground">
+                              Preview and validation
+                            </summary>
+                            <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-background p-3 font-mono text-[9px]">
+                              {dataset.preview}
+                            </pre>
+                            {parseValidationErrors(dataset).map((message) => (
+                              <p className="mt-1 text-red-400" key={message}>
+                                {message}
+                              </p>
+                            ))}
+                          </details>
+                        )}
+                      </Card>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          ) : null}
+
+          {["jobs", "running", "completed", "failed", "history"].includes(section) ? (
+            <section>
+              <div className="mb-4 flex items-center justify-between">
+                <div>
+                  <h2 className="text-sm font-semibold">
+                    {sections.find(([id]) => id === section)?.[1]}
+                  </h2>
+                  <p className="mt-1 text-[10px] text-muted-foreground">
+                    Drafts are local. Dispatch explicitly submits a validated dataset to
+                    the active external Training Manager.
+                  </p>
+                </div>
+                {section === "jobs" ? (
+                  <Button
+                    disabled={(datasets.data?.length ?? 0) === 0}
+                    onClick={() =>
+                      setJobForm({
+                        backend: "auto",
+                        datasetId: datasets.data?.[0]?.id ?? "",
+                        model: "",
+                        parametersJson:
+                          '{\n  "learningRate": 0.0002,\n  "batchSize": 2,\n  "method": "lora"\n}',
+                        totalEpochs: 3,
+                      })
+                    }
+                    size="sm"
+                  >
+                    <Plus className="size-3.5" />
+                    New job
+                  </Button>
+                ) : null}
+              </div>
+              {visibleJobs.length === 0 ? (
+                <Card>
+                  <EmptyState
+                    description={
+                      section === "jobs"
+                        ? "Create a dataset first, then define a local training job draft."
+                        : `There are no ${section} training jobs.`
+                    }
+                    icon={ListChecks}
+                    title="No training jobs"
+                  />
+                </Card>
+              ) : (
+                <div className="grid gap-3">
+                  {visibleJobs.map((job) => (
+                    <JobCard
+                      dataset={datasets.data?.find(
+                        (dataset) => dataset.id === job.datasetId,
+                      )}
+                      job={job}
+                      key={job.id}
+                      onAction={(action) => jobAction.mutate({ action, id: job.id })}
+                      pending={jobAction.isPending}
+                    />
+                  ))}
+                </div>
+              )}
+            </section>
+          ) : null}
+
+          {section === "resources" ? (
+            <section>
+              <h2 className="text-sm font-semibold">Server resources</h2>
+              <p className="mt-1 text-[10px] text-muted-foreground">
+                Refreshed every ten seconds while the active Training Manager is
+                connected.
+              </p>
+              {activeServer === null ? (
+                <Card className="mt-4">
+                  <EmptyState
+                    description="Select an active Training Manager from the dashboard."
+                    icon={Server}
+                    title="No active server"
+                  />
+                </Card>
+              ) : resources.data === null || resources.data === undefined ? (
+                <Card className="mt-4">
+                  <EmptyState
+                    action={
+                      <Button
+                        onClick={() => {
+                          void backend
+                            .refreshTrainingResources(activeServer.id)
+                            .then(refreshAll)
+                            .catch((error: unknown) => toast.error(errorMessage(error)));
+                        }}
+                        size="sm"
+                      >
+                        Refresh resources
+                      </Button>
+                    }
+                    description="The external server has not returned a resource snapshot."
+                    icon={MemoryStick}
+                    title="No resource data"
+                  />
+                </Card>
+              ) : (
+                <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                  <Metric
+                    detail="Current server utilization"
+                    icon={Activity}
+                    label="CPU"
+                    value={percent(resources.data.cpuUsage)}
+                  />
+                  <Metric
+                    detail={`${formatBytes(resources.data.ramUsed ?? 0)} of ${formatBytes(resources.data.ramTotal ?? 0)}`}
+                    icon={MemoryStick}
+                    label="RAM"
+                    value={percent(
+                      resources.data.ramTotal === null || resources.data.ramUsed === null
+                        ? null
+                        : (resources.data.ramUsed / resources.data.ramTotal) * 100,
+                    )}
+                  />
+                  <Metric
+                    detail={`${formatBytes(resources.data.diskUsed ?? 0)} of ${formatBytes(resources.data.diskTotal ?? 0)}`}
+                    icon={HardDrive}
+                    label="Disk"
+                    value={percent(
+                      resources.data.diskTotal === null ||
+                        resources.data.diskUsed === null
+                        ? null
+                        : (resources.data.diskUsed / resources.data.diskTotal) * 100,
+                    )}
+                  />
+                  <Metric
+                    detail={`Captured ${formatDate(resources.data.capturedAt)}`}
+                    icon={ListChecks}
+                    label="Queue"
+                    value={String(resources.data.queueLength)}
+                  />
+                  <Card className="p-4 sm:col-span-2 xl:col-span-4">
+                    <h3 className="text-xs font-semibold">GPU inventory</h3>
+                    <pre className="mt-3 max-h-72 overflow-auto whitespace-pre-wrap rounded-lg bg-background p-3 font-mono text-[10px] text-muted-foreground">
+                      {JSON.stringify(JSON.parse(resources.data.gpuJson), null, 2)}
+                    </pre>
+                  </Card>
+                </div>
+              )}
+            </section>
+          ) : null}
+
+          {section === "logs" ? (
+            <section>
+              <h2 className="text-sm font-semibold">Training logs</h2>
+              <p className="mt-1 text-[10px] text-muted-foreground">
+                Persisted server, dataset, upload, and job events.
+              </p>
+              {(logs.data?.length ?? 0) === 0 ? (
+                <Card className="mt-4">
+                  <EmptyState
+                    description="Training activity and errors will be recorded here."
+                    icon={Logs}
+                    title="No training logs"
+                  />
+                </Card>
+              ) : (
+                <Card className="mt-4 divide-y divide-border overflow-hidden">
+                  {logs.data?.map((entry) => (
+                    <div className="flex gap-3 px-4 py-3" key={entry.id}>
+                      <StatusBadge value={entry.level} />
+                      <div className="min-w-0 flex-1">
+                        <p className="break-words text-[11px]">{entry.message}</p>
+                        <p className="mt-1 text-[9px] text-muted-foreground">
+                          {formatDate(entry.createdAt)}
+                          {entry.trainingJobId === null
+                            ? ""
+                            : ` · job ${entry.trainingJobId}`}
+                        </p>
+                      </div>
+                    </div>
+                  ))}
+                </Card>
+              )}
+            </section>
+          ) : null}
+        </main>
+      </div>
+
+      {serverForm === null ? null : (
+        <Modal
+          onClose={() => setServerForm(null)}
+          title={serverForm.id === undefined ? "Add training server" : "Edit server"}
+        >
+          <form
+            className="space-y-4 p-5"
+            onSubmit={(event) => {
+              event.preventDefault();
+              saveServer.mutate({ ...serverForm, adapter: "tome-training-v1" });
+            }}
+          >
+            <label className="block space-y-1.5 text-xs">
+              <span>Name</span>
+              <input
+                autoFocus
+                className={inputClassName}
+                onChange={(event) =>
+                  setServerForm({ ...serverForm, name: event.target.value })
+                }
+                required
+                value={serverForm.name}
+              />
+            </label>
+            <label className="block space-y-1.5 text-xs">
+              <span>Training Manager URL</span>
+              <input
+                className={inputClassName}
+                onChange={(event) =>
+                  setServerForm({ ...serverForm, url: event.target.value })
+                }
+                placeholder="http://training-server:8080"
+                required
+                type="url"
+                value={serverForm.url}
+              />
+            </label>
+            <label className="flex items-center gap-2 text-xs">
+              <input
+                checked={serverForm.isActive}
+                onChange={(event) =>
+                  setServerForm({ ...serverForm, isActive: event.target.checked })
+                }
+                type="checkbox"
+              />
+              Make this the active training server
+            </label>
+            <p className="rounded-lg bg-secondary p-3 text-[10px] leading-relaxed text-muted-foreground">
+              Tome expects the external server to implement <code>tome-training/v1</code>.
+              This is separate from your Ollama inference URL.
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button onClick={() => setServerForm(null)} type="button" variant="outline">
+                Cancel
+              </Button>
+              <Button disabled={saveServer.isPending} type="submit">
+                Save
+              </Button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      {datasetForm === null ? null : (
+        <Modal
+          onClose={() => setDatasetForm(null)}
+          title={datasetForm.id === undefined ? "Add dataset" : "Replace dataset"}
+        >
+          <form
+            className="space-y-4 p-5"
+            onSubmit={(event) => {
+              event.preventDefault();
+              saveDataset.mutate({
+                ...datasetForm,
+                supportedFormats: datasetForm.supportedFormats
+                  .split(",")
+                  .map((value) => value.trim())
+                  .filter(Boolean),
+              });
+            }}
+          >
+            <label className="block space-y-1.5 text-xs">
+              <span>Dataset name</span>
+              <input
+                autoFocus
+                className={inputClassName}
+                onChange={(event) =>
+                  setDatasetForm({ ...datasetForm, name: event.target.value })
+                }
+                required
+                value={datasetForm.name}
+              />
+            </label>
+            <label className="block space-y-1.5 text-xs">
+              <span>Local file or directory path</span>
+              <input
+                className={inputClassName}
+                onChange={(event) =>
+                  setDatasetForm({ ...datasetForm, sourcePath: event.target.value })
+                }
+                placeholder="/Users/me/datasets/instructions.jsonl"
+                required
+                value={datasetForm.sourcePath}
+              />
+            </label>
+            <label className="block space-y-1.5 text-xs">
+              <span>Allowed extensions (comma separated)</span>
+              <input
+                className={inputClassName}
+                onChange={(event) =>
+                  setDatasetForm({
+                    ...datasetForm,
+                    supportedFormats: event.target.value,
+                  })
+                }
+                required
+                value={datasetForm.supportedFormats}
+              />
+            </label>
+            <label className="flex items-center gap-2 text-xs">
+              <input
+                checked={datasetForm.compress}
+                onChange={(event) =>
+                  setDatasetForm({ ...datasetForm, compress: event.target.checked })
+                }
+                type="checkbox"
+              />
+              Compress into a managed ZIP before upload
+            </label>
+            <div className="flex justify-end gap-2">
+              <Button
+                onClick={() => setDatasetForm(null)}
+                type="button"
+                variant="outline"
+              >
+                Cancel
+              </Button>
+              <Button disabled={saveDataset.isPending} type="submit">
+                {saveDataset.isPending ? "Validating…" : "Validate and save"}
+              </Button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      {jobForm === null ? null : (
+        <Modal
+          onClose={() => setJobForm(null)}
+          title="New training job draft"
+          width="max-w-xl"
+        >
+          <form
+            className="space-y-4 p-5"
+            onSubmit={(event) => {
+              event.preventDefault();
+              saveJob.mutate({
+                ...jobForm,
+                trainingServerId: activeServer?.id ?? null,
+              });
+            }}
+          >
+            <div className="grid gap-4 sm:grid-cols-2">
+              <label className="block space-y-1.5 text-xs">
+                <span>Dataset</span>
+                <select
+                  className={inputClassName}
+                  onChange={(event) =>
+                    setJobForm({ ...jobForm, datasetId: event.target.value })
+                  }
+                  required
+                  value={jobForm.datasetId}
+                >
+                  {datasets.data?.map((dataset) => (
+                    <option key={dataset.id} value={dataset.id}>
+                      {dataset.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="block space-y-1.5 text-xs">
+                <span>Base model</span>
+                <input
+                  className={inputClassName}
+                  onChange={(event) =>
+                    setJobForm({ ...jobForm, model: event.target.value })
+                  }
+                  placeholder="qwen2.5:3b"
+                  required
+                  value={jobForm.model}
+                />
+              </label>
+              <label className="block space-y-1.5 text-xs">
+                <span>Backend adapter</span>
+                <select
+                  className={inputClassName}
+                  onChange={(event) =>
+                    setJobForm({ ...jobForm, backend: event.target.value })
+                  }
+                  value={jobForm.backend}
+                >
+                  <option value="auto">Auto</option>
+                  <option value="unsloth">Unsloth</option>
+                  <option value="axolotl">Axolotl</option>
+                  <option value="transformers">Hugging Face Transformers</option>
+                </select>
+              </label>
+              <label className="block space-y-1.5 text-xs">
+                <span>Epochs</span>
+                <input
+                  className={inputClassName}
+                  min={1}
+                  onChange={(event) =>
+                    setJobForm({
+                      ...jobForm,
+                      totalEpochs: Number(event.target.value),
+                    })
+                  }
+                  required
+                  type="number"
+                  value={jobForm.totalEpochs}
+                />
+              </label>
+            </div>
+            <label className="block space-y-1.5 text-xs">
+              <span>Training parameters (JSON)</span>
+              <textarea
+                className={`${textAreaClassName} min-h-40 font-mono`}
+                onChange={(event) =>
+                  setJobForm({ ...jobForm, parametersJson: event.target.value })
+                }
+                required
+                value={jobForm.parametersJson}
+              />
+            </label>
+            <div className="flex justify-end gap-2">
+              <Button onClick={() => setJobForm(null)} type="button" variant="outline">
+                Cancel
+              </Button>
+              <Button disabled={saveJob.isPending} type="submit">
+                Save draft
+              </Button>
+            </div>
+          </form>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function JobCard({
+  dataset,
+  job,
+  onAction,
+  pending,
+}: {
+  readonly dataset: TrainingDatasetRecord | undefined;
+  readonly job: TrainingJobRecord;
+  readonly onAction: (
+    action: "cancel" | "delete" | "dispatch" | "refresh" | "retry",
+  ) => void;
+  readonly pending: boolean;
+}): React.JSX.Element {
+  const active = ["queued", "running", "paused", "cancelling", "unreachable"].includes(
+    job.status,
+  );
+  return (
+    <Card className="p-4">
+      <div className="flex flex-wrap items-start gap-3">
+        <span className="grid size-9 place-items-center rounded-lg bg-secondary">
+          <Activity className={cn("size-4 text-violet-400", active && "animate-pulse")} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-semibold">{job.model}</span>
+            <StatusBadge value={job.status} />
+            <Badge>{job.backend}</Badge>
+          </div>
+          <p className="mt-1 text-[10px] text-muted-foreground">
+            {dataset?.name ?? "Missing dataset"} · {job.stage} · Epoch {job.currentEpoch}/
+            {job.totalEpochs} · ETA {duration(job.etaSeconds)}
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-1">
+          {job.status === "draft" || job.status === "failed" ? (
+            <Button
+              disabled={pending || dataset?.remoteDatasetId === null}
+              onClick={() => onAction("dispatch")}
+              size="sm"
+            >
+              <Play className="size-3" />
+              Dispatch
+            </Button>
+          ) : null}
+          {active && job.remoteJobId !== null ? (
+            <>
+              <Button
+                disabled={pending}
+                onClick={() => onAction("refresh")}
+                size="sm"
+                variant="outline"
+              >
+                <RefreshCw className="size-3" />
+                Refresh
+              </Button>
+              <Button
+                disabled={pending}
+                onClick={() => onAction("cancel")}
+                size="sm"
+                variant="ghost"
+              >
+                <Ban className="size-3" />
+                Cancel
+              </Button>
+            </>
+          ) : null}
+          {["failed", "cancelled"].includes(job.status) && job.remoteJobId !== null ? (
+            <Button
+              disabled={pending}
+              onClick={() => onAction("retry")}
+              size="sm"
+              variant="outline"
+            >
+              <RotateCcw className="size-3" />
+              Retry
+            </Button>
+          ) : null}
+          {!active ? (
+            <Button
+              aria-label={`Delete ${job.model} job`}
+              disabled={pending}
+              onClick={() => {
+                if (window.confirm(`Delete the ${job.model} training job record?`)) {
+                  onAction("delete");
+                }
+              }}
+              size="icon"
+              variant="ghost"
+            >
+              <Trash2 className="size-3.5" />
+            </Button>
+          ) : null}
+        </div>
+      </div>
+      <div className="mt-3">
+        <div className="mb-1.5 flex justify-between text-[9px] text-muted-foreground">
+          <span>{percent(job.progress)}</span>
+          <span>
+            Loss {job.loss?.toFixed(4) ?? "—"} · LR{" "}
+            {job.learningRate?.toExponential(2) ?? "—"}
+          </span>
+        </div>
+        <ProgressBar value={job.progress} />
+      </div>
+      <div className="mt-3 grid grid-cols-2 gap-2 text-[9px] text-muted-foreground sm:grid-cols-4">
+        <span>GPU {percent(job.gpuUsage)}</span>
+        <span>CPU {percent(job.cpuUsage)}</span>
+        <span>RAM {percent(job.ramUsage)}</span>
+        <span>Disk {percent(job.diskUsage)}</span>
+      </div>
+      {job.warning === null ? null : (
+        <p className="mt-3 flex items-start gap-2 rounded-md bg-amber-500/10 p-2 text-[10px] text-amber-400">
+          <CircleAlert className="mt-0.5 size-3 shrink-0" />
+          {job.warning}
+        </p>
+      )}
+      {job.error === null ? null : (
+        <p className="mt-3 flex items-start gap-2 rounded-md bg-red-500/10 p-2 text-[10px] text-red-400">
+          <CircleAlert className="mt-0.5 size-3 shrink-0" />
+          {job.error}
+        </p>
+      )}
+    </Card>
+  );
+}

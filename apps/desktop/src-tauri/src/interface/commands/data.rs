@@ -308,24 +308,32 @@ pub fn delete_workspace(state: State<'_, AppState>, id: String) -> Result<(), St
 }
 
 #[tauri::command]
-pub fn list_projects(state: State<'_, AppState>) -> Result<Vec<ProjectRecord>, String> {
+pub fn list_projects(
+    state: State<'_, AppState>,
+    include_archived: Option<bool>,
+) -> Result<Vec<ProjectRecord>, String> {
     let database = state.database.lock().map_err(|error| error.to_string())?;
     let mut statement = database
         .prepare(
-            "SELECT id, workspace_id, name, path, created_at, updated_at, last_opened_at
-             FROM projects ORDER BY last_opened_at DESC",
+            "SELECT id, workspace_id, name, path, archived_at, duplicate_of,
+                    created_at, updated_at, last_opened_at
+             FROM projects
+             WHERE (?1 = 1 OR archived_at IS NULL)
+             ORDER BY archived_at IS NOT NULL, last_opened_at DESC",
         )
         .map_err(|error| database_error("preparing projects", error))?;
     let records = statement
-        .query_map([], |row| {
+        .query_map([i64::from(include_archived.unwrap_or(false))], |row| {
             Ok(ProjectRecord {
                 id: row.get(0)?,
                 workspace_id: row.get(1)?,
                 name: row.get(2)?,
                 path: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-                last_opened_at: row.get(6)?,
+                archived_at: row.get(4)?,
+                duplicate_of: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+                last_opened_at: row.get(8)?,
             })
         })
         .map_err(|error| database_error("reading projects", error))?
@@ -355,16 +363,26 @@ pub fn save_project(
     let database = state.database.lock().map_err(|error| error.to_string())?;
     database
         .execute(
-            "INSERT INTO projects(id, workspace_id, name, path, created_at, updated_at, last_opened_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?5)
+            "INSERT INTO projects(
+                id, workspace_id, name, path, archived_at, duplicate_of,
+                created_at, updated_at, last_opened_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?6, ?6)
              ON CONFLICT(id) DO UPDATE SET workspace_id=excluded.workspace_id,
                name=excluded.name, path=excluded.path, updated_at=excluded.updated_at,
-               last_opened_at=excluded.last_opened_at",
-            params![id, input.workspace_id, input.name.trim(), path.to_string_lossy(), timestamp],
+               archived_at=excluded.archived_at, last_opened_at=excluded.last_opened_at",
+            params![
+                id,
+                input.workspace_id,
+                input.name.trim(),
+                path.to_string_lossy(),
+                input.archived_at,
+                timestamp
+            ],
         )
         .map_err(|error| database_error("saving project", error))?;
     drop(database);
-    list_projects(state)?
+    list_projects(state, Some(true))?
         .into_iter()
         .find(|project| project.id == id)
         .ok_or_else(|| "Saved project could not be reloaded".into())
@@ -372,11 +390,141 @@ pub fn save_project(
 
 #[tauri::command]
 pub fn delete_project(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let database = state.database.lock().map_err(|error| error.to_string())?;
-    database
-        .execute("DELETE FROM projects WHERE id = ?1", [id])
+    let mut database = state.database.lock().map_err(|error| error.to_string())?;
+    let transaction = database
+        .transaction()
+        .map_err(|error| database_error("starting project deletion", error))?;
+    transaction
+        .execute("DELETE FROM conversations WHERE project_id = ?1", [&id])
+        .map_err(|error| database_error("deleting project conversations", error))?;
+    transaction
+        .execute("DELETE FROM projects WHERE id = ?1", [&id])
         .map_err(|error| database_error("deleting project", error))?;
+    transaction
+        .commit()
+        .map_err(|error| database_error("committing project deletion", error))?;
     Ok(())
+}
+
+#[tauri::command]
+pub fn archive_project(
+    state: State<'_, AppState>,
+    id: String,
+    archived: bool,
+) -> Result<ProjectRecord, String> {
+    let database = state.database.lock().map_err(|error| error.to_string())?;
+    let archived_at = archived.then(now);
+    let affected = database
+        .execute(
+            "UPDATE projects SET archived_at = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, archived_at, now()],
+        )
+        .map_err(|error| database_error("archiving project", error))?;
+    if affected == 0 {
+        return Err("The selected project no longer exists".into());
+    }
+    drop(database);
+    list_projects(state, Some(true))?
+        .into_iter()
+        .find(|project| project.id == id)
+        .ok_or_else(|| "Archived project could not be reloaded".into())
+}
+
+#[tauri::command]
+pub fn duplicate_project(state: State<'_, AppState>, id: String) -> Result<ProjectRecord, String> {
+    let timestamp = now();
+    let copy_id = Uuid::new_v4().to_string();
+    let mut database = state.database.lock().map_err(|error| error.to_string())?;
+    let transaction = database
+        .transaction()
+        .map_err(|error| database_error("starting project duplication", error))?;
+    let source = transaction
+        .query_row(
+            "SELECT workspace_id, name, path FROM projects WHERE id = ?1",
+            [&id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| database_error("reading project to duplicate", error))?
+        .ok_or_else(|| "The selected project no longer exists".to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO projects(
+                id, workspace_id, name, path, archived_at, duplicate_of,
+                created_at, updated_at, last_opened_at
+             ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?6, ?6)",
+            params![
+                copy_id,
+                source.0,
+                format!("{} Copy", source.1),
+                source.2,
+                id,
+                timestamp
+            ],
+        )
+        .map_err(|error| database_error("duplicating project", error))?;
+
+    let mut conversations = transaction
+        .prepare(
+            "SELECT id, title, model FROM conversations
+             WHERE project_id = ?1 AND archived_at IS NULL ORDER BY created_at",
+        )
+        .map_err(|error| database_error("preparing project conversations", error))?
+        .query_map([&id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(|error| database_error("reading project conversations", error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| database_error("reading project conversations", error))?;
+
+    for (source_conversation_id, title, model) in conversations.drain(..) {
+        let conversation_id = Uuid::new_v4().to_string();
+        transaction
+            .execute(
+                "INSERT INTO conversations(
+                    id, title, model, created_at, updated_at, project_id,
+                    archived_at, duplicate_of
+                 ) VALUES (?1, ?2, ?3, ?4, ?4, ?5, NULL, ?6)",
+                params![
+                    conversation_id,
+                    title,
+                    model,
+                    timestamp,
+                    copy_id,
+                    source_conversation_id
+                ],
+            )
+            .map_err(|error| database_error("duplicating conversation", error))?;
+        transaction
+            .execute(
+                "INSERT INTO messages(
+                    id, conversation_id, role, content, attachments_json, created_at
+                 )
+                 SELECT lower(hex(randomblob(16))), ?1, role, content,
+                        attachments_json, created_at
+                 FROM messages WHERE conversation_id = ?2",
+                params![conversation_id, source_conversation_id],
+            )
+            .map_err(|error| database_error("duplicating conversation messages", error))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| database_error("committing project duplication", error))?;
+    drop(database);
+    list_projects(state, Some(true))?
+        .into_iter()
+        .find(|project| project.id == copy_id)
+        .ok_or_else(|| "Duplicated project could not be reloaded".into())
 }
 
 fn build_tree(path: &Path, depth: usize) -> Vec<FileTreeNode> {
@@ -430,32 +578,47 @@ pub fn read_file_tree(path: String) -> Result<Vec<FileTreeNode>, String> {
 pub fn list_conversations(
     state: State<'_, AppState>,
     search: Option<String>,
+    project_id: Option<String>,
+    include_archived: Option<bool>,
 ) -> Result<Vec<ConversationRecord>, String> {
     let database = state.database.lock().map_err(|error| error.to_string())?;
     let query = search.unwrap_or_default();
     let pattern = format!("%{}%", query.trim());
     let mut statement = database
         .prepare(
-            "SELECT c.id, c.title, c.model, c.created_at, c.updated_at,
+            "SELECT c.id, c.project_id, c.title, c.model, c.archived_at,
+                    c.duplicate_of, c.created_at, c.updated_at,
                     COUNT(m.id), MAX(CASE WHEN m.role = 'user' THEN m.content END)
              FROM conversations c
              LEFT JOIN messages m ON m.conversation_id = c.id
-             WHERE c.title LIKE ?1 OR m.content LIKE ?1
+             WHERE (c.title LIKE ?1 OR m.content LIKE ?1)
+               AND (?2 IS NULL OR c.project_id = ?2)
+               AND (?3 = 1 OR c.archived_at IS NULL)
              GROUP BY c.id ORDER BY c.updated_at DESC",
         )
         .map_err(|error| database_error("preparing conversations", error))?;
     let records = statement
-        .query_map([pattern], |row| {
-            Ok(ConversationRecord {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                model: row.get(2)?,
-                created_at: row.get(3)?,
-                updated_at: row.get(4)?,
-                message_count: row.get(5)?,
-                preview: row.get(6)?,
-            })
-        })
+        .query_map(
+            params![
+                pattern,
+                project_id,
+                i64::from(include_archived.unwrap_or(false))
+            ],
+            |row| {
+                Ok(ConversationRecord {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    title: row.get(2)?,
+                    model: row.get(3)?,
+                    archived_at: row.get(4)?,
+                    duplicate_of: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    message_count: row.get(8)?,
+                    preview: row.get(9)?,
+                })
+            },
+        )
         .map_err(|error| database_error("reading conversations", error))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| database_error("reading conversations", error))?;
@@ -472,15 +635,24 @@ pub fn save_conversation(
     let database = state.database.lock().map_err(|error| error.to_string())?;
     database
         .execute(
-            "INSERT INTO conversations(id, title, model, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?4)
+            "INSERT INTO conversations(
+                id, title, model, created_at, updated_at, project_id,
+                archived_at, duplicate_of
+             )
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5, NULL, NULL)
              ON CONFLICT(id) DO UPDATE SET title=excluded.title, model=excluded.model,
-               updated_at=excluded.updated_at",
-            params![id, input.title.trim(), input.model, timestamp],
+               project_id=excluded.project_id, updated_at=excluded.updated_at",
+            params![
+                id,
+                input.title.trim(),
+                input.model,
+                timestamp,
+                input.project_id
+            ],
         )
         .map_err(|error| database_error("saving conversation", error))?;
     drop(database);
-    list_conversations(state, None)?
+    list_conversations(state, None, None, Some(true))?
         .into_iter()
         .find(|conversation| conversation.id == id)
         .ok_or_else(|| "Saved conversation could not be reloaded".into())
@@ -493,6 +665,89 @@ pub fn delete_conversation(state: State<'_, AppState>, id: String) -> Result<(),
         .execute("DELETE FROM conversations WHERE id = ?1", [id])
         .map_err(|error| database_error("deleting conversation", error))?;
     Ok(())
+}
+
+#[tauri::command]
+pub fn move_conversation(
+    state: State<'_, AppState>,
+    id: String,
+    project_id: Option<String>,
+) -> Result<(), String> {
+    let database = state.database.lock().map_err(|error| error.to_string())?;
+    let affected = database
+        .execute(
+            "UPDATE conversations SET project_id = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, project_id, now()],
+        )
+        .map_err(|error| database_error("moving conversation", error))?;
+    if affected == 0 {
+        return Err("The selected conversation no longer exists".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn duplicate_conversation(
+    state: State<'_, AppState>,
+    id: String,
+    project_id: Option<String>,
+) -> Result<ConversationRecord, String> {
+    let timestamp = now();
+    let copy_id = Uuid::new_v4().to_string();
+    let mut database = state.database.lock().map_err(|error| error.to_string())?;
+    let transaction = database
+        .transaction()
+        .map_err(|error| database_error("starting conversation duplication", error))?;
+    let source = transaction
+        .query_row(
+            "SELECT project_id, title, model FROM conversations WHERE id = ?1",
+            [&id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| database_error("reading conversation to duplicate", error))?
+        .ok_or_else(|| "The selected conversation no longer exists".to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO conversations(
+                id, title, model, created_at, updated_at, project_id,
+                archived_at, duplicate_of
+             ) VALUES (?1, ?2, ?3, ?4, ?4, ?5, NULL, ?6)",
+            params![
+                copy_id,
+                format!("{} Copy", source.1),
+                source.2,
+                timestamp,
+                project_id.or(source.0),
+                id
+            ],
+        )
+        .map_err(|error| database_error("duplicating conversation", error))?;
+    transaction
+        .execute(
+            "INSERT INTO messages(
+                id, conversation_id, role, content, attachments_json, created_at
+             )
+             SELECT lower(hex(randomblob(16))), ?1, role, content,
+                    attachments_json, created_at
+             FROM messages WHERE conversation_id = ?2",
+            params![copy_id, id],
+        )
+        .map_err(|error| database_error("duplicating conversation messages", error))?;
+    transaction
+        .commit()
+        .map_err(|error| database_error("committing conversation duplication", error))?;
+    drop(database);
+    list_conversations(state, None, None, Some(true))?
+        .into_iter()
+        .find(|conversation| conversation.id == copy_id)
+        .ok_or_else(|| "Duplicated conversation could not be reloaded".into())
 }
 
 #[tauri::command]

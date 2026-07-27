@@ -65,7 +65,7 @@ export function ProjectsPage(): React.JSX.Element {
   const [form, setForm] = useState<ProjectForm | null>(null);
   const projects = useQuery({
     enabled: isTauriRuntime(),
-    queryFn: backend.listProjects,
+    queryFn: () => backend.listProjects(),
     queryKey: ["projects"],
   });
   const tree = useQuery({
