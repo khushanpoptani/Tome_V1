@@ -1,0 +1,8 @@
+dist
+target
+coverage
+node_modules
+pnpm-lock.yaml
+tmp
+apps/desktop/src-tauri/gen
+

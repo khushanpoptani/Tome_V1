@@ -70,6 +70,5 @@ flowchart LR
     Hooks --> Types
 ```
 
-Dependencies flow inward toward stable contracts. Feature packages may consume
-shared packages, but shared packages may not import application features.
-
+Dependencies flow inward toward stable contracts. Feature packages may consume shared
+packages, but shared packages may not import application features.

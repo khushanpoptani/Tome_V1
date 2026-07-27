@@ -41,13 +41,12 @@ tome/
 1. UI features depend on stable package contracts, not Tauri internals.
 2. Tauri commands are adapters around application services.
 3. Domain and application code do not depend on UI frameworks.
-4. Only infrastructure adapters access SQLite, the operating system, Git,
-   HTTP/WebSocket transports, or files.
+4. Only infrastructure adapters access SQLite, the operating system, Git, HTTP/WebSocket
+   transports, or files.
 5. Only the File Writer adapter may mutate project files.
-6. Every potentially destructive adapter must require a security authorization
-   decision.
-7. AI-specific reasoning remains remote; the client validates schemas and
-   orchestrates deterministic transitions.
+6. Every potentially destructive adapter must require a security authorization decision.
+7. AI-specific reasoning remains remote; the client validates schemas and orchestrates
+   deterministic transitions.
 
 ## Naming
 
@@ -55,4 +54,3 @@ tome/
 - Repository and JavaScript package prefix: `tome` / `@tome/*`
 - Rust crates: `tome-*`
 - Desktop bundle identifier: `app.tome.desktop`
-

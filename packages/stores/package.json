@@ -1,0 +1,19 @@
+{
+  "name": "@tome/stores",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@tome/types": "workspace:*",
+    "zustand": "^5.0.6"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  }
+}
