@@ -1,0 +1,7 @@
+pnpm exec lint-staged
+
+if command -v cargo >/dev/null 2>&1; then
+  cargo fmt --all -- --check
+else
+  echo "cargo not found; Rust formatting will be enforced by CI"
+fi
