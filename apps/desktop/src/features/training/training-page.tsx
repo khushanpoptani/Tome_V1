@@ -8,6 +8,7 @@ import {
 import { backend, isTauriRuntime, startDatasetUpload } from "@/lib/backend";
 import { errorMessage, formatBytes, formatDate } from "@/lib/format";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type {
   TrainingDatasetRecord,
   TrainingJobRecord,
@@ -40,7 +41,7 @@ import {
   UploadCloud,
   XCircle,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 const sections = [
@@ -75,10 +76,13 @@ interface DatasetForm {
 interface JobForm {
   readonly datasetId: string;
   readonly model: string;
+  readonly baseModel: string;
   readonly backend: string;
   readonly totalEpochs: number;
   readonly parametersJson: string;
 }
+
+type StreamStatus = "disabled" | "connecting" | "connected" | "fallback";
 
 function percent(value: number | null | undefined): string {
   return `${Math.round(Math.max(0, Math.min(100, value ?? 0)))}%`;
@@ -168,6 +172,10 @@ export function TrainingPage(): React.JSX.Element {
   const [serverForm, setServerForm] = useState<ServerForm | null>(null);
   const [datasetForm, setDatasetForm] = useState<DatasetForm | null>(null);
   const [jobForm, setJobForm] = useState<JobForm | null>(null);
+  const [dragActive, setDragActive] = useState(false);
+  const [streamStatus, setStreamStatus] = useState<StreamStatus>("disabled");
+  const pendingRefreshes = useRef(new Map<string, number>());
+  const jobsRef = useRef<readonly TrainingJobRecord[]>([]);
   const [uploadProgress, setUploadProgress] = useState<
     Readonly<Record<string, TrainingStreamEvent>>
   >({});
@@ -207,6 +215,153 @@ export function TrainingPage(): React.JSX.Element {
     queryKey: ["training-resources", activeServer?.id],
   });
 
+  useEffect(() => {
+    jobsRef.current = jobs.data ?? [];
+  }, [jobs.data]);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) {
+      return;
+    }
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (disposed) return;
+        if (event.payload.type === "enter" || event.payload.type === "over") {
+          setDragActive(true);
+          return;
+        }
+        setDragActive(false);
+        if (event.payload.type !== "drop" || event.payload.paths.length === 0) {
+          return;
+        }
+        const paths = event.payload.paths;
+        void Promise.allSettled(
+          paths.map((sourcePath) => {
+            const filename = sourcePath.split(/[\\/]/).pop() ?? "Dataset";
+            const name = filename.replace(/\.[^.]+$/, "") || filename;
+            return backend.saveTrainingDataset({
+              compress: true,
+              name,
+              sourcePath,
+              supportedFormats: ["jsonl", "json", "csv", "parquet", "txt", "md"],
+            });
+          }),
+        ).then((results) => {
+          const saved = results.filter((result) => result.status === "fulfilled").length;
+          const failedCount = results.length - saved;
+          void Promise.all([
+            queryClient.invalidateQueries({ queryKey: ["training-datasets"] }),
+            queryClient.invalidateQueries({ queryKey: ["training-logs"] }),
+          ]);
+          if (saved > 0) {
+            toast.success(
+              `${saved} dataset${saved === 1 ? "" : "s"} validated and saved.`,
+            );
+          }
+          if (failedCount > 0) {
+            const firstFailure = results.find(
+              (result): result is PromiseRejectedResult => result.status === "rejected",
+            );
+            toast.error(
+              `${failedCount} dataset${failedCount === 1 ? "" : "s"} failed validation: ${errorMessage(firstFailure?.reason)}`,
+            );
+          }
+        });
+      })
+      .then((stop) => {
+        if (disposed) {
+          stop();
+        } else {
+          unlisten = stop;
+        }
+      })
+      .catch((error: unknown) => {
+        toast.error(`Native dataset drop is unavailable: ${errorMessage(error)}`);
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [queryClient]);
+
+  useEffect(() => {
+    if (activeServer === null || activeServer.status !== "connected") {
+      setStreamStatus("disabled");
+      return;
+    }
+    let capabilities: {
+      websocket?: boolean;
+      websocketPath?: string;
+    } = {};
+    try {
+      capabilities = JSON.parse(activeServer.capabilitiesJson) as typeof capabilities;
+    } catch {
+      setStreamStatus("fallback");
+      return;
+    }
+    if (!capabilities.websocket) {
+      setStreamStatus("fallback");
+      return;
+    }
+    const endpoint = new URL(activeServer.url);
+    endpoint.protocol = endpoint.protocol === "https:" ? "wss:" : "ws:";
+    endpoint.pathname = `${endpoint.pathname.replace(/\/$/, "")}${capabilities.websocketPath ?? "/v1/events/ws"}`;
+    endpoint.search = "";
+    setStreamStatus("connecting");
+    const socket = new WebSocket(endpoint);
+    const refreshes = pendingRefreshes.current;
+    socket.addEventListener("open", () => setStreamStatus("connected"));
+    socket.addEventListener("close", () => setStreamStatus("fallback"));
+    socket.addEventListener("error", () => setStreamStatus("fallback"));
+    socket.addEventListener("message", (message) => {
+      try {
+        const event = JSON.parse(String(message.data)) as {
+          type?: string;
+          jobId?: string;
+        };
+        if (event.type === "resources") {
+          void backend
+            .refreshTrainingResources(activeServer.id)
+            .then(() =>
+              queryClient.invalidateQueries({ queryKey: ["training-resources"] }),
+            )
+            .catch(() => undefined);
+          return;
+        }
+        if (event.type === "modelRegistered") {
+          void queryClient.invalidateQueries({ queryKey: ["models"] });
+        }
+        if (event.jobId === undefined) return;
+        const localJob = jobsRef.current.find((job) => job.remoteJobId === event.jobId);
+        if (localJob === undefined || refreshes.has(localJob.id)) return;
+        const timer = window.setTimeout(() => {
+          refreshes.delete(localJob.id);
+          void backend
+            .refreshTrainingJob(localJob.id)
+            .then(() =>
+              Promise.all([
+                queryClient.invalidateQueries({ queryKey: ["training-jobs"] }),
+                queryClient.invalidateQueries({ queryKey: ["training-logs"] }),
+              ]),
+            )
+            .catch(() => undefined);
+        }, 200);
+        refreshes.set(localJob.id, timer);
+      } catch {
+        setStreamStatus("fallback");
+      }
+    });
+    return () => {
+      socket.close();
+      for (const timer of refreshes.values()) {
+        window.clearTimeout(timer);
+      }
+      refreshes.clear();
+    };
+  }, [activeServer, queryClient]);
+
   const refreshAll = (): void => {
     void Promise.all([
       queryClient.invalidateQueries({ queryKey: ["training-servers"] }),
@@ -227,16 +382,19 @@ export function TrainingPage(): React.JSX.Element {
     if (activeJobs.length === 0) {
       return;
     }
-    const timer = window.setInterval(() => {
-      void Promise.allSettled(
-        activeJobs.map(async (job) => backend.refreshTrainingJob(job.id)),
-      ).then(() => {
-        void queryClient.invalidateQueries({ queryKey: ["training-jobs"] });
-        void queryClient.invalidateQueries({ queryKey: ["training-logs"] });
-      });
-    }, 5_000);
+    const timer = window.setInterval(
+      () => {
+        void Promise.allSettled(
+          activeJobs.map(async (job) => backend.refreshTrainingJob(job.id)),
+        ).then(() => {
+          void queryClient.invalidateQueries({ queryKey: ["training-jobs"] });
+          void queryClient.invalidateQueries({ queryKey: ["training-logs"] });
+        });
+      },
+      streamStatus === "connected" ? 30_000 : 5_000,
+    );
     return () => window.clearInterval(timer);
-  }, [jobs.data, queryClient]);
+  }, [jobs.data, queryClient, streamStatus]);
 
   useEffect(() => {
     if (activeServer === null || activeServer.status !== "connected") {
@@ -399,10 +557,27 @@ export function TrainingPage(): React.JSX.Element {
     <div className="min-h-full">
       <PageHeader
         actions={
-          <Button onClick={refreshAll} size="sm" variant="outline">
-            <RefreshCw className="size-3.5" />
-            Refresh
-          </Button>
+          <div className="flex items-center gap-2">
+            {activeServer === null ? null : (
+              <Badge
+                className={cn(
+                  streamStatus === "connected"
+                    ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+                    : "text-muted-foreground",
+                )}
+              >
+                {streamStatus === "connected"
+                  ? "Live events"
+                  : streamStatus === "connecting"
+                    ? "Connecting…"
+                    : "Polling fallback"}
+              </Badge>
+            )}
+            <Button onClick={refreshAll} size="sm" variant="outline">
+              <RefreshCw className="size-3.5" />
+              Refresh
+            </Button>
+          </div>
         }
         description="Manage external fine-tuning infrastructure without running training on this desktop."
         icon={Activity}
@@ -475,7 +650,7 @@ export function TrainingPage(): React.JSX.Element {
                       setServerForm({
                         isActive: (servers.data?.length ?? 0) === 0,
                         name: "",
-                        url: "",
+                        url: "http://192.168.1.12:11435",
                       })
                     }
                     size="sm"
@@ -493,7 +668,7 @@ export function TrainingPage(): React.JSX.Element {
                             setServerForm({
                               isActive: true,
                               name: "Training Manager",
-                              url: "",
+                              url: "http://192.168.1.12:11435",
                             })
                           }
                           size="sm"
@@ -620,6 +795,21 @@ export function TrainingPage(): React.JSX.Element {
                   Add dataset
                 </Button>
               </div>
+              <Card
+                className={cn(
+                  "mb-4 border-dashed p-5 text-center transition-colors",
+                  dragActive && "border-violet-500 bg-violet-500/10",
+                )}
+              >
+                <UploadCloud className="mx-auto size-6 text-violet-400" />
+                <p className="mt-2 text-xs font-medium">
+                  {dragActive ? "Drop datasets to validate" : "Drag datasets here"}
+                </p>
+                <p className="mt-1 text-[10px] text-muted-foreground">
+                  Drop one or more files or folders. Tome validates and catalogs them
+                  locally; upload remains an explicit action.
+                </p>
+              </Card>
               {(datasets.data?.length ?? 0) === 0 ? (
                 <Card>
                   <EmptyState
@@ -794,10 +984,11 @@ export function TrainingPage(): React.JSX.Element {
                     onClick={() =>
                       setJobForm({
                         backend: "auto",
+                        baseModel: "",
                         datasetId: datasets.data?.[0]?.id ?? "",
                         model: "",
                         parametersJson:
-                          '{\n  "learningRate": 0.0002,\n  "batchSize": 2,\n  "method": "lora"\n}',
+                          '{\n  "sourceModel": "meta-llama/Llama-3.2-3B",\n  "ollamaAdapterArchitecture": "llama",\n  "learningRate": 0.0002,\n  "batchSize": 2,\n  "maxLength": 2048,\n  "loraRank": 16\n}',
                         totalEpochs: 3,
                       })
                     }
@@ -988,7 +1179,7 @@ export function TrainingPage(): React.JSX.Element {
                 onChange={(event) =>
                   setServerForm({ ...serverForm, url: event.target.value })
                 }
-                placeholder="http://training-server:8080"
+                placeholder="http://192.168.1.12:11435"
                 required
                 type="url"
                 value={serverForm.url}
@@ -1137,15 +1328,27 @@ export function TrainingPage(): React.JSX.Element {
                 </select>
               </label>
               <label className="block space-y-1.5 text-xs">
-                <span>Base model</span>
+                <span>Output Ollama model</span>
                 <input
                   className={inputClassName}
                   onChange={(event) =>
                     setJobForm({ ...jobForm, model: event.target.value })
                   }
-                  placeholder="qwen2.5:3b"
+                  placeholder="tome-llama:latest"
                   required
                   value={jobForm.model}
+                />
+              </label>
+              <label className="block space-y-1.5 text-xs">
+                <span>Installed Ollama base model</span>
+                <input
+                  className={inputClassName}
+                  onChange={(event) =>
+                    setJobForm({ ...jobForm, baseModel: event.target.value })
+                  }
+                  placeholder="llama3.2:3b"
+                  required
+                  value={jobForm.baseModel}
                 />
               </label>
               <label className="block space-y-1.5 text-xs">
@@ -1157,9 +1360,10 @@ export function TrainingPage(): React.JSX.Element {
                   }
                   value={jobForm.backend}
                 >
-                  <option value="auto">Auto</option>
-                  <option value="unsloth">Unsloth</option>
-                  <option value="axolotl">Axolotl</option>
+                  <option value="auto">Auto (LoRA)</option>
+                  <option value="lora">PEFT LoRA</option>
+                  <option value="qlora">PEFT QLoRA</option>
+                  <option value="peft">PEFT</option>
                   <option value="transformers">Hugging Face Transformers</option>
                 </select>
               </label>
@@ -1190,6 +1394,12 @@ export function TrainingPage(): React.JSX.Element {
                 required
                 value={jobForm.parametersJson}
               />
+              <span className="block text-[9px] leading-relaxed text-muted-foreground">
+                <code>sourceModel</code> is the Hugging Face model used by the training
+                worker. The installed Ollama base model is used when the adapter is
+                registered after successful training. Ollama currently documents
+                Safetensors adapter registration for Llama, Mistral/Mixtral, and Gemma.
+              </span>
             </label>
             <div className="flex justify-end gap-2">
               <Button onClick={() => setJobForm(null)} type="button" variant="outline">
@@ -1235,8 +1445,9 @@ function JobCard({
             <Badge>{job.backend}</Badge>
           </div>
           <p className="mt-1 text-[10px] text-muted-foreground">
-            {dataset?.name ?? "Missing dataset"} · {job.stage} · Epoch {job.currentEpoch}/
-            {job.totalEpochs} · ETA {duration(job.etaSeconds)}
+            {job.model} ← {job.baseModel} · {dataset?.name ?? "Missing dataset"} ·{" "}
+            {job.stage} · Epoch {job.currentEpoch}/{job.totalEpochs} · ETA{" "}
+            {duration(job.etaSeconds)}
           </p>
         </div>
         <div className="flex flex-wrap gap-1">
@@ -1305,7 +1516,10 @@ function JobCard({
           <span>{percent(job.progress)}</span>
           <span>
             Loss {job.loss?.toFixed(4) ?? "—"} · LR{" "}
-            {job.learningRate?.toExponential(2) ?? "—"}
+            {job.learningRate?.toExponential(2) ?? "—"} ·{" "}
+            {job.trainingSpeed === null
+              ? "— samples/s"
+              : `${job.trainingSpeed.toFixed(2)} samples/s`}
           </span>
         </div>
         <ProgressBar value={job.progress} />
@@ -1313,8 +1527,8 @@ function JobCard({
       <div className="mt-3 grid grid-cols-2 gap-2 text-[9px] text-muted-foreground sm:grid-cols-4">
         <span>GPU {percent(job.gpuUsage)}</span>
         <span>CPU {percent(job.cpuUsage)}</span>
-        <span>RAM {percent(job.ramUsage)}</span>
-        <span>Disk {percent(job.diskUsage)}</span>
+        <span>RAM {job.ramUsage === null ? "—" : formatBytes(job.ramUsage)}</span>
+        <span>Disk {job.diskUsage === null ? "—" : formatBytes(job.diskUsage)}</span>
       </div>
       {job.warning === null ? null : (
         <p className="mt-3 flex items-start gap-2 rounded-md bg-amber-500/10 p-2 text-[10px] text-amber-400">

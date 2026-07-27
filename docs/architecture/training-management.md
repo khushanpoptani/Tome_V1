@@ -1,7 +1,6 @@
 # Tome Training Management Architecture
 
-Status: approved implementation baseline for Prompt 3  
-Last reviewed: 2026-07-27
+Status: Windows Training Manager implementation baseline Last reviewed: 2026-07-27
 
 ## Decision
 
@@ -43,7 +42,40 @@ fine-tuning, training jobs, epochs, loss, ETA, training progress, or training re
 monitoring.
 
 Therefore Tome uses a backend-neutral external training protocol. Ollama integration
-begins only after a backend exports a compatible model artifact.
+begins only after a backend exports a compatible model artifact. The official
+`/api/create` endpoint or the local `ollama create` command performs registry creation;
+neither performs fine-tuning.
+
+## Windows AI Server deployment
+
+The machine at `192.168.1.12` hosts two independent processes:
+
+```text
+Ollama                    http://0.0.0.0:11434
+Tome Training Manager     http://0.0.0.0:11435
+```
+
+The Training Manager is a Rust service in `services/training-manager`. It owns a separate
+SQLite database and data root and runs as a Windows service. It never writes inside
+Ollama's storage directory.
+
+```text
+%PROGRAMDATA%\Tome\TrainingManager\
+├── config.json
+├── training-manager.sqlite3
+├── datasets\
+├── uploads\
+├── jobs\
+│   └── <job-id>\
+│       ├── specification.json
+│       ├── checkpoints\
+│       └── output\
+└── workers\
+```
+
+The default listener becomes LAN-accessible only when the deployment script creates an
+explicit Windows Firewall rule for TCP 11435. Bearer-token authentication is supported and
+should be enabled before exposure beyond a trusted network.
 
 ## Desktop responsibilities
 
@@ -79,6 +111,7 @@ llama.cpp conversion, or a managed service.
 | `GET`  | `/v1/capabilities` | Protocol version, supported formats/backends, limits |
 | `GET`  | `/v1/health`       | Liveness and server version                          |
 | `GET`  | `/v1/resources`    | GPU, CPU, RAM, disk, and queue state                 |
+| `GET`  | `/v1/events/ws`    | WebSocket job, log, resource, and registry events    |
 
 ### Resumable datasets
 
@@ -87,7 +120,6 @@ llama.cpp conversion, or a managed service.
 | `POST`   | `/v1/uploads`                     | Create or resume an upload session |
 | `GET`    | `/v1/uploads/{id}`                | Read acknowledged byte offset      |
 | `PUT`    | `/v1/uploads/{id}/chunks/{index}` | Upload a byte range                |
-| `POST`   | `/v1/uploads/{id}/complete`       | Verify checksum and commit dataset |
 | `DELETE` | `/v1/uploads/{id}`                | Cancel an upload session           |
 | `DELETE` | `/v1/datasets/{id}`               | Remove a committed remote dataset  |
 
@@ -106,11 +138,45 @@ server-confirmed offset after restart.
 | `POST` | `/v1/jobs/{id}/cancel`              | Request cancellation                   |
 | `POST` | `/v1/jobs/{id}/retry`               | Retry with the immutable specification |
 | `GET`  | `/v1/jobs/{id}/logs?after={cursor}` | Incremental logs                       |
-| `GET`  | `/v1/events`                        | Optional server-sent event stream      |
+| `GET`  | `/v1/events/ws`                     | Preferred WebSocket event stream       |
 
-Tome prefers server events. When the adapter reports no event capability, active jobs poll
+Tome prefers WebSocket server events and immediately reconciles the corresponding
+persisted job after an event. When WebSocket streaming is unavailable, active jobs poll
 every five seconds. A job becomes `unreachable` after three missed heartbeats but is not
 marked failed without a server terminal state.
+
+## Backend, export, and registry adapters
+
+The queue invokes a backend through a stable server-side port:
+
+```text
+TrainingBackend
+├── validate(specification, dataset)
+├── prepare(job_directory)
+├── run(progress_sink, cancellation)
+└── collect_artifacts()
+```
+
+The first executable adapter is the bundled Hugging Face Transformers + PEFT worker. It
+supports LoRA and QLoRA when the matching Python and CUDA dependencies are installed.
+Unsloth and Axolotl are capability names but remain unavailable until their adapters are
+installed on the Windows host; the API reports this instead of simulating progress.
+
+Exports pass through a separate model-export port:
+
+- PEFT Safetensors adapter;
+- merged Safetensors model;
+- GGUF conversion through configured llama.cpp tools.
+
+The registry adapter writes a job-local Modelfile and invokes the local Ollama CLI. On
+success it verifies the model through `/api/tags` before emitting `model.registered`.
+Registration failure is a terminal job error and retains all output artifacts.
+
+Ollama's published Safetensors adapter-import list currently covers Llama,
+Mistral/Mixtral, and Gemma. The Training Manager validates this before queueing so an
+unsupported architecture such as Qwen cannot consume training time and fail only during
+registration. A future GGUF export adapter is the extension path for other llama.cpp
+architectures.
 
 ## Job state model
 
@@ -207,10 +273,12 @@ Empty and unavailable states are explicit. When no training server is configured
 can still catalog, preview, validate, compress datasets, and create job drafts. Network
 actions explain that a compatible external Training Manager must be configured.
 
-## Out of scope for this phase
+## Operational constraints
 
-- executing a real fine-tuning process;
-- framework-specific parameter editors beyond backend-neutral job JSON;
-- credential provisioning;
-- artifact conversion or Ollama registry import execution;
-- local GPU training.
+- No job starts until a valid dataset upload is committed and the requested backend
+  reports available.
+- The server executes one GPU job at a time by default; queue concurrency is configurable.
+- The desktop never starts a local worker.
+- The bundled worker is real, but installation and health checks never start training.
+- Framework installation, CUDA compatibility, model licenses, and Hugging Face access are
+  operator responsibilities and are reported through capabilities and diagnostics.

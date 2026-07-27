@@ -154,12 +154,9 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
         [],
         |row| row.get::<_, i64>(0),
     )? != 0;
-    if has_v3 {
-        return Ok(());
-    }
-
-    connection.execute_batch(
-        r#"
+    if !has_v3 {
+        connection.execute_batch(
+            r#"
         PRAGMA foreign_keys = OFF;
         BEGIN IMMEDIATE;
 
@@ -324,7 +321,47 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
         COMMIT;
         PRAGMA foreign_keys = ON;
         "#,
-    )
+        )?;
+    }
+
+    let has_v4 = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 4)",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if !has_v4 {
+        connection.execute_batch(
+            r#"
+            BEGIN IMMEDIATE;
+            ALTER TABLE training_jobs
+                ADD COLUMN base_model TEXT NOT NULL DEFAULT '';
+            ALTER TABLE training_jobs
+                ADD COLUMN training_speed REAL;
+            INSERT INTO schema_migrations(version, applied_at)
+            VALUES (4, datetime('now'));
+            COMMIT;
+            "#,
+        )?;
+    }
+
+    let has_v5 = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 5)",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if !has_v5 {
+        connection.execute_batch(
+            r#"
+            BEGIN IMMEDIATE;
+            ALTER TABLE training_jobs
+                ADD COLUMN heartbeat_failures INTEGER NOT NULL DEFAULT 0;
+            INSERT INTO schema_migrations(version, applied_at)
+            VALUES (5, datetime('now'));
+            COMMIT;
+            "#,
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -349,7 +386,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("schema version should be readable");
-        assert_eq!(version, 3);
+        assert_eq!(version, 5);
         for table in [
             "training_servers",
             "training_datasets",
@@ -362,6 +399,13 @@ mod tests {
         }
         assert!(has_column(&connection, "projects", "archived_at"));
         assert!(has_column(&connection, "conversations", "project_id"));
+        assert!(has_column(&connection, "training_jobs", "base_model"));
+        assert!(has_column(&connection, "training_jobs", "training_speed"));
+        assert!(has_column(
+            &connection,
+            "training_jobs",
+            "heartbeat_failures"
+        ));
     }
 
     fn has_table(connection: &Connection, table: &str) -> bool {

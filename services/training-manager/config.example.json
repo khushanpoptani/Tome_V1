@@ -1,0 +1,12 @@
+{
+  "bind": "0.0.0.0:11435",
+  "dataDir": "C:\\ProgramData\\Tome\\TrainingManager",
+  "ollamaUrl": "http://127.0.0.1:11434",
+  "ollamaExecutable": "ollama.exe",
+  "pythonExecutable": "C:\\ProgramData\\Tome\\TrainingManager\\venv\\Scripts\\python.exe",
+  "workerScript": "C:\\ProgramData\\Tome\\TrainingManager\\workers\\train.py",
+  "bearerToken": null,
+  "maxUploadBytes": 268435456000,
+  "chunkSize": 4194304,
+  "jobConcurrency": 1
+}

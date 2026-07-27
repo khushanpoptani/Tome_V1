@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/desktop/src-tauri"]
+members = ["apps/desktop/src-tauri", "services/training-manager"]
 resolver = "2"
 
 [workspace.package]
@@ -14,4 +14,3 @@ lto = true
 opt-level = "s"
 panic = "abort"
 strip = true
-

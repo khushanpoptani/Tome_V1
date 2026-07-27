@@ -74,5 +74,6 @@ describe("Tome application shell", () => {
     expect(screen.getByText("Training Manager servers")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Datasets" }));
     expect(screen.getByRole("heading", { name: "Datasets" })).toBeInTheDocument();
+    expect(screen.getByText("Drag datasets here")).toBeInTheDocument();
   });
 });

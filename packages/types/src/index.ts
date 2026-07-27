@@ -286,6 +286,7 @@ export interface TrainingJobRecord {
   readonly remoteJobId: string | null;
   readonly datasetId: string;
   readonly model: string;
+  readonly baseModel: string;
   readonly backend: string;
   readonly parametersJson: string;
   readonly status: TrainingJobStatus;
@@ -302,6 +303,7 @@ export interface TrainingJobRecord {
   readonly totalEpochs: number;
   readonly loss: number | null;
   readonly learningRate: number | null;
+  readonly trainingSpeed: number | null;
   readonly heartbeatAt: string | null;
   readonly warning: string | null;
   readonly error: string | null;
@@ -315,6 +317,7 @@ export interface TrainingJobInput {
   readonly trainingServerId?: string | null;
   readonly datasetId: string;
   readonly model: string;
+  readonly baseModel: string;
   readonly backend: string;
   readonly parametersJson: string;
   readonly totalEpochs: number;

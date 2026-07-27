@@ -78,10 +78,11 @@ Dependencies: Phase 5 and approved agent schemas.
 - Implement model install/compare/benchmark views.
 - Implemented dataset inspection, configurable formats, preview, validation, compression,
   checksums, resumable chunk uploads, retries, cancellation, speed, and ETA.
-- Implemented external Training Manager adapters, job drafts, dispatch, status heartbeat,
-  monitoring, retry/cancel, resource snapshots, and persistent logs.
-- Actual fine-tuning and the external Training Manager runtime remain intentionally out of
-  scope until a backend and deployment environment are selected.
+- Implemented the Windows Training Manager runtime, job drafts, dispatch, WebSocket and
+  heartbeat monitoring, retry/cancel, resource snapshots, persistent logs, and Ollama
+  registry integration.
+- Implemented a real Hugging Face Transformers + PEFT worker for LoRA and QLoRA. Server
+  installation is explicit, and Tome never starts training without a user-dispatched job.
 
 Dependencies: Phase 2, Phase 4, and explicit server management/training APIs.
 

@@ -115,28 +115,30 @@ fn map_job(row: &Row<'_>) -> rusqlite::Result<TrainingJobRecord> {
         remote_job_id: row.get(2)?,
         dataset_id: row.get(3)?,
         model: row.get(4)?,
-        backend: row.get(5)?,
-        parameters_json: row.get(6)?,
-        status: row.get(7)?,
-        stage: row.get(8)?,
-        progress: row.get(9)?,
-        eta_seconds: row.get(10)?,
-        started_at: row.get(11)?,
-        finished_at: row.get(12)?,
-        gpu_usage: row.get(13)?,
-        cpu_usage: row.get(14)?,
-        ram_usage: row.get(15)?,
-        disk_usage: row.get(16)?,
-        current_epoch: row.get(17)?,
-        total_epochs: row.get(18)?,
-        loss: row.get(19)?,
-        learning_rate: row.get(20)?,
-        heartbeat_at: row.get(21)?,
-        warning: row.get(22)?,
-        error: row.get(23)?,
-        retry_of: row.get(24)?,
-        created_at: row.get(25)?,
-        updated_at: row.get(26)?,
+        base_model: row.get(5)?,
+        backend: row.get(6)?,
+        parameters_json: row.get(7)?,
+        status: row.get(8)?,
+        stage: row.get(9)?,
+        progress: row.get(10)?,
+        eta_seconds: row.get(11)?,
+        started_at: row.get(12)?,
+        finished_at: row.get(13)?,
+        gpu_usage: row.get(14)?,
+        cpu_usage: row.get(15)?,
+        ram_usage: row.get(16)?,
+        disk_usage: row.get(17)?,
+        current_epoch: row.get(18)?,
+        total_epochs: row.get(19)?,
+        loss: row.get(20)?,
+        learning_rate: row.get(21)?,
+        training_speed: row.get(22)?,
+        heartbeat_at: row.get(23)?,
+        warning: row.get(24)?,
+        error: row.get(25)?,
+        retry_of: row.get(26)?,
+        created_at: row.get(27)?,
+        updated_at: row.get(28)?,
     })
 }
 
@@ -1440,10 +1442,10 @@ pub fn list_training_jobs(state: State<'_, AppState>) -> Result<Vec<TrainingJobR
     let database = state.database.lock().map_err(|error| error.to_string())?;
     let mut statement = database
         .prepare(
-            "SELECT id, training_server_id, remote_job_id, dataset_id, model, backend,
+            "SELECT id, training_server_id, remote_job_id, dataset_id, model, base_model, backend,
                     parameters_json, status, stage, progress, eta_seconds, started_at,
                     finished_at, gpu_usage, cpu_usage, ram_usage, disk_usage,
-                    current_epoch, total_epochs, loss, learning_rate, heartbeat_at,
+                    current_epoch, total_epochs, loss, learning_rate, training_speed, heartbeat_at,
                     warning, error, retry_of, created_at, updated_at
              FROM training_jobs ORDER BY created_at DESC",
         )
@@ -1466,6 +1468,12 @@ pub fn save_training_job(
     if input.total_epochs < 1 {
         return Err("Training epochs must be at least 1".into());
     }
+    if input.model.trim().is_empty() {
+        return Err("The output model name is required".into());
+    }
+    if input.base_model.trim().is_empty() {
+        return Err("The Ollama base model is required".into());
+    }
     let datasets = list_training_datasets(state.clone())?;
     if !datasets
         .iter()
@@ -1479,12 +1487,13 @@ pub fn save_training_job(
     database
         .execute(
             "INSERT INTO training_jobs(
-                id, training_server_id, dataset_id, model, backend,
+                id, training_server_id, dataset_id, model, base_model, backend,
                 parameters_json, status, stage, total_epochs, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'draft', 'Draft', ?7, ?8, ?8)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'draft', 'Draft', ?8, ?9, ?9)
              ON CONFLICT(id) DO UPDATE SET
                 training_server_id=excluded.training_server_id,
                 dataset_id=excluded.dataset_id, model=excluded.model,
+                base_model=excluded.base_model,
                 backend=excluded.backend, parameters_json=excluded.parameters_json,
                 total_epochs=excluded.total_epochs, updated_at=excluded.updated_at",
             params![
@@ -1492,6 +1501,7 @@ pub fn save_training_job(
                 input.training_server_id,
                 input.dataset_id,
                 input.model.trim(),
+                input.base_model.trim(),
                 input.backend.trim(),
                 input.parameters_json,
                 input.total_epochs,
@@ -1541,6 +1551,29 @@ fn active_training_server(
         })
 }
 
+fn record_training_heartbeat_failure(
+    state: &State<'_, AppState>,
+    id: &str,
+    message: &str,
+) -> Result<(), String> {
+    let database = state.database.lock().map_err(|error| error.to_string())?;
+    database
+        .execute(
+            "UPDATE training_jobs SET
+                heartbeat_failures=heartbeat_failures + 1,
+                status=CASE
+                    WHEN heartbeat_failures + 1 >= 3 THEN 'unreachable'
+                    ELSE status
+                END,
+                warning=?2,
+                updated_at=?3
+             WHERE id=?1",
+            params![id, message, now()],
+        )
+        .map_err(|error| database_error("recording training heartbeat failure", error))?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn dispatch_training_job(
     state: State<'_, AppState>,
@@ -1572,6 +1605,7 @@ pub async fn dispatch_training_job(
             "clientJobId": job.id,
             "datasetId": remote_dataset_id,
             "model": job.model,
+            "baseModel": job.base_model,
             "backend": job.backend,
             "parameters": parameters,
             "epochs": job.total_epochs
@@ -1649,14 +1683,23 @@ pub async fn refresh_training_job(
         .clone()
         .ok_or_else(|| "Draft jobs have no remote status".to_string())?;
     let server = active_training_server(state.clone(), job.training_server_id.as_deref())?;
-    let response = state
+    let response = match state
         .http
         .get(api_url(&server.url, &format!("/v1/jobs/{remote_id}")))
         .send()
         .await
-        .map_err(|error| format!("Training job heartbeat failed: {error}"))?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let message = format!("Training job heartbeat failed: {error}");
+            record_training_heartbeat_failure(&state, &id, &message)?;
+            return Err(message);
+        }
+    };
     if !response.status().is_success() {
-        return Err(response_failure(response, "Refreshing the training job").await);
+        let message = response_failure(response, "Refreshing the training job").await;
+        record_training_heartbeat_failure(&state, &id, &message)?;
+        return Err(message);
     }
     let value = response
         .json::<Value>()
@@ -1691,10 +1734,11 @@ pub async fn refresh_training_job(
                     status=?2, stage=?3, progress=?4, eta_seconds=?5,
                     gpu_usage=?6, cpu_usage=?7, ram_usage=?8, disk_usage=?9,
                     current_epoch=?10, total_epochs=COALESCE(?11, total_epochs),
-                    loss=?12, learning_rate=?13, heartbeat_at=?14,
-                    warning=?15, error=?16,
-                    finished_at=CASE WHEN ?17=1 THEN COALESCE(finished_at, ?14) ELSE NULL END,
-                    updated_at=?14 WHERE id=?1",
+                    loss=?12, learning_rate=?13, training_speed=?14, heartbeat_at=?15,
+                    warning=?16, error=?17,
+                    heartbeat_failures=0,
+                    finished_at=CASE WHEN ?18=1 THEN COALESCE(finished_at, ?15) ELSE NULL END,
+                    updated_at=?15 WHERE id=?1",
                 params![
                     id,
                     status,
@@ -1709,6 +1753,7 @@ pub async fn refresh_training_job(
                     value_i64(&value, "totalEpochs", "total_epochs"),
                     value_f64(&value, "loss", "loss"),
                     value_f64(&value, "learningRate", "learning_rate"),
+                    value_f64(&value, "trainingSpeed", "training_speed"),
                     timestamp,
                     value_string(&value, "warning", "warning"),
                     value_string(&value, "error", "error"),
@@ -1834,12 +1879,12 @@ pub async fn retry_training_job(
         database
             .execute(
                 "INSERT INTO training_jobs(
-                    id, training_server_id, remote_job_id, dataset_id, model, backend,
+                    id, training_server_id, remote_job_id, dataset_id, model, base_model, backend,
                     parameters_json, status, stage, progress, started_at,
                     current_epoch, total_epochs, retry_of, created_at, updated_at
                  ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', 'Queued', 0, ?8,
-                    0, ?9, ?10, ?8, ?8
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', 'Queued', 0, ?9,
+                    0, ?10, ?11, ?9, ?9
                  )",
                 params![
                     retry_id,
@@ -1847,6 +1892,7 @@ pub async fn retry_training_job(
                     new_remote_id,
                     source.dataset_id,
                     source.model,
+                    source.base_model,
                     source.backend,
                     source.parameters_json,
                     timestamp,

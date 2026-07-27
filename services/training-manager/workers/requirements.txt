@@ -1,0 +1,10 @@
+accelerate>=1.9,<2
+datasets>=4,<5
+peft>=0.17,<1
+pyarrow>=20,<24
+safetensors>=0.5,<1
+torch>=2.7,<3
+transformers>=4.53,<6
+
+# Install bitsandbytes separately when QLoRA is required and verify that its release
+# supports the CUDA and Windows versions installed on the Training Server.
