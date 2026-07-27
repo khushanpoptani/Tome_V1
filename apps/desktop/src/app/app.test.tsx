@@ -40,7 +40,10 @@ describe("Tome application shell", () => {
 
     expect(screen.getByRole("heading", { name: "Settings" })).toBeInTheDocument();
     expect(
-      screen.getByText("Business features begin after foundation review."),
+      screen.getByRole("navigation", { name: "Settings sections" }),
     ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Security" }));
+    expect(screen.getByRole("heading", { name: "Execution mode" })).toBeInTheDocument();
   });
 });

@@ -2,7 +2,6 @@ import { ContextPanel } from "@/components/shell/context-panel";
 import { PromptBar } from "@/components/shell/prompt-bar";
 import { Sidebar } from "@/components/shell/sidebar";
 import { StatusBar } from "@/components/shell/status-bar";
-import { TitleBar } from "@/components/shell/title-bar";
 import { useShellStore } from "@tome/stores";
 import { AnimatePresence, motion } from "framer-motion";
 import { Outlet } from "react-router-dom";
@@ -12,8 +11,7 @@ export function DesktopShell(): React.JSX.Element {
   const sidebarCollapsed = useShellStore((state) => state.sidebarCollapsed);
 
   return (
-    <div className="grid h-dvh min-h-[680px] grid-rows-[42px_minmax(0,1fr)_24px] overflow-hidden bg-background text-foreground">
-      <TitleBar />
+    <div className="grid h-dvh min-h-[640px] grid-rows-[minmax(0,1fr)_24px] overflow-hidden bg-background text-foreground">
       <div className="flex min-h-0 overflow-hidden">
         <Sidebar collapsed={sidebarCollapsed} />
         <div className="flex min-w-0 flex-1">

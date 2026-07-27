@@ -37,7 +37,7 @@ export function Sidebar({ collapsed }: SidebarProps): React.JSX.Element {
     >
       <nav
         aria-label="Primary navigation"
-        className="flex min-h-0 flex-1 flex-col gap-1 p-2"
+        className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto p-2"
       >
         <div className="mb-1 px-2 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground/60">
           {collapsed ? "•" : "Workspace"}

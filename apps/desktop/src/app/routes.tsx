@@ -1,5 +1,6 @@
 import { DashboardPage } from "@/features/dashboard/dashboard-page";
 import { PlaceholderPage } from "@/features/placeholders/placeholder-page";
+import { SettingsPage } from "@/features/settings/settings-page";
 import { DesktopShell } from "@/layouts/desktop-shell";
 import { Navigate, Route, Routes } from "react-router-dom";
 
@@ -58,16 +59,7 @@ export function AppRoutes(): React.JSX.Element {
             />
           }
         />
-        <Route
-          path="settings"
-          element={
-            <PlaceholderPage
-              description="Configure Tome, its appearance, Ollama connection, models, security, and logging."
-              eyebrow="Preferences"
-              title="Settings"
-            />
-          }
-        />
+        <Route path="settings" element={<SettingsPage />} />
       </Route>
       <Route path="*" element={<Navigate replace to="/" />} />
     </Routes>
