@@ -20,6 +20,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { useState } from "react";
+import { useSearchParams } from "react-router-dom";
 
 type SettingsSection =
   "general" | "appearance" | "server" | "models" | "security" | "logging" | "about";
@@ -51,7 +52,12 @@ const content: Readonly<Record<SettingsSection, () => React.JSX.Element>> = {
 };
 
 export function SettingsPage(): React.JSX.Element {
-  const [activeSection, setActiveSection] = useState<SettingsSection>("general");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const requestedSection = searchParams.get("section");
+  const initialSection = navigation.some((item) => item.id === requestedSection)
+    ? (requestedSection as SettingsSection)
+    : "general";
+  const [activeSection, setActiveSection] = useState<SettingsSection>(initialSection);
   const ActiveContent = content[activeSection];
   const activeLabel =
     navigation.find((item) => item.id === activeSection)?.label ?? "Settings";
@@ -87,6 +93,7 @@ export function SettingsPage(): React.JSX.Element {
               key={id}
               onClick={() => {
                 setActiveSection(id);
+                setSearchParams({ section: id }, { replace: true });
               }}
               type="button"
             >

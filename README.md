@@ -4,9 +4,11 @@ Tome is a cross-platform, AI-powered desktop software-engineering workspace. The
 client keeps repositories and deterministic execution on the user's machine while
 delegating all AI reasoning to agents hosted by an Ollama server.
 
-This repository currently contains the production-ready project foundation and application
-shell only. Business features are intentionally deferred until the initial architecture
-review is approved.
+This repository contains the production-ready project foundation and functional desktop
+shell. Navigation, local records, settings, server management, Ollama model management,
+streaming chat, history, task progress, and diagnostic logging are operational. AI agents,
+training, datasets, code generation, repair, and deterministic execution workflows remain
+intentionally deferred.
 
 ## Architecture at a glance
 
@@ -52,7 +54,7 @@ destructive operations must pass through the security layer.
 - React Router, React Hook Form, and Zod
 - react-markdown, Mermaid, Monaco Editor, xterm.js, Recharts, and Sonner
 - SQLite for local persistence
-- HTTP and WebSocket communication with Ollama
+- Official Ollama REST API with streamed NDJSON responses
 
 ## Getting started
 
@@ -66,7 +68,7 @@ Prerequisites:
 
 ```bash
 pnpm install
-pnpm dev
+pnpm desktop dev
 ```
 
 Useful checks:
@@ -89,5 +91,11 @@ The architecture summary, open decisions, repository map, and staged delivery pl
 - macOS (Intel and Apple Silicon): `.app`, `.dmg`
 - Linux: `.deb`, `.rpm`, `.AppImage`
 
-Packaging workflows will be enabled after signing, updater, and release-channel decisions
-are approved.
+Local unsigned packages can be built with:
+
+```bash
+pnpm desktop build --bundles app,dmg --no-sign
+```
+
+Signing, notarization, updater, and release-channel decisions remain open production
+release concerns.

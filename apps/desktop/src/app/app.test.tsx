@@ -19,6 +19,12 @@ describe("Tome application shell", () => {
       screen.getByRole("navigation", { name: "Primary navigation" }),
     ).toBeInTheDocument();
     expect(screen.getByLabelText("Ask Tome")).toBeInTheDocument();
+    const collapseSidebar = screen.getByRole("button", { name: "Collapse sidebar" });
+    fireEvent.click(collapseSidebar);
+    const expandSidebar = screen.getByRole("button", { name: "Expand sidebar" });
+    expect(expandSidebar).toBeInTheDocument();
+    fireEvent.click(expandSidebar);
+    expect(screen.getByRole("button", { name: "Collapse sidebar" })).toBeInTheDocument();
 
     const permissionSelector = screen.getByRole("combobox", {
       name: "Permission mode",
@@ -29,7 +35,7 @@ describe("Tome application shell", () => {
     fireEvent.change(permissionSelector, { target: { value: "ask" } });
   });
 
-  it("renders a routed foundation placeholder", () => {
+  it("renders the functional settings route", () => {
     render(
       <AppProviders>
         <MemoryRouter initialEntries={["/settings"]}>
@@ -42,6 +48,11 @@ describe("Tome application shell", () => {
     expect(
       screen.getByRole("navigation", { name: "Settings sections" }),
     ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Appearance" }));
+    fireEvent.click(screen.getByRole("button", { name: /Light/ }));
+    expect(document.documentElement).toHaveAttribute("data-theme", "light");
+    fireEvent.click(screen.getByRole("button", { name: /System/ }));
 
     fireEvent.click(screen.getByRole("button", { name: "Security" }));
     expect(screen.getByRole("heading", { name: "Execution mode" })).toBeInTheDocument();

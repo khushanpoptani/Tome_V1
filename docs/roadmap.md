@@ -1,6 +1,6 @@
 # Tome Phased Implementation Roadmap
 
-## Phase 0 - Foundation (this milestone)
+## Phase 0 - Foundation (complete)
 
 - Review and codify the supplied architecture.
 - Establish pnpm and Cargo workspaces.
@@ -13,20 +13,20 @@
 Exit criterion: a clean clone installs, checks, builds, and opens a polished Tome shell
 with no implemented engineering workflows.
 
-## Phase 1 - Local platform core
+## Phase 1 - Local platform core (functional-shell scope complete)
 
-- Approve SQLite schema, migration, retention, and encryption decisions.
-- Implement settings, workspace/project records, task state, and history.
-- Implement structured logging, redaction, and diagnostics.
+- Implement versioned SQLite migrations.
+- Implement settings, workspace/project records, task state, and conversation history.
+- Implement structured application, connection, model, and streaming logs.
 - Introduce secure credential storage and platform environment discovery.
 
 Dependencies: Phase 0 and OD-003, OD-005, OD-011.
 
-## Phase 2 - Ollama connectivity
+## Phase 2 - Ollama connectivity (functional-shell scope complete)
 
 - Finalize versioned HTTP and WebSocket contracts.
-- Add connection validation, health status, model discovery, streaming, cancellation,
-  reconnect, backpressure, and error handling.
+- Add connection validation, health status, model discovery, streaming, cancellation, and
+  detailed error handling.
 - Add server/model settings forms and connection diagnostics.
 
 Dependencies: Phase 1 and OD-001, OD-002, OD-010.
