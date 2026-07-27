@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+target/
+coverage/
+*.tsbuildinfo
+
+# Tool caches
+.eslintcache
+.vite/
+.turbo/
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# IDE and OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Logs and temporary artifacts
+*.log
+tmp/
+
+# Local data, models, and datasets
+*.db
+*.db-shm
+*.db-wal
+models/*
+!models/.gitkeep
+datasets/*
+!datasets/.gitkeep
+
+# Tauri signing material
+*.key
+*.pem
+
