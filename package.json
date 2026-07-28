@@ -1,6 +1,6 @@
 {
   "name": "tome",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "description": "Tome - a cross-platform AI software engineering workspace",
   "packageManager": "pnpm@11.9.0",

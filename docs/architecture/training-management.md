@@ -130,11 +130,16 @@ accepted chunk, retries transient failures with bounded backoff, and resumes fro
 server-confirmed offset after restart.
 
 Completion is a long-running server operation because it verifies the full checksum,
-extracts archives, validates records, and commits metadata. Training Manager 0.1.3 owns
-that work in a background task and returns `202 Accepted`; Tome polls the persisted
-`validating`, `completed`, or `failed` state every five seconds. The desktop retains a
-one-hour compatibility timeout for older synchronous servers and emits validation
-heartbeats instead of applying the short timeout used for ordinary API calls.
+extracts archives, validates records, and commits metadata. Training Manager 0.1.3 and
+later own that work in a background task and return `202 Accepted`; Tome polls the
+persisted `validating`, `completed`, or `failed` state every five seconds. The desktop
+retains a one-hour compatibility timeout for older synchronous servers and emits
+validation heartbeats instead of applying the short timeout used for ordinary API calls.
+
+Dataset registration is idempotent by dataset ID. If a retry creates a new resumable
+upload session for a dataset already registered on the Training Manager, completion
+updates the existing dataset metadata and source upload reference instead of failing a
+primary-key constraint.
 
 ### Jobs and monitoring
 
@@ -213,11 +218,13 @@ immutable after dispatch. Retrying creates a new attempt linked to the original 
 
 Dataset groups are desktop-side organizational containers. A group owns zero or more local
 dataset catalog records and provides bulk add, existing-record assignment, upload, and
-delete actions. Assignment changes only group metadata, preserving validation, artifacts,
-and upload state. Selecting a group in the job form expands it into the current ordered
-set of valid dataset IDs; the remote Training Manager protocol remains dataset-based and
-requires no group-specific coupling. Existing and intentionally independent datasets
-remain available under `Ungrouped`.
+delete actions. Group deletion explicitly deletes each member first and preserves the
+group if any local or remote dataset cannot be removed; the UI reports the blocking
+upload, deletion, server, or job-reference reason. Assignment changes only group metadata,
+preserving validation, artifacts, and upload state. Selecting a group in the job form
+expands it into the current ordered set of valid dataset IDs; the remote Training Manager
+protocol remains dataset-based and requires no group-specific coupling. Existing and
+intentionally independent datasets remain available under `Ungrouped`.
 
 ## ETA estimation
 

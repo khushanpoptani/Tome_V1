@@ -1781,19 +1781,37 @@ export function TrainingPage(): React.JSX.Element {
                                   </Button>
                                   <Button
                                     aria-label={`Delete group ${row.group.name}`}
-                                    disabled={
-                                      groupUploadActive || bulkDeleteProgress !== null
-                                    }
-                                    onClick={() =>
+                                    className="border-red-500/25 text-red-400 hover:bg-red-500/10 hover:text-red-300"
+                                    onClick={() => {
+                                      if (groupUploadActive) {
+                                        toast.error(
+                                          `${row.group!.name} cannot be deleted while one of its datasets is uploading. Wait for the upload to finish or cancel it first.`,
+                                        );
+                                        return;
+                                      }
+                                      if (bulkDeleteProgress !== null) {
+                                        toast.error(
+                                          "Another dataset deletion is still running. Wait for it to finish before deleting this group.",
+                                        );
+                                        return;
+                                      }
                                       setDatasetGroupDeleteConfirmation({
                                         datasets: row.datasets,
                                         group: row.group as TrainingDatasetGroupRecord,
-                                      })
+                                      });
+                                    }}
+                                    size="sm"
+                                    title={
+                                      groupUploadActive
+                                        ? "Wait for the active group upload to finish"
+                                        : bulkDeleteProgress !== null
+                                          ? "Wait for the current deletion to finish"
+                                          : `Delete ${row.group.name}`
                                     }
-                                    size="icon"
-                                    variant="ghost"
+                                    variant="outline"
                                   >
                                     <Trash2 className="size-3.5" />
+                                    Delete group
                                   </Button>
                                 </>
                               )}

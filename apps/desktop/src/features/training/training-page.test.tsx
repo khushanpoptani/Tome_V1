@@ -153,6 +153,26 @@ describe("Training dataset groups", () => {
     expect(screen.getByRole("button", { name: "Add data" })).toBeEnabled();
   });
 
+  it("provides a labeled group deletion action and deletes an empty group", async () => {
+    const deleteGroup = vi
+      .spyOn(backend, "deleteTrainingDatasetGroup")
+      .mockResolvedValue(undefined);
+    renderTrainingPage([]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Datasets" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: `Delete group ${datasetGroup.name}` }),
+    );
+
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText(`Delete ${datasetGroup.name}?`)).toBeInTheDocument();
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Delete group and datasets" }),
+    );
+
+    await waitFor(() => expect(deleteGroup).toHaveBeenCalledWith(datasetGroup.id));
+  });
+
   it("moves existing catalog datasets into a group without revalidation", async () => {
     const assign = vi
       .spyOn(backend, "assignTrainingDatasetsToGroup")

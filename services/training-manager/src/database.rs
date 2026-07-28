@@ -334,7 +334,8 @@ impl Database {
                 id, source_upload_id, name, format, size, sha256, artifact_path,
                 content_path, file_count, validation_status, created_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'valid', ?10, ?10)
-             ON CONFLICT(source_upload_id) DO UPDATE SET
+             ON CONFLICT(id) DO UPDATE SET
+                source_upload_id=excluded.source_upload_id,
                 name=excluded.name, format=excluded.format, size=excluded.size,
                 sha256=excluded.sha256, artifact_path=excluded.artifact_path,
                 content_path=excluded.content_path, file_count=excluded.file_count,
@@ -935,6 +936,65 @@ mod tests {
 
         assert_eq!(resumed.name, "dataset.zip");
         assert_eq!(resumed.format, "zip");
+        drop(database);
+        fs::remove_dir_all(root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn replaces_a_dataset_when_a_new_upload_session_reuses_its_id() {
+        let root = std::env::temp_dir().join(format!("tome-training-reupload-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("test directory should be created");
+        let database =
+            Database::open(&root.join("training.sqlite3")).expect("training database should open");
+        let mut request = UploadRequest {
+            client_upload_id: "first-upload".into(),
+            dataset_id: "stable-dataset-id".into(),
+            name: "Planning v1".into(),
+            format: "jsonl".into(),
+            size: 1024,
+            sha256: "first".into(),
+        };
+        let first_upload = database
+            .create_or_resume_upload(&request, &root.join("first.partial"), 4 * 1024 * 1024)
+            .expect("first upload should be created");
+        database
+            .complete_upload(
+                &first_upload,
+                &root.join("first.artifact"),
+                &root.join("first-content"),
+                10,
+            )
+            .expect("first upload should register the dataset");
+
+        request.client_upload_id = "replacement-upload".into();
+        request.name = "Planning v2".into();
+        request.size = 2048;
+        request.sha256 = "second".into();
+        let replacement_upload = database
+            .create_or_resume_upload(&request, &root.join("replacement.partial"), 4 * 1024 * 1024)
+            .expect("replacement upload should be created");
+        let replaced = database
+            .complete_upload(
+                &replacement_upload,
+                &root.join("replacement.artifact"),
+                &root.join("replacement-content"),
+                20,
+            )
+            .expect("replacement upload should update the existing dataset");
+
+        assert_eq!(replaced.id, "stable-dataset-id");
+        assert_eq!(replaced.name, "Planning v2");
+        assert_eq!(replaced.size, 2048);
+        assert_eq!(replaced.sha256, "second");
+        assert!(database
+            .dataset_by_upload(&first_upload.id)
+            .expect("old upload lookup should succeed")
+            .is_none());
+        assert!(database
+            .dataset_by_upload(&replacement_upload.id)
+            .expect("replacement upload lookup should succeed")
+            .is_some());
+
         drop(database);
         fs::remove_dir_all(root).expect("test directory should be removed");
     }
