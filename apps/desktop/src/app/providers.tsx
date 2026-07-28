@@ -36,7 +36,7 @@ function DesktopBootstrap(): null {
         await backend.saveServer({
           isActive: true,
           name: "Home Ollama",
-          url: "http://192.168.1.12:11434",
+          url: "http://192.168.1.6:11434",
         });
         servers = await backend.listServers();
       }

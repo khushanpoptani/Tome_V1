@@ -1094,7 +1094,7 @@ export function TrainingPage(): React.JSX.Element {
                       setServerForm({
                         isActive: (servers.data?.length ?? 0) === 0,
                         name: "",
-                        url: "http://192.168.1.12:11435",
+                        url: "http://192.168.1.6:11435",
                       })
                     }
                     size="sm"
@@ -1112,7 +1112,7 @@ export function TrainingPage(): React.JSX.Element {
                             setServerForm({
                               isActive: true,
                               name: "Training Manager",
-                              url: "http://192.168.1.12:11435",
+                              url: "http://192.168.1.6:11435",
                             })
                           }
                           size="sm"
@@ -1856,7 +1856,7 @@ export function TrainingPage(): React.JSX.Element {
                 onChange={(event) =>
                   setServerForm({ ...serverForm, url: event.target.value })
                 }
-                placeholder="http://192.168.1.12:11435"
+                placeholder="http://192.168.1.6:11435"
                 required
                 type="url"
                 value={serverForm.url}

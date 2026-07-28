@@ -48,7 +48,7 @@ neither performs fine-tuning.
 
 ## Windows AI Server deployment
 
-The machine at `192.168.1.12` hosts two independent processes:
+The machine at `192.168.1.6` hosts two independent processes:
 
 ```text
 Ollama                    http://0.0.0.0:11434

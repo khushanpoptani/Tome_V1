@@ -100,22 +100,17 @@ if ($createdConfig) {
 
 if ($null -eq $existingService) {
     $serviceBinaryPath = "`"$binaryTarget`" --service"
-    & sc.exe create $serviceName "binPath= $serviceBinaryPath" "start= auto" `
-        "DisplayName= Tome Training Manager"
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not register the Windows service."
-    }
-    & sc.exe description $serviceName `
-        "Receives Tome datasets, manages external AI training jobs, and registers completed models with Ollama."
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not set the Windows service description."
-    }
+    New-Service -Name $serviceName `
+        -BinaryPathName $serviceBinaryPath `
+        -DisplayName "Tome Training Manager" `
+        -Description "Receives Tome datasets, manages external AI training jobs, and registers completed models with Ollama." `
+        -StartupType Automatic | Out-Null
 }
 
 $firewallName = "Tome Training Manager (TCP 11435)"
 if (-not (Get-NetFirewallRule -DisplayName $firewallName -ErrorAction SilentlyContinue)) {
     New-NetFirewallRule -DisplayName $firewallName -Direction Inbound -Action Allow `
-        -Protocol TCP -LocalPort 11435 -Profile Private | Out-Null
+        -Protocol TCP -LocalPort 11435 -Profile Any -RemoteAddress LocalSubnet | Out-Null
 }
 
 Start-Service -Name $serviceName
