@@ -732,6 +732,10 @@ export function TrainingPage(): React.JSX.Element {
     () => (ollamaModels.data ?? []).filter(supportsOllamaAdapter),
     [ollamaModels.data],
   );
+  const incompatibleOllamaModels = useMemo(
+    () => (ollamaModels.data ?? []).filter((model) => !supportsOllamaAdapter(model)),
+    [ollamaModels.data],
+  );
   const visibleJobs = useMemo(() => {
     const all = jobs.data ?? [];
     if (section === "running") {
@@ -2119,9 +2123,39 @@ export function TrainingPage(): React.JSX.Element {
                   rather than selected.
                 </FieldHelp>
               </label>
-              <label className="block space-y-1.5 text-xs">
-                <span>Installed Ollama base model</span>
+              <div className="block space-y-1.5 text-xs">
+                <span className="flex items-center justify-between gap-2">
+                  <span>Installed Ollama base model</span>
+                  <button
+                    className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground disabled:cursor-wait disabled:opacity-60"
+                    disabled={
+                      ollamaModels.isFetching ||
+                      ollamaServer.data === null ||
+                      ollamaServer.data === undefined
+                    }
+                    onClick={() => {
+                      void ollamaModels.refetch().then((result) => {
+                        if (result.isError) {
+                          toast.error(
+                            `Could not refresh Ollama models: ${errorMessage(result.error)}`,
+                          );
+                          return;
+                        }
+                        toast.success(
+                          `Refreshed ${result.data?.length ?? 0} installed Ollama model(s).`,
+                        );
+                      });
+                    }}
+                    type="button"
+                  >
+                    <RefreshCw
+                      className={cn("size-3", ollamaModels.isFetching && "animate-spin")}
+                    />
+                    {ollamaModels.isFetching ? "Refreshing…" : "Refresh all"}
+                  </button>
+                </span>
                 <select
+                  aria-label="Installed Ollama base model"
                   className={inputClassName}
                   onChange={(event) =>
                     setJobForm({ ...jobForm, baseModel: event.target.value })
@@ -2144,13 +2178,26 @@ export function TrainingPage(): React.JSX.Element {
                         : ""}
                     </option>
                   ))}
+                  {incompatibleOllamaModels.length === 0 ? null : (
+                    <optgroup label="Installed · adapter registration unavailable">
+                      {incompatibleOllamaModels.map((model) => (
+                        <option disabled key={model.name} value={model.name}>
+                          {model.name}
+                          {model.details?.parameter_size
+                            ? ` · ${model.details.parameter_size}`
+                            : ""}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
                 </select>
                 <FieldHelp>
-                  The installed Ollama model used as the base when Tome registers the
-                  trained adapter. Only currently supported Llama, Mistral/Mixtral, and
-                  Gemma models are shown.
+                  Refresh all reads the complete installed list directly from the active
+                  Ollama server. Llama, Mistral/Mixtral, and Gemma models can currently be
+                  selected for Safetensors adapter registration; other installed models
+                  remain visible but disabled.
                 </FieldHelp>
-              </label>
+              </div>
               <label className="block space-y-1.5 text-xs">
                 <span>Backend adapter</span>
                 <select
