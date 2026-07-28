@@ -32,7 +32,14 @@ impl AppState {
                      logs=logs || CASE WHEN logs='' THEN '' ELSE char(10) END ||
                          'Paused: Tome restarted; resume the upload from Datasets',
                      updated_at=datetime('now')
-                 WHERE kind='dataset-upload' AND status='running';
+                 WHERE kind='dataset-upload' AND status='running'
+                   AND id IN (
+                       SELECT id FROM dataset_uploads WHERE status='paused'
+                   );
+
+                 DELETE FROM tasks
+                 WHERE kind='dataset-upload'
+                   AND id NOT IN (SELECT id FROM dataset_uploads);
 
                  UPDATE tasks
                  SET status='failed', ended_at=datetime('now'),

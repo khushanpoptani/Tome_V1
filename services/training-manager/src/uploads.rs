@@ -9,9 +9,11 @@ use axum::{
     body::Bytes,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::Serialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
@@ -30,6 +32,7 @@ pub struct UploadStatus {
     pub uploaded_bytes: i64,
     pub total_bytes: i64,
     pub chunk_size: i64,
+    pub last_error: Option<String>,
 }
 
 pub async fn create_upload(
@@ -61,6 +64,11 @@ pub async fn create_upload(
                 uploaded_bytes: upload.expected_size,
                 chunk_size: upload.chunk_size,
             }),
+        ));
+    }
+    if upload.status == "validating" {
+        return Err(ApiError::conflict(
+            "Dataset upload is already being validated; poll this upload for completion",
         ));
     }
     if let Ok(metadata) = tokio::fs::metadata(&upload.partial_path).await {
@@ -95,6 +103,7 @@ pub async fn get_upload(
         uploaded_bytes: upload.uploaded_bytes,
         total_bytes: upload.expected_size,
         chunk_size: upload.chunk_size,
+        last_error: upload.last_error,
     }))
 }
 
@@ -107,6 +116,11 @@ pub async fn upload_chunk(
     let upload = state.database.upload(&id)?;
     if upload.status == "completed" {
         return Ok(Json(upload_status(&upload)));
+    }
+    if upload.status == "validating" {
+        return Err(ApiError::conflict(
+            "Dataset upload is being validated and cannot accept more chunks",
+        ));
     }
     if upload.status == "cancelled" {
         return Err(ApiError::conflict("Upload session was cancelled"));
@@ -182,7 +196,7 @@ pub async fn complete_upload(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(request): Json<CompleteUploadRequest>,
-) -> ApiResult<Json<CompleteUploadResponse>> {
+) -> ApiResult<Response> {
     let upload = state.database.upload(&id)?;
     if upload.status == "completed" {
         let dataset = state.database.dataset(&upload.dataset_id)?;
@@ -190,7 +204,15 @@ pub async fn complete_upload(
             dataset_id: dataset.id,
             validation_status: dataset.validation_status,
             file_count: count_files(&dataset.content_path)?,
-        }));
+        })
+        .into_response());
+    }
+    if upload.status == "validating" {
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({ "uploadId": id, "status": "validating" })),
+        )
+            .into_response());
     }
     if upload.uploaded_bytes != upload.expected_size || request.size != upload.expected_size {
         return Err(ApiError::conflict(format!(
@@ -204,54 +226,33 @@ pub async fn complete_upload(
             "Completion checksum differs from upload handshake",
         ));
     }
-    let source = upload.partial_path.clone();
-    let expected = upload.expected_sha256.clone();
-    let actual = tokio::task::spawn_blocking(move || sha256_file(&source))
-        .await
-        .map_err(|error| ApiError::internal(format!("Checksum worker failed: {error}")))??;
-    if actual != expected {
-        state
-            .database
-            .fail_upload(&id, "Final dataset SHA-256 does not match")?;
-        return Err(ApiError::invalid("Final dataset SHA-256 does not match"));
-    }
-
-    let dataset_root = state.config.data_dir.join("datasets").join(&id);
-    let artifact_path = dataset_root.join("artifact");
-    let content_path = dataset_root.join("content");
-    let upload_for_validation = upload.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        commit_and_validate(
-            &upload_for_validation,
-            &dataset_root,
-            &artifact_path,
-            &content_path,
-        )
-    })
-    .await
-    .map_err(|error| ApiError::internal(format!("Dataset validation worker failed: {error}")))?;
-    let (artifact_path, content_path, file_count) = match result {
-        Ok(value) => value,
-        Err(error) => {
-            state.database.fail_upload(&id, &error.message)?;
-            return Err(error);
+    state.database.validate_upload(&id)?;
+    let validation_state = state.clone();
+    let validation_id = id.clone();
+    tokio::spawn(async move {
+        if let Err(error) = finalize_upload(validation_state.clone(), &validation_id, upload).await
+        {
+            let _ = validation_state
+                .database
+                .fail_upload(&validation_id, &error.message);
         }
-    };
-    let dataset =
-        state
-            .database
-            .complete_upload(&upload, &artifact_path, &content_path, file_count)?;
-    Ok(Json(CompleteUploadResponse {
-        dataset_id: dataset.id,
-        validation_status: dataset.validation_status,
-        file_count,
-    }))
+    });
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "uploadId": id, "status": "validating" })),
+    )
+        .into_response())
 }
 
 pub async fn cancel_upload(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
+    if state.database.upload(&id)?.status == "validating" {
+        return Err(ApiError::conflict(
+            "Dataset validation is already running and cannot be cancelled safely",
+        ));
+    }
     let upload = state.database.cancel_upload(&id)?;
     if upload.partial_path.exists() {
         tokio::fs::remove_file(&upload.partial_path).await?;
@@ -284,7 +285,38 @@ fn upload_status(upload: &UploadRecord) -> UploadStatus {
         uploaded_bytes: upload.uploaded_bytes,
         total_bytes: upload.expected_size,
         chunk_size: upload.chunk_size,
+        last_error: upload.last_error.clone(),
     }
+}
+
+async fn finalize_upload(state: Arc<AppState>, id: &str, upload: UploadRecord) -> ApiResult<()> {
+    let source = upload.partial_path.clone();
+    let expected = upload.expected_sha256.clone();
+    let actual = tokio::task::spawn_blocking(move || sha256_file(&source))
+        .await
+        .map_err(|error| ApiError::internal(format!("Checksum worker failed: {error}")))??;
+    if actual != expected {
+        return Err(ApiError::invalid("Final dataset SHA-256 does not match"));
+    }
+
+    let dataset_root = state.config.data_dir.join("datasets").join(id);
+    let artifact_path = dataset_root.join("artifact");
+    let content_path = dataset_root.join("content");
+    let upload_for_validation = upload.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        commit_and_validate(
+            &upload_for_validation,
+            &dataset_root,
+            &artifact_path,
+            &content_path,
+        )
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Dataset validation worker failed: {error}")))??;
+    state
+        .database
+        .complete_upload(&upload, &result.0, &result.1, result.2)?;
+    Ok(())
 }
 
 fn parse_content_range(value: &str) -> ApiResult<(i64, i64, i64)> {

@@ -1,10 +1,22 @@
 import { backend, isTauriRuntime } from "@/lib/backend";
+import { formatDate } from "@/lib/format";
 import { useQuery } from "@tanstack/react-query";
 import { useShellStore } from "@tome/stores";
 import { Badge, Button, Separator } from "@tome/ui";
-import { Bot, CheckCircle2, FolderGit2, ListChecks, ScrollText, X } from "lucide-react";
+import {
+  Bot,
+  CheckCircle2,
+  CircleAlert,
+  FolderGit2,
+  ListChecks,
+  ScrollText,
+  X,
+} from "lucide-react";
+import { useEffect, useMemo, useRef } from "react";
+import { useLocation } from "react-router-dom";
 
 export function ContextPanel(): React.JSX.Element {
+  const location = useLocation();
   const activeProject = useShellStore((state) => state.activeProject);
   const activeServer = useShellStore((state) => state.activeServer);
   const selectedModel = useShellStore((state) => state.selectedModel);
@@ -17,18 +29,34 @@ export function ContextPanel(): React.JSX.Element {
   });
   const logs = useQuery({
     enabled: isTauriRuntime(),
-    queryFn: () => backend.listLogs(20),
+    queryFn: () => backend.listLogs(100),
     queryKey: ["logs", "context"],
-    refetchInterval: 3_000,
+    refetchInterval: 2_000,
   });
+  const logsSection = useRef<HTMLElement>(null);
   const running = (tasks.data ?? []).filter((task) => task.status === "running");
   const failed = (tasks.data ?? []).filter((task) => task.status === "failed");
+  const visibleLogs = useMemo(() => {
+    const records = logs.data ?? [];
+    return (
+      location.pathname === "/training"
+        ? records.filter((record) => record.category.startsWith("training"))
+        : records
+    ).slice(0, 20);
+  }, [location.pathname, logs.data]);
+
+  useEffect(() => {
+    const showLogs = (): void => {
+      logsSection.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    };
+    window.addEventListener("tome:show-context-logs", showLogs);
+    return () => window.removeEventListener("tome:show-context-logs", showLogs);
+  }, []);
 
   const sections = [
     { icon: Bot, label: "Chat model", value: selectedModel ?? "None selected" },
     { icon: FolderGit2, label: "Current project", value: activeProject?.name ?? "None" },
     { icon: ListChecks, label: "Running tasks", value: String(running.length) },
-    { icon: ScrollText, label: "Recent logs", value: String(logs.data?.length ?? 0) },
     { icon: CheckCircle2, label: "Failed tasks", value: String(failed.length) },
   ] as const;
 
@@ -74,13 +102,21 @@ export function ContextPanel(): React.JSX.Element {
                   <div className="flex items-center justify-between gap-2 text-[10px]">
                     <span className="truncate">{task.title}</span>
                     <span className="text-muted-foreground">
-                      {Math.round(task.progress)}%
+                      {Math.round(Number.isFinite(task.progress) ? task.progress : 0)}%
                     </span>
                   </div>
                   <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-secondary">
                     <div
                       className="h-full rounded-full bg-violet-500 transition-[width]"
-                      style={{ width: `${Math.max(0, Math.min(100, task.progress))}%` }}
+                      style={{
+                        width: `${Math.max(
+                          0,
+                          Math.min(
+                            100,
+                            Number.isFinite(task.progress) ? task.progress : 0,
+                          ),
+                        )}%`,
+                      }}
                     />
                   </div>
                   <p className="mt-1 truncate text-[9px] text-muted-foreground">
@@ -91,6 +127,56 @@ export function ContextPanel(): React.JSX.Element {
             </div>
           </section>
         )}
+        <section
+          className="scroll-mt-3 rounded-lg border border-border/70 bg-background/35"
+          ref={logsSection}
+        >
+          <div className="flex items-center justify-between border-b border-border/70 px-3 py-2.5">
+            <p className="flex items-center gap-2 text-[11px] font-medium">
+              <ScrollText className="size-3.5 text-violet-400" />
+              {location.pathname === "/training" ? "Training logs" : "Activity logs"}
+            </p>
+            <Badge>{visibleLogs.length}</Badge>
+          </div>
+          <div className="max-h-80 divide-y divide-border/60 overflow-y-auto">
+            {logs.isLoading ? (
+              <p className="p-3 text-[10px] text-muted-foreground">Loading logs…</p>
+            ) : visibleLogs.length === 0 ? (
+              <p className="p-3 text-[10px] text-muted-foreground">
+                No activity has been recorded yet.
+              </p>
+            ) : (
+              visibleLogs.map((record) => (
+                <article className="p-3" key={record.id}>
+                  <div className="flex items-start gap-2">
+                    {record.level === "error" ? (
+                      <CircleAlert className="mt-0.5 size-3 shrink-0 text-red-400" />
+                    ) : (
+                      <span
+                        className={`mt-1.5 size-1.5 shrink-0 rounded-full ${
+                          record.level === "warning" ? "bg-amber-400" : "bg-emerald-400"
+                        }`}
+                      />
+                    )}
+                    <div className="min-w-0">
+                      <p className="break-words text-[10px] leading-4">
+                        {record.message}
+                      </p>
+                      {record.details === null ? null : (
+                        <p className="mt-1 break-words text-[9px] leading-3.5 text-muted-foreground">
+                          {record.details}
+                        </p>
+                      )}
+                      <p className="mt-1 text-[8px] text-muted-foreground">
+                        {record.category} · {formatDate(record.createdAt)}
+                      </p>
+                    </div>
+                  </div>
+                </article>
+              ))
+            )}
+          </div>
+        </section>
       </div>
       <div className="mt-auto border-t border-border p-4">
         <div className="rounded-lg bg-violet-500/8 p-3">

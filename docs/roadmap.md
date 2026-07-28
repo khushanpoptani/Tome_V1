@@ -78,7 +78,8 @@ Dependencies: Phase 5 and approved agent schemas.
 - Implement model install/compare/benchmark views.
 - Implemented dataset inspection, configurable formats, preview, validation, compression,
   checksums, reusable dataset groups, group-level upload/delete actions, resumable chunk
-  uploads, retries, cancellation, speed, and ETA.
+  uploads, retries, cancellation, speed, ETA, long-running validation heartbeats, and
+  contextual right-sidebar logs.
 - Implemented the Windows Training Manager runtime, job drafts, dispatch, WebSocket and
   heartbeat monitoring, retry/cancel, resource snapshots, persistent logs, and Ollama
   registry integration.

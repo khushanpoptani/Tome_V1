@@ -36,6 +36,18 @@ The installer builds the Rust service on Windows, creates a Python virtual envir
 installs the worker dependencies, registers `TomeTrainingManager` with the Windows Service
 Manager, opens inbound TCP `11435`, starts the service, and checks `/v1/health`.
 
+To upgrade an existing installation without reinstalling the Python environment, replace
+the Tome checkout with the new release, open PowerShell as Administrator, and run:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass -Force
+.\scripts\windows\install-training-manager.ps1 -SkipPythonDependencies
+(Invoke-RestMethod http://127.0.0.1:11435/v1/health).version
+```
+
+The installer stops the existing service, replaces the executable and worker files,
+preserves `config.json`, restarts the service, and performs a health check.
+
 Defaults:
 
 - API: `http://0.0.0.0:11435`

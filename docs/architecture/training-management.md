@@ -120,6 +120,7 @@ llama.cpp conversion, or a managed service.
 | `POST`   | `/v1/uploads`                     | Create or resume an upload session |
 | `GET`    | `/v1/uploads/{id}`                | Read acknowledged byte offset      |
 | `PUT`    | `/v1/uploads/{id}/chunks/{index}` | Upload a byte range                |
+| `POST`   | `/v1/uploads/{id}/complete`       | Validate and register the dataset  |
 | `DELETE` | `/v1/uploads/{id}`                | Cancel an upload session           |
 | `DELETE` | `/v1/datasets/{id}`               | Remove a committed remote dataset  |
 
@@ -127,6 +128,13 @@ Every chunk includes `Content-Range`, `X-Content-SHA256`, and an idempotency key
 server response returns the next acknowledged offset. Tome persists that offset after each
 accepted chunk, retries transient failures with bounded backoff, and resumes from the
 server-confirmed offset after restart.
+
+Completion is a long-running server operation because it verifies the full checksum,
+extracts archives, validates records, and commits metadata. Training Manager 0.1.3 owns
+that work in a background task and returns `202 Accepted`; Tome polls the persisted
+`validating`, `completed`, or `failed` state every five seconds. The desktop retains a
+one-hour compatibility timeout for older synchronous servers and emits validation
+heartbeats instead of applying the short timeout used for ordinary API calls.
 
 ### Jobs and monitoring
 
@@ -253,6 +261,8 @@ SQLite stores:
 - bounded job logs and resource snapshots.
 - dataset preparation, upload, validation, and deletion tasks with progress and stage logs
   for the global Task Queue and Context Panel.
+- the latest persisted training activity and error details in the right context panel;
+  dataset-card “View logs” actions focus this panel without leaving the workflow.
 
 Secrets belong in the platform credential store when authenticated adapters are added.
 SQLite stores only a credential reference.

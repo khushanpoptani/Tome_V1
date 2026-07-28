@@ -22,6 +22,7 @@ import type {
   TrainingJobRecord,
   TrainingStreamEvent,
 } from "@tome/types";
+import { useShellStore } from "@tome/stores";
 import { Badge, Button, Card, cn } from "@tome/ui";
 import {
   Activity,
@@ -66,7 +67,6 @@ const sections = [
   ["failed", "Failed Jobs", XCircle],
   ["history", "Training History", History],
   ["resources", "Server Resources", MemoryStick],
-  ["logs", "Logs", Logs],
 ] as const;
 
 type SectionId = (typeof sections)[number][0];
@@ -278,6 +278,7 @@ function supportsOllamaAdapter(model: OllamaModel): boolean {
 }
 
 export function TrainingPage(): React.JSX.Element {
+  const setContextPanelOpen = useShellStore((state) => state.setContextPanelOpen);
   const queryClient = useQueryClient();
   const [section, setSection] = useState<SectionId>("dashboard");
   const [serverForm, setServerForm] = useState<ServerForm | null>(null);
@@ -366,12 +367,6 @@ export function TrainingPage(): React.JSX.Element {
     queryKey: ["training-jobs"],
     refetchInterval: 5_000,
   });
-  const logs = useQuery({
-    enabled: isTauriRuntime(),
-    queryFn: () => backend.listTrainingLogs(undefined, 500),
-    queryKey: ["training-logs"],
-    refetchInterval: section === "logs" ? 3_000 : false,
-  });
   const activeServer = servers.data?.find((server) => server.isActive) ?? null;
   const resources = useQuery({
     enabled: isTauriRuntime() && activeServer !== null,
@@ -413,6 +408,13 @@ export function TrainingPage(): React.JSX.Element {
       })
       .then(() => queryClient.invalidateQueries({ queryKey: ["tasks"] }))
       .catch(() => undefined);
+  };
+
+  const showContextLogs = (): void => {
+    setContextPanelOpen(true);
+    window.setTimeout(() => {
+      window.dispatchEvent(new Event("tome:show-context-logs"));
+    }, 200);
   };
 
   const prepareDataset = async (
@@ -937,6 +939,7 @@ export function TrainingPage(): React.JSX.Element {
     }
     let taskId: string | null = null;
     let lastOperationEvent: OperationProgressEvent | null = null;
+    let validationNotificationShown = false;
     try {
       await startDatasetUpload(dataset.id, activeServer.id, (event) => {
         setUploadProgress((current) => ({ ...current, [dataset.id]: event }));
@@ -949,7 +952,12 @@ export function TrainingPage(): React.JSX.Element {
             `Upload ${dataset.name}`,
             event,
           );
-          if (notify && event.stage === "Server Validation") {
+          if (
+            notify &&
+            event.stage === "Server Validation" &&
+            !validationNotificationShown
+          ) {
+            validationNotificationShown = true;
             toast.info(`Upload complete. Validating ${dataset.name} on the server…`);
           }
         } else if (event.type === "uploadProgress") {
@@ -1825,11 +1833,15 @@ export function TrainingPage(): React.JSX.Element {
                             : (latest.bytesUploaded / latest.totalBytes) * 100;
                     const operationProgressValue =
                       operation?.event.progress ?? persistedOperation?.progress ?? 0;
+                    const persistedOperationIsRelevant =
+                      persistedOperation?.status === "running" ||
+                      (persistedOperation?.status === "failed" &&
+                        (persistedOperation.id === `dataset-delete:${dataset.id}` ||
+                          dataset.validationStatus === "invalid"));
                     const operationIsVisible =
                       operation !== undefined ||
                       dataset.validationStatus === "pending" ||
-                      (persistedOperation !== undefined &&
-                        ["running", "failed"].includes(persistedOperation.status));
+                      persistedOperationIsRelevant;
                     const uploadStage =
                       event?.type === "operationProgress"
                         ? event.stage
@@ -2087,7 +2099,7 @@ export function TrainingPage(): React.JSX.Element {
                                     Retry
                                   </Button>
                                   <Button
-                                    onClick={() => setSection("logs")}
+                                    onClick={showContextLogs}
                                     size="sm"
                                     variant="ghost"
                                   >
@@ -2299,41 +2311,6 @@ export function TrainingPage(): React.JSX.Element {
                     </pre>
                   </Card>
                 </div>
-              )}
-            </section>
-          ) : null}
-
-          {section === "logs" ? (
-            <section>
-              <h2 className="text-sm font-semibold">Training logs</h2>
-              <p className="mt-1 text-[10px] text-muted-foreground">
-                Persisted server, dataset, upload, and job events.
-              </p>
-              {(logs.data?.length ?? 0) === 0 ? (
-                <Card className="mt-4">
-                  <EmptyState
-                    description="Training activity and errors will be recorded here."
-                    icon={Logs}
-                    title="No training logs"
-                  />
-                </Card>
-              ) : (
-                <Card className="mt-4 divide-y divide-border overflow-hidden">
-                  {logs.data?.map((entry) => (
-                    <div className="flex gap-3 px-4 py-3" key={entry.id}>
-                      <StatusBadge value={entry.level} />
-                      <div className="min-w-0 flex-1">
-                        <p className="break-words text-[11px]">{entry.message}</p>
-                        <p className="mt-1 text-[9px] text-muted-foreground">
-                          {formatDate(entry.createdAt)}
-                          {entry.trainingJobId === null
-                            ? ""
-                            : ` · job ${entry.trainingJobId}`}
-                        </p>
-                      </div>
-                    </div>
-                  ))}
-                </Card>
               )}
             </section>
           ) : null}

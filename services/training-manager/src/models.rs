@@ -117,7 +117,11 @@ pub struct WorkerEvent {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", tag = "type")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "type"
+)]
 pub enum ServerEvent {
     Job {
         job_id: String,

@@ -30,6 +30,7 @@ pub struct UploadRecord {
     pub chunk_size: i64,
     pub status: String,
     pub partial_path: PathBuf,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -194,6 +195,13 @@ impl Database {
              WHERE status IN ('running', 'cancelling')",
             [now()],
         )?;
+        connection.execute(
+            "UPDATE uploads SET status='failed',
+                last_error='Training Manager restarted during server validation; resume the upload to recover',
+                updated_at=?1
+             WHERE status='validating'",
+            [now()],
+        )?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -290,6 +298,19 @@ impl Database {
         connection.execute(
             "UPDATE uploads SET status='failed', last_error=?2, updated_at=?3 WHERE id=?1",
             params![id, error, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn validate_upload(&self, id: &str) -> ApiResult<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|value| ApiError::internal(format!("Database lock was poisoned: {value}")))?;
+        connection.execute(
+            "UPDATE uploads SET status='validating', last_error=NULL, updated_at=?2
+             WHERE id=?1",
+            params![id, now()],
         )?;
         Ok(())
     }
@@ -697,7 +718,7 @@ fn query_upload(
             &format!(
                 "SELECT id, client_upload_id, dataset_id, name, format,
                         expected_size, expected_sha256, uploaded_bytes,
-                        chunk_size, status, partial_path
+                        chunk_size, status, partial_path, last_error
                  FROM uploads WHERE {column}=?1"
             ),
             [value],
@@ -714,6 +735,7 @@ fn query_upload(
                     chunk_size: row.get(8)?,
                     status: row.get(9)?,
                     partial_path: PathBuf::from(row.get::<_, String>(10)?),
+                    last_error: row.get(11)?,
                 })
             },
         )

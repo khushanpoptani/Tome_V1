@@ -1215,7 +1215,11 @@ pub async fn delete_training_dataset(
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase", tag = "type")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "type"
+)]
 pub enum TrainingStreamEvent {
     Status {
         message: String,
@@ -1885,16 +1889,41 @@ pub async fn start_dataset_upload(
         "Server dataset validation started",
         Some(&dataset.name),
     );
-    let completion = state
+    let completion_request = state
         .http
         .post(api_url(
             &server.url,
             &format!("/v1/uploads/{remote_upload_id}/complete"),
         ))
+        // Server-side checksum, extraction, and validation can take substantially
+        // longer than the normal API timeout for multi-gigabyte archives.
+        .timeout(Duration::from_secs(60 * 60))
         .header("Idempotency-Key", format!("{upload_id}:complete"))
         .json(&json!({ "sha256": checksum, "size": total_bytes }))
-        .send()
-        .await;
+        .send();
+    tokio::pin!(completion_request);
+    let validation_started = Instant::now();
+    let mut validation_heartbeat = tokio::time::interval(Duration::from_secs(5));
+    validation_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let completion = loop {
+        tokio::select! {
+            response = &mut completion_request => break response,
+            _ = validation_heartbeat.tick() => {
+                let elapsed = validation_started.elapsed().as_secs();
+                let _ = on_event.send(TrainingStreamEvent::OperationProgress {
+                    operation_id: upload_id.clone(),
+                    stage: "Server Validation".into(),
+                    message: format!(
+                        "Windows is validating and registering the dataset ({elapsed}s elapsed)"
+                    ),
+                    progress: 99.0,
+                    bytes_processed: total_bytes,
+                    total_bytes,
+                    current_file: Some(artifact_path.clone()),
+                });
+            }
+        }
+    };
     let completion = match completion {
         Ok(response) => response,
         Err(error) => {
@@ -1938,10 +1967,131 @@ pub async fn start_dataset_upload(
             },
         );
     }
-    let completion_json = completion
+    let completion_is_async = completion.status().as_u16() == 202;
+    let mut completion_json = completion
         .json::<Value>()
         .await
         .unwrap_or_else(|_| json!({}));
+    if completion_is_async {
+        let monitoring_started = Instant::now();
+        let mut consecutive_monitor_failures = 0_u8;
+        loop {
+            if monitoring_started.elapsed() >= Duration::from_secs(60 * 60) {
+                let message =
+                    "Windows dataset validation did not finish within one hour".to_string();
+                return fail_upload(
+                    &state,
+                    &on_event,
+                    UploadProgress {
+                        id: &upload_id,
+                        status: "failed",
+                        remote_upload_id: Some(&remote_upload_id),
+                        bytes_uploaded,
+                        total_bytes,
+                        chunk_size,
+                        speed_bps: 0.0,
+                        eta_seconds: None,
+                        retry_count,
+                        last_error: Some(&message),
+                        finished: false,
+                    },
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let status_response = state
+                .http
+                .get(api_url(
+                    &server.url,
+                    &format!("/v1/uploads/{remote_upload_id}"),
+                ))
+                .send()
+                .await;
+            let status_response = match status_response {
+                Ok(response) if response.status().is_success() => {
+                    consecutive_monitor_failures = 0;
+                    response
+                }
+                Ok(response) => {
+                    consecutive_monitor_failures = consecutive_monitor_failures.saturating_add(1);
+                    let detail = response_failure(response, "Monitoring dataset validation").await;
+                    let _ = on_event.send(TrainingStreamEvent::OperationProgress {
+                        operation_id: upload_id.clone(),
+                        stage: "Reconnecting".into(),
+                        message: detail,
+                        progress: 99.0,
+                        bytes_processed: total_bytes,
+                        total_bytes,
+                        current_file: Some(artifact_path.clone()),
+                    });
+                    continue;
+                }
+                Err(error) => {
+                    consecutive_monitor_failures = consecutive_monitor_failures.saturating_add(1);
+                    let _ = on_event.send(TrainingStreamEvent::OperationProgress {
+                        operation_id: upload_id.clone(),
+                        stage: "Reconnecting".into(),
+                        message: format!(
+                            "Validation continues on Windows; status check failed ({consecutive_monitor_failures}): {}",
+                            request_error_details(&error)
+                        ),
+                        progress: 99.0,
+                        bytes_processed: total_bytes,
+                        total_bytes,
+                        current_file: Some(artifact_path.clone()),
+                    });
+                    continue;
+                }
+            };
+            let status_json = status_response
+                .json::<Value>()
+                .await
+                .unwrap_or_else(|_| json!({}));
+            match status_json["status"].as_str().unwrap_or("validating") {
+                "completed" => {
+                    completion_json =
+                        json!({ "datasetId": dataset.id, "validationStatus": "valid" });
+                    break;
+                }
+                "failed" | "cancelled" => {
+                    let message = status_json["lastError"]
+                        .as_str()
+                        .unwrap_or("Windows rejected the dataset during validation")
+                        .to_string();
+                    return fail_upload(
+                        &state,
+                        &on_event,
+                        UploadProgress {
+                            id: &upload_id,
+                            status: "failed",
+                            remote_upload_id: Some(&remote_upload_id),
+                            bytes_uploaded,
+                            total_bytes,
+                            chunk_size,
+                            speed_bps: 0.0,
+                            eta_seconds: None,
+                            retry_count,
+                            last_error: Some(&message),
+                            finished: false,
+                        },
+                    );
+                }
+                status => {
+                    let elapsed = monitoring_started.elapsed().as_secs();
+                    let _ = on_event.send(TrainingStreamEvent::OperationProgress {
+                        operation_id: upload_id.clone(),
+                        stage: "Server Validation".into(),
+                        message: format!(
+                            "Windows reports {status}; validation has run for {elapsed}s"
+                        ),
+                        progress: 99.0,
+                        bytes_processed: total_bytes,
+                        total_bytes,
+                        current_file: Some(artifact_path.clone()),
+                    });
+                }
+            }
+        }
+    }
     let remote_dataset_id = completion_json["datasetId"]
         .as_str()
         .unwrap_or(&remote_upload_id)
@@ -2690,11 +2840,30 @@ pub fn get_training_resources(
 
 #[cfg(test)]
 mod tests {
-    use super::{delete_local_dataset, inspect_dataset};
+    use super::{delete_local_dataset, inspect_dataset, TrainingStreamEvent};
     use crate::infrastructure::state::AppState;
     use rusqlite::params;
     use std::fs;
     use uuid::Uuid;
+
+    #[test]
+    fn serializes_upload_progress_fields_for_typescript() {
+        let event = TrainingStreamEvent::UploadProgress {
+            upload_id: "upload-1".into(),
+            bytes_uploaded: 10,
+            total_bytes: 20,
+            progress: 50.0,
+            speed_bps: 4.0,
+            eta_seconds: Some(3),
+        };
+        let value = serde_json::to_value(event).expect("event should serialize");
+
+        assert_eq!(value["type"], "uploadProgress");
+        assert_eq!(value["uploadId"], "upload-1");
+        assert_eq!(value["bytesUploaded"], 10);
+        assert_eq!(value["totalBytes"], 20);
+        assert!(value.get("upload_id").is_none());
+    }
 
     #[test]
     fn deletes_dataset_metadata_and_managed_artifact() {

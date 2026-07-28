@@ -42,7 +42,11 @@ pub struct TestServerInput {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase", tag = "type")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "type"
+)]
 pub enum StreamEvent {
     Status {
         message: String,
