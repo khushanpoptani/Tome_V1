@@ -149,8 +149,9 @@ describe("Training dataset groups", () => {
     expect(
       screen.getByRole("button", { name: `Collapse ${datasetGroup.name}` }),
     ).toBeInTheDocument();
-    expect(screen.getByText(/0 datasets · 0 valid/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Add data" })).toBeEnabled();
+    expect(screen.getByText("0 datasets")).toBeInTheDocument();
+    expect(screen.getByText("0 valid")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add" })).toBeEnabled();
   });
 
   it("provides a labeled group deletion action and deletes an empty group", async () => {
@@ -180,7 +181,7 @@ describe("Training dataset groups", () => {
     renderTrainingPage([{ ...dataset, groupId: null }]);
 
     fireEvent.click(screen.getByRole("button", { name: "Datasets" }));
-    fireEvent.click(screen.getByRole("button", { name: "Add existing" }));
+    fireEvent.click(screen.getByRole("button", { name: "Existing" }));
 
     const dialog = screen.getByRole("dialog");
     fireEvent.click(within(dialog).getByText("Select all (1)").closest("label")!);
@@ -214,5 +215,25 @@ describe("Training dataset groups", () => {
         within(datasetLabel as HTMLLabelElement).getByRole("checkbox"),
       ).toBeChecked();
     }
+  });
+
+  it("visually nests expanded datasets under their parent group", () => {
+    renderTrainingPage([dataset, secondDataset]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Datasets" }));
+
+    for (const trainingDataset of [dataset, secondDataset]) {
+      expect(
+        screen
+          .getByText(trainingDataset.name)
+          .closest(`[data-parent-group="${datasetGroup.id}"]`),
+      ).not.toBeNull();
+    }
+
+    fireEvent.click(
+      screen.getByRole("button", { name: `Collapse ${datasetGroup.name}` }),
+    );
+    expect(screen.queryByText(dataset.name)).not.toBeInTheDocument();
+    expect(screen.queryByText(secondDataset.name)).not.toBeInTheDocument();
   });
 });

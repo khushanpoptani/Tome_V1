@@ -304,9 +304,12 @@ The Training route contains:
 
 The Datasets section renders collapsible group rows with aggregate dataset count, valid
 count, storage size, upload state, and group-level actions. Individual dataset controls
-remain available inside expanded groups. Deleting a group first deletes its local dataset
-records and Tome-managed artifacts; source files and remote Training Manager copies are
-not silently removed.
+remain available inside expanded groups. Group headers use a compact toolbar layout;
+expanded datasets are indented beneath their parent with a continuous hierarchy guide.
+Completed transfers collapse into a concise registration summary instead of retaining a
+full progress panel. Deleting a group first deletes its local dataset records and
+Tome-managed artifacts; source files and remote Training Manager copies are not silently
+removed.
 
 Empty and unavailable states are explicit. When no training server is configured, users
 can still catalog, preview, validate, compress datasets, and create job drafts. Network

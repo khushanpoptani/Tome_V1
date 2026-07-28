@@ -120,7 +120,9 @@ type DatasetListRow =
     }
   | {
       readonly dataset: TrainingDatasetRecord;
+      readonly isLastInGroup: boolean;
       readonly kind: "dataset";
+      readonly parentGroupId: string;
     };
 
 interface JobForm {
@@ -860,7 +862,14 @@ export function TrainingPage(): React.JSX.Element {
       const members = allDatasets.filter((dataset) => dataset.groupId === group.id);
       rows.push({ datasets: members, group, id: group.id, kind: "group" });
       if (!collapsedDatasetGroups.has(group.id)) {
-        rows.push(...members.map((dataset) => ({ dataset, kind: "dataset" as const })));
+        rows.push(
+          ...members.map((dataset, index) => ({
+            dataset,
+            isLastInGroup: index === members.length - 1,
+            kind: "dataset" as const,
+            parentGroupId: group.id,
+          })),
+        );
       }
     }
     const ungrouped = allDatasets.filter((dataset) => dataset.groupId === null);
@@ -868,7 +877,14 @@ export function TrainingPage(): React.JSX.Element {
       const id = "__ungrouped__";
       rows.push({ datasets: ungrouped, group: null, id, kind: "group" });
       if (!collapsedDatasetGroups.has(id)) {
-        rows.push(...ungrouped.map((dataset) => ({ dataset, kind: "dataset" as const })));
+        rows.push(
+          ...ungrouped.map((dataset, index) => ({
+            dataset,
+            isLastInGroup: index === ungrouped.length - 1,
+            kind: "dataset" as const,
+            parentGroupId: id,
+          })),
+        );
       }
     }
     return rows;
@@ -1685,13 +1701,16 @@ export function TrainingPage(): React.JSX.Element {
                             );
                       return (
                         <Card
-                          className="border-violet-500/20 bg-violet-500/[0.035] p-3"
+                          className={cn(
+                            "border-violet-500/20 bg-violet-500/[0.035] px-3 py-2 shadow-none",
+                            !isCollapsed && row.datasets.length > 0 && "rounded-b-lg",
+                          )}
                           key={`group:${row.id}`}
                         >
-                          <div className="flex flex-wrap items-center gap-3">
+                          <div className="grid items-center gap-2 lg:grid-cols-[minmax(12rem,1fr)_auto]">
                             <button
                               aria-label={`${isCollapsed ? "Expand" : "Collapse"} ${row.group?.name ?? "Ungrouped"}`}
-                              className="flex min-w-0 flex-1 items-center gap-3 rounded-md text-left"
+                              className="flex min-w-0 items-center gap-2 rounded-md py-0.5 text-left"
                               onClick={() =>
                                 setCollapsedDatasetGroups((current) => {
                                   const next = new Set(current);
@@ -1704,36 +1723,45 @@ export function TrainingPage(): React.JSX.Element {
                             >
                               <ChevronRight
                                 className={cn(
-                                  "size-4 shrink-0 text-muted-foreground transition-transform",
+                                  "size-3.5 shrink-0 text-muted-foreground transition-transform",
                                   !isCollapsed && "rotate-90",
                                 )}
                               />
-                              <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-violet-500/10 text-violet-400">
+                              <span className="grid size-7 shrink-0 place-items-center rounded-md bg-violet-500/10 text-violet-400">
                                 {isCollapsed ? (
-                                  <Folder className="size-4" />
+                                  <Folder className="size-3.5" />
                                 ) : (
-                                  <FolderOpen className="size-4" />
+                                  <FolderOpen className="size-3.5" />
                                 )}
                               </span>
                               <span className="min-w-0">
-                                <span className="block truncate text-xs font-semibold">
+                                <span className="block truncate text-[11px] font-semibold">
                                   {row.group?.name ?? "Ungrouped"}
                                 </span>
-                                <span className="mt-0.5 block text-[9px] text-muted-foreground">
-                                  {row.datasets.length} dataset
-                                  {row.datasets.length === 1 ? "" : "s"} ·{" "}
-                                  {validMembers.length} valid ·{" "}
-                                  {formatBytes(
-                                    row.datasets.reduce(
-                                      (total, dataset) => total + dataset.size,
-                                      0,
-                                    ),
-                                  )}
+                                <span className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-[9px] text-muted-foreground">
+                                  <span className="whitespace-nowrap">
+                                    {row.datasets.length} dataset
+                                    {row.datasets.length === 1 ? "" : "s"}
+                                  </span>
+                                  <span aria-hidden="true">·</span>
+                                  <span className="whitespace-nowrap">
+                                    {validMembers.length} valid
+                                  </span>
+                                  <span aria-hidden="true">·</span>
+                                  <span className="whitespace-nowrap">
+                                    {formatBytes(
+                                      row.datasets.reduce(
+                                        (total, dataset) => total + dataset.size,
+                                        0,
+                                      ),
+                                    )}
+                                  </span>
                                 </span>
                               </span>
                             </button>
-                            <div className="flex flex-wrap items-center gap-1">
+                            <div className="flex flex-wrap items-center gap-1 lg:justify-end">
                               <Button
+                                className="h-7 px-2 text-[10px]"
                                 disabled={
                                   activeServer === null ||
                                   activeServer.status !== "connected" ||
@@ -1747,13 +1775,14 @@ export function TrainingPage(): React.JSX.Element {
                                 size="sm"
                                 variant="outline"
                               >
-                                <UploadCloud className="size-3.5" />
-                                Upload group
+                                <UploadCloud className="size-3" />
+                                Upload
                                 {pendingMembers.length > 0
                                   ? ` (${pendingMembers.length})`
                                   : ""}
                               </Button>
                               <Button
+                                className="h-7 px-2 text-[10px]"
                                 onClick={() =>
                                   setDatasetForm({
                                     compress: true,
@@ -1766,12 +1795,13 @@ export function TrainingPage(): React.JSX.Element {
                                 size="sm"
                                 variant="outline"
                               >
-                                <Plus className="size-3.5" />
-                                Add data
+                                <Plus className="size-3" />
+                                Add
                               </Button>
                               {row.group === null ? null : (
                                 <>
                                   <Button
+                                    className="h-7 px-2 text-[10px]"
                                     disabled={assignableDatasets.length === 0}
                                     onClick={() =>
                                       setDatasetGroupAssignment({
@@ -1782,11 +1812,12 @@ export function TrainingPage(): React.JSX.Element {
                                     size="sm"
                                     variant="outline"
                                   >
-                                    <ListPlus className="size-3.5" />
-                                    Add existing
+                                    <ListPlus className="size-3" />
+                                    Existing
                                   </Button>
                                   <Button
                                     aria-label={`Rename ${row.group.name}`}
+                                    className="size-7"
                                     onClick={() =>
                                       setDatasetGroupForm({
                                         id: row.group!.id,
@@ -1796,11 +1827,11 @@ export function TrainingPage(): React.JSX.Element {
                                     size="icon"
                                     variant="ghost"
                                   >
-                                    <Pencil className="size-3.5" />
+                                    <Pencil className="size-3" />
                                   </Button>
                                   <Button
                                     aria-label={`Delete group ${row.group.name}`}
-                                    className="border-red-500/25 text-red-400 hover:bg-red-500/10 hover:text-red-300"
+                                    className="h-7 border-red-500/25 px-2 text-[10px] text-red-400 hover:bg-red-500/10 hover:text-red-300"
                                     onClick={() => {
                                       if (groupUploadActive) {
                                         toast.error(
@@ -1829,8 +1860,8 @@ export function TrainingPage(): React.JSX.Element {
                                     }
                                     variant="outline"
                                   >
-                                    <Trash2 className="size-3.5" />
-                                    Delete group
+                                    <Trash2 className="size-3" />
+                                    Delete
                                   </Button>
                                 </>
                               )}
@@ -1901,6 +1932,8 @@ export function TrainingPage(): React.JSX.Element {
                     const uploadStatus =
                       latest?.status ??
                       (event?.type === "uploadProgress" ? "uploading" : "pending");
+                    const uploadComplete =
+                      latest?.status === "completed" || event?.type === "complete";
                     const uploadSpeed =
                       event?.type === "uploadProgress"
                         ? event.speedBps
@@ -1910,278 +1943,304 @@ export function TrainingPage(): React.JSX.Element {
                         ? event.etaSeconds
                         : (latest?.etaSeconds ?? null);
                     return (
-                      <Card
+                      <div
                         className={cn(
-                          "p-4 transition-opacity",
-                          isDeleting && "opacity-80",
+                          "relative ml-3 pl-5 md:ml-5 md:pl-6",
+                          "before:absolute before:left-0 before:w-px before:bg-violet-500/20",
+                          "after:absolute after:left-0 after:top-7 after:h-px after:w-4 after:bg-violet-500/20 md:after:w-5",
+                          row.isLastInGroup
+                            ? "before:-top-3 before:h-10"
+                            : "before:-top-3 before:-bottom-3",
                         )}
+                        data-parent-group={row.parentGroupId}
                         key={dataset.id}
                       >
-                        <div className="flex flex-wrap items-start gap-3">
-                          <span className="grid size-9 place-items-center rounded-lg bg-secondary">
-                            {dataset.compressed ? (
-                              <Archive className="size-4 text-violet-400" />
-                            ) : (
-                              <Database className="size-4 text-violet-400" />
-                            )}
-                          </span>
-                          <div className="min-w-0 flex-1">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <span className="text-xs font-semibold">
-                                {dataset.name}
-                              </span>
-                              <StatusBadge value={dataset.validationStatus} />
-                              <Badge>{dataset.format}</Badge>
+                        <Card
+                          className={cn(
+                            "border-l-violet-500/25 p-3.5 shadow-none transition-opacity",
+                            isDeleting && "opacity-80",
+                          )}
+                        >
+                          <div className="flex flex-wrap items-start gap-3">
+                            <span className="grid size-9 place-items-center rounded-lg bg-secondary">
+                              {dataset.compressed ? (
+                                <Archive className="size-4 text-violet-400" />
+                              ) : (
+                                <Database className="size-4 text-violet-400" />
+                              )}
+                            </span>
+                            <div className="min-w-0 flex-1">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="text-xs font-semibold">
+                                  {dataset.name}
+                                </span>
+                                <StatusBadge value={dataset.validationStatus} />
+                                <Badge>{dataset.format}</Badge>
+                              </div>
+                              <p className="mt-1 truncate font-mono text-[9px] text-muted-foreground">
+                                {dataset.sourcePath}
+                              </p>
+                              <p className="mt-1 text-[10px] text-muted-foreground">
+                                {formatBytes(dataset.size)} · {dataset.fileCount} files ·{" "}
+                                {dataset.compressed ? "compressed" : "original"}
+                              </p>
                             </div>
-                            <p className="mt-1 truncate font-mono text-[9px] text-muted-foreground">
-                              {dataset.sourcePath}
-                            </p>
-                            <p className="mt-1 text-[10px] text-muted-foreground">
-                              {formatBytes(dataset.size)} · {dataset.fileCount} files ·{" "}
-                              {dataset.compressed ? "compressed" : "original"}
-                            </p>
-                          </div>
-                          <div className="flex flex-wrap gap-1">
-                            <Button
-                              disabled={
-                                dataset.validationStatus !== "valid" ||
-                                activeServer === null ||
-                                latest?.status === "uploading" ||
-                                isDeleting
-                              }
-                              onClick={() => beginUpload(dataset)}
-                              size="sm"
-                              variant="outline"
-                            >
-                              <UploadCloud className="size-3.5" />
-                              {latest?.status === "failed" ||
-                              latest?.status === "cancelled" ||
-                              latest?.status === "paused"
-                                ? "Resume"
-                                : latest?.status === "completed"
-                                  ? "Replace remote"
-                                  : "Upload"}
-                            </Button>
-                            {latest?.status === "uploading" ? (
+                            <div className="flex flex-wrap gap-1">
                               <Button
-                                onClick={() => {
-                                  void backend
-                                    .cancelDatasetUpload(latest.id)
-                                    .then(() => {
-                                      const cancelEvent: OperationProgressEvent = {
-                                        bytesProcessed: latest.bytesUploaded,
-                                        currentFile:
-                                          dataset.artifactPath ?? dataset.sourcePath,
-                                        message: "Upload cancellation requested",
-                                        operationId: latest.id,
-                                        progress: uploadProgressValue,
-                                        stage: "Cancelled",
-                                        totalBytes: latest.totalBytes,
-                                        type: "operationProgress",
-                                      };
-                                      persistOperationTask(
-                                        latest.id,
-                                        "dataset-upload",
-                                        `Upload ${dataset.name}`,
-                                        cancelEvent,
-                                        "cancelled",
-                                      );
-                                      toast.info(
-                                        `Cancellation requested for ${dataset.name}.`,
-                                      );
-                                      refreshAll();
-                                    })
-                                    .catch((error: unknown) =>
-                                      toast.error(errorMessage(error)),
-                                    );
-                                }}
+                                disabled={
+                                  dataset.validationStatus !== "valid" ||
+                                  activeServer === null ||
+                                  latest?.status === "uploading" ||
+                                  isDeleting
+                                }
+                                onClick={() => beginUpload(dataset)}
                                 size="sm"
+                                variant="outline"
+                              >
+                                <UploadCloud className="size-3.5" />
+                                {latest?.status === "failed" ||
+                                latest?.status === "cancelled" ||
+                                latest?.status === "paused"
+                                  ? "Resume"
+                                  : latest?.status === "completed"
+                                    ? "Replace remote"
+                                    : "Upload"}
+                              </Button>
+                              {latest?.status === "uploading" ? (
+                                <Button
+                                  onClick={() => {
+                                    void backend
+                                      .cancelDatasetUpload(latest.id)
+                                      .then(() => {
+                                        const cancelEvent: OperationProgressEvent = {
+                                          bytesProcessed: latest.bytesUploaded,
+                                          currentFile:
+                                            dataset.artifactPath ?? dataset.sourcePath,
+                                          message: "Upload cancellation requested",
+                                          operationId: latest.id,
+                                          progress: uploadProgressValue,
+                                          stage: "Cancelled",
+                                          totalBytes: latest.totalBytes,
+                                          type: "operationProgress",
+                                        };
+                                        persistOperationTask(
+                                          latest.id,
+                                          "dataset-upload",
+                                          `Upload ${dataset.name}`,
+                                          cancelEvent,
+                                          "cancelled",
+                                        );
+                                        toast.info(
+                                          `Cancellation requested for ${dataset.name}.`,
+                                        );
+                                        refreshAll();
+                                      })
+                                      .catch((error: unknown) =>
+                                        toast.error(errorMessage(error)),
+                                      );
+                                  }}
+                                  size="sm"
+                                  variant="ghost"
+                                >
+                                  <Square className="size-3" />
+                                  Cancel
+                                </Button>
+                              ) : null}
+                              <Button
+                                aria-label={`Replace ${dataset.name}`}
+                                disabled={
+                                  isDeleting || dataset.validationStatus === "pending"
+                                }
+                                onClick={() =>
+                                  setDatasetForm({
+                                    compress: dataset.compressed,
+                                    groupId: dataset.groupId,
+                                    id: dataset.id,
+                                    name: dataset.name,
+                                    sourcePath: dataset.sourcePath,
+                                    supportedFormats: "jsonl,json,csv,parquet,txt,md",
+                                  })
+                                }
+                                size="icon"
                                 variant="ghost"
                               >
-                                <Square className="size-3" />
-                                Cancel
+                                <Pencil className="size-3.5" />
                               </Button>
-                            ) : null}
-                            <Button
-                              aria-label={`Replace ${dataset.name}`}
-                              disabled={
-                                isDeleting || dataset.validationStatus === "pending"
-                              }
-                              onClick={() =>
-                                setDatasetForm({
-                                  compress: dataset.compressed,
-                                  groupId: dataset.groupId,
-                                  id: dataset.id,
-                                  name: dataset.name,
-                                  sourcePath: dataset.sourcePath,
-                                  supportedFormats: "jsonl,json,csv,parquet,txt,md",
-                                })
-                              }
-                              size="icon"
-                              variant="ghost"
-                            >
-                              <Pencil className="size-3.5" />
-                            </Button>
-                            <Button
-                              aria-label={`Delete ${dataset.name}`}
-                              disabled={isDeleting || latest?.status === "uploading"}
-                              onClick={() =>
-                                setDatasetDeleteConfirmation({
-                                  datasets: [dataset],
-                                  mode: "single",
-                                })
-                              }
-                              size="icon"
-                              variant="ghost"
-                            >
-                              {isDeleting ? (
-                                <RotateCcw className="size-3.5 animate-spin" />
-                              ) : (
-                                <Trash2 className="size-3.5" />
-                              )}
-                            </Button>
-                          </div>
-                        </div>
-                        {operationIsVisible ? (
-                          <div
-                            aria-live="polite"
-                            className="mt-3 rounded-lg border border-violet-500/20 bg-violet-500/5 p-3"
-                          >
-                            <div className="mb-2 flex items-start justify-between gap-3">
-                              <div>
-                                <p className="text-[11px] font-medium">
-                                  {operation?.event.stage ??
-                                    (persistedOperation?.status === "failed"
-                                      ? "Operation Failed"
-                                      : "Preparing Dataset")}
-                                </p>
-                                <p className="mt-0.5 text-[10px] text-muted-foreground">
-                                  {operation?.error ??
-                                    operation?.event.message ??
-                                    persistedOperation?.logs.split("\n").at(-1) ??
-                                    "Processing in the background"}
-                                </p>
-                              </div>
-                              <span className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
-                                {persistedOperation?.status === "failed" ||
-                                (operation?.error !== null &&
-                                  operation?.error !== undefined) ? (
-                                  <CircleAlert className="size-3.5 text-red-400" />
+                              <Button
+                                aria-label={`Delete ${dataset.name}`}
+                                disabled={isDeleting || latest?.status === "uploading"}
+                                onClick={() =>
+                                  setDatasetDeleteConfirmation({
+                                    datasets: [dataset],
+                                    mode: "single",
+                                  })
+                                }
+                                size="icon"
+                                variant="ghost"
+                              >
+                                {isDeleting ? (
+                                  <RotateCcw className="size-3.5 animate-spin" />
                                 ) : (
-                                  <RefreshCw className="size-3.5 animate-spin text-violet-400" />
+                                  <Trash2 className="size-3.5" />
                                 )}
-                                {Math.round(operationProgressValue)}%
-                              </span>
+                              </Button>
                             </div>
-                            <ProgressBar value={operationProgressValue} />
-                            {operation?.event.currentFile === null ||
-                            operation?.event.currentFile === undefined ? null : (
-                              <p className="mt-2 truncate font-mono text-[9px] text-muted-foreground">
-                                Current file: {operation.event.currentFile}
-                              </p>
-                            )}
-                            {operation?.event.totalBytes === 0 ||
-                            operation?.event.totalBytes === undefined ? null : (
-                              <p className="mt-1 text-[9px] text-muted-foreground">
-                                {formatBytes(operation.event.bytesProcessed)} /{" "}
-                                {formatBytes(operation.event.totalBytes)}
-                              </p>
-                            )}
                           </div>
-                        ) : null}
-                        {latest === undefined && event === undefined ? null : (
-                          <div className="mt-3 rounded-lg border border-border bg-background/50 p-3">
-                            <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-[10px]">
-                              <span className="flex items-center gap-2">
-                                <StatusBadge value={uploadStatus} />
-                                <span className="font-medium">{uploadStage}</span>
-                              </span>
-                              <span className="text-muted-foreground">
-                                {formatBytes(uploadSpeed)}/s · ETA {duration(uploadEta)}
-                              </span>
-                            </div>
-                            <ProgressBar value={uploadProgressValue} />
-                            <div className="mt-2 grid gap-1 text-[9px] text-muted-foreground sm:grid-cols-2">
-                              <span>
-                                {formatBytes(bytesUploaded)} /{" "}
-                                {formatBytes(totalUploadBytes)} (
-                                {Math.round(uploadProgressValue)}%)
-                              </span>
-                              <span className="sm:text-right">
-                                Remaining{" "}
-                                {formatBytes(
-                                  Math.max(0, totalUploadBytes - bytesUploaded),
-                                )}
-                              </span>
-                              <span className="truncate sm:col-span-2">
-                                Current file:{" "}
-                                {event?.type === "operationProgress"
-                                  ? (event.currentFile ?? "Server-side validation")
-                                  : (dataset.artifactPath ?? dataset.sourcePath)}
-                              </span>
-                            </div>
-                            {latest?.lastError === null ||
-                            latest?.lastError === undefined ? null : (
-                              <div className="mt-2 rounded-md border border-red-500/20 bg-red-500/5 p-2">
-                                <p className="text-[10px] text-red-400">
-                                  {latest.lastError}
-                                </p>
-                                <div className="mt-2 flex gap-2">
-                                  <Button
-                                    onClick={() => beginUpload(dataset)}
-                                    size="sm"
-                                    variant="outline"
-                                  >
-                                    <RotateCcw className="size-3" />
-                                    Retry
-                                  </Button>
-                                  <Button
-                                    onClick={showContextLogs}
-                                    size="sm"
-                                    variant="ghost"
-                                  >
-                                    <Logs className="size-3" />
-                                    View logs
-                                  </Button>
+                          {operationIsVisible ? (
+                            <div
+                              aria-live="polite"
+                              className="mt-3 rounded-lg border border-violet-500/20 bg-violet-500/5 p-3"
+                            >
+                              <div className="mb-2 flex items-start justify-between gap-3">
+                                <div>
+                                  <p className="text-[11px] font-medium">
+                                    {operation?.event.stage ??
+                                      (persistedOperation?.status === "failed"
+                                        ? "Operation Failed"
+                                        : "Preparing Dataset")}
+                                  </p>
+                                  <p className="mt-0.5 text-[10px] text-muted-foreground">
+                                    {operation?.error ??
+                                      operation?.event.message ??
+                                      persistedOperation?.logs.split("\n").at(-1) ??
+                                      "Processing in the background"}
+                                  </p>
                                 </div>
-                              </div>
-                            )}
-                          </div>
-                        )}
-                        {dataset.preview === null &&
-                        validationErrors.length === 0 ? null : (
-                          <details className="mt-3 min-w-0 max-w-full overflow-hidden text-[10px]">
-                            <summary className="text-muted-foreground">
-                              Preview and validation
-                            </summary>
-                            <div className="mt-2 max-h-56 max-w-full overflow-auto overscroll-contain rounded-lg border border-border bg-background">
-                              {dataset.preview === null ? null : (
-                                <pre className="max-w-full whitespace-pre-wrap break-all p-3 font-mono text-[9px]">
-                                  {dataset.preview}
-                                </pre>
-                              )}
-                              {validationErrors.length === 0 ? null : (
-                                <div className="border-t border-border p-3">
-                                  {validationErrors.slice(0, 25).map((message) => (
-                                    <p
-                                      className="mt-1 break-words text-red-400 first:mt-0"
-                                      key={message}
-                                    >
-                                      {message}
-                                    </p>
-                                  ))}
-                                  {validationErrors.length <= 25 ? null : (
-                                    <p className="mt-2 text-muted-foreground">
-                                      {validationErrors.length - 25} additional errors
-                                      hidden to keep this view responsive.
-                                    </p>
+                                <span className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                                  {persistedOperation?.status === "failed" ||
+                                  (operation?.error !== null &&
+                                    operation?.error !== undefined) ? (
+                                    <CircleAlert className="size-3.5 text-red-400" />
+                                  ) : (
+                                    <RefreshCw className="size-3.5 animate-spin text-violet-400" />
                                   )}
+                                  {Math.round(operationProgressValue)}%
+                                </span>
+                              </div>
+                              <ProgressBar value={operationProgressValue} />
+                              {operation?.event.currentFile === null ||
+                              operation?.event.currentFile === undefined ? null : (
+                                <p className="mt-2 truncate font-mono text-[9px] text-muted-foreground">
+                                  Current file: {operation.event.currentFile}
+                                </p>
+                              )}
+                              {operation?.event.totalBytes === 0 ||
+                              operation?.event.totalBytes === undefined ? null : (
+                                <p className="mt-1 text-[9px] text-muted-foreground">
+                                  {formatBytes(operation.event.bytesProcessed)} /{" "}
+                                  {formatBytes(operation.event.totalBytes)}
+                                </p>
+                              )}
+                            </div>
+                          ) : null}
+                          {latest === undefined &&
+                          event === undefined ? null : uploadComplete ? (
+                            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-md border border-emerald-500/20 bg-emerald-500/5 px-3 py-2">
+                              <span className="flex items-center gap-2 text-[10px]">
+                                <CheckCircle2 className="size-3.5 text-emerald-400" />
+                                <span className="font-medium text-emerald-300">
+                                  Dataset registered
+                                </span>
+                              </span>
+                              <span className="text-[9px] text-muted-foreground">
+                                {formatBytes(totalUploadBytes)} on{" "}
+                                {activeServer?.name ?? "Training Manager"}
+                              </span>
+                            </div>
+                          ) : (
+                            <div className="mt-3 rounded-lg border border-border bg-background/50 p-3">
+                              <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-[10px]">
+                                <span className="flex items-center gap-2">
+                                  <StatusBadge value={uploadStatus} />
+                                  <span className="font-medium">{uploadStage}</span>
+                                </span>
+                                <span className="text-muted-foreground">
+                                  {formatBytes(uploadSpeed)}/s · ETA {duration(uploadEta)}
+                                </span>
+                              </div>
+                              <ProgressBar value={uploadProgressValue} />
+                              <div className="mt-2 grid gap-1 text-[9px] text-muted-foreground sm:grid-cols-2">
+                                <span>
+                                  {formatBytes(bytesUploaded)} /{" "}
+                                  {formatBytes(totalUploadBytes)} (
+                                  {Math.round(uploadProgressValue)}%)
+                                </span>
+                                <span className="sm:text-right">
+                                  Remaining{" "}
+                                  {formatBytes(
+                                    Math.max(0, totalUploadBytes - bytesUploaded),
+                                  )}
+                                </span>
+                                <span className="truncate sm:col-span-2">
+                                  Current file:{" "}
+                                  {event?.type === "operationProgress"
+                                    ? (event.currentFile ?? "Server-side validation")
+                                    : (dataset.artifactPath ?? dataset.sourcePath)}
+                                </span>
+                              </div>
+                              {latest?.lastError === null ||
+                              latest?.lastError === undefined ? null : (
+                                <div className="mt-2 rounded-md border border-red-500/20 bg-red-500/5 p-2">
+                                  <p className="text-[10px] text-red-400">
+                                    {latest.lastError}
+                                  </p>
+                                  <div className="mt-2 flex gap-2">
+                                    <Button
+                                      onClick={() => beginUpload(dataset)}
+                                      size="sm"
+                                      variant="outline"
+                                    >
+                                      <RotateCcw className="size-3" />
+                                      Retry
+                                    </Button>
+                                    <Button
+                                      onClick={showContextLogs}
+                                      size="sm"
+                                      variant="ghost"
+                                    >
+                                      <Logs className="size-3" />
+                                      View logs
+                                    </Button>
+                                  </div>
                                 </div>
                               )}
                             </div>
-                          </details>
-                        )}
-                      </Card>
+                          )}
+                          {dataset.preview === null &&
+                          validationErrors.length === 0 ? null : (
+                            <details className="mt-3 min-w-0 max-w-full overflow-hidden text-[10px]">
+                              <summary className="text-muted-foreground">
+                                Preview and validation
+                              </summary>
+                              <div className="mt-2 max-h-56 max-w-full overflow-auto overscroll-contain rounded-lg border border-border bg-background">
+                                {dataset.preview === null ? null : (
+                                  <pre className="max-w-full whitespace-pre-wrap break-all p-3 font-mono text-[9px]">
+                                    {dataset.preview}
+                                  </pre>
+                                )}
+                                {validationErrors.length === 0 ? null : (
+                                  <div className="border-t border-border p-3">
+                                    {validationErrors.slice(0, 25).map((message) => (
+                                      <p
+                                        className="mt-1 break-words text-red-400 first:mt-0"
+                                        key={message}
+                                      >
+                                        {message}
+                                      </p>
+                                    ))}
+                                    {validationErrors.length <= 25 ? null : (
+                                      <p className="mt-2 text-muted-foreground">
+                                        {validationErrors.length - 25} additional errors
+                                        hidden to keep this view responsive.
+                                      </p>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            </details>
+                          )}
+                        </Card>
+                      </div>
                     );
                   })}
                 </div>
