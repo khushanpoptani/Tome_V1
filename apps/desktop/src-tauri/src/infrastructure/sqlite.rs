@@ -382,6 +382,33 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             "#,
         )?;
     }
+
+    let has_v7 = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 7)",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if !has_v7 {
+        connection.execute_batch(
+            r#"
+            BEGIN IMMEDIATE;
+            CREATE TABLE training_dataset_groups (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            ALTER TABLE training_datasets
+                ADD COLUMN group_id TEXT
+                REFERENCES training_dataset_groups(id) ON DELETE SET NULL;
+            CREATE INDEX idx_training_datasets_group
+                ON training_datasets(group_id, updated_at DESC);
+            INSERT INTO schema_migrations(version, applied_at)
+            VALUES (7, datetime('now'));
+            COMMIT;
+            "#,
+        )?;
+    }
     Ok(())
 }
 
@@ -407,9 +434,10 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("schema version should be readable");
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         for table in [
             "training_servers",
+            "training_dataset_groups",
             "training_datasets",
             "dataset_uploads",
             "training_jobs",
@@ -428,6 +456,7 @@ mod tests {
             "heartbeat_failures"
         ));
         assert!(has_column(&connection, "training_jobs", "dataset_ids_json"));
+        assert!(has_column(&connection, "training_datasets", "group_id"));
     }
 
     fn has_table(connection: &Connection, table: &str) -> bool {

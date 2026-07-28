@@ -3,6 +3,7 @@ import { backend } from "@/lib/backend";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type {
   TrainingDatasetRecord,
+  TrainingDatasetGroupRecord,
   TrainingJobRecord,
   TrainingServerRecord,
 } from "@tome/types";
@@ -31,6 +32,7 @@ const dataset: TrainingDatasetRecord = {
   createdAt: "2026-07-28T00:00:00Z",
   fileCount: 1,
   format: "jsonl",
+  groupId: "planning-group",
   id: "planning-dataset",
   name: "Planning agent",
   preview: null,
@@ -41,6 +43,20 @@ const dataset: TrainingDatasetRecord = {
   updatedAt: "2026-07-28T00:00:00Z",
   validationErrorsJson: "[]",
   validationStatus: "valid",
+};
+
+const datasetGroup: TrainingDatasetGroupRecord = {
+  createdAt: "2026-07-28T00:00:00Z",
+  id: "planning-group",
+  name: "Planning Corpus",
+  updatedAt: "2026-07-28T00:00:00Z",
+};
+
+const secondDataset: TrainingDatasetRecord = {
+  ...dataset,
+  id: "planning-dataset-two",
+  name: "Planning examples two",
+  sourcePath: "/tmp/planning-two.jsonl",
 };
 
 const job: TrainingJobRecord = {
@@ -76,12 +92,15 @@ const job: TrainingJobRecord = {
   warning: null,
 };
 
-function renderTrainingPage(): void {
+function renderTrainingPage(
+  trainingDatasets: readonly TrainingDatasetRecord[] = [dataset],
+): void {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   queryClient.setQueryData(["training-servers"], [server]);
-  queryClient.setQueryData(["training-datasets"], [dataset]);
+  queryClient.setQueryData(["training-datasets"], trainingDatasets);
+  queryClient.setQueryData(["training-dataset-groups"], [datasetGroup]);
   queryClient.setQueryData(["dataset-uploads"], []);
   queryClient.setQueryData(["tasks"], []);
   queryClient.setQueryData(["training-jobs"], [job]);
@@ -118,5 +137,62 @@ describe("Training deletion confirmations", () => {
     await waitFor(() => expect(deleteJob).toHaveBeenCalledWith(job.id));
 
     expect(confirm).not.toHaveBeenCalled();
+  });
+});
+
+describe("Training dataset groups", () => {
+  it("keeps an empty group visible so data can be added to it", () => {
+    renderTrainingPage([]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Datasets" }));
+
+    expect(
+      screen.getByRole("button", { name: `Collapse ${datasetGroup.name}` }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/0 datasets · 0 valid/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add data" })).toBeEnabled();
+  });
+
+  it("moves existing catalog datasets into a group without revalidation", async () => {
+    const assign = vi
+      .spyOn(backend, "assignTrainingDatasetsToGroup")
+      .mockResolvedValue(undefined);
+    renderTrainingPage([{ ...dataset, groupId: null }]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Datasets" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add existing" }));
+
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Select all (1)").closest("label")!);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add 1 dataset" }));
+
+    await waitFor(() =>
+      expect(assign).toHaveBeenCalledWith(datasetGroup.id, [dataset.id]),
+    );
+  });
+
+  it("selects every valid dataset in a group for one training job", () => {
+    renderTrainingPage([dataset, secondDataset]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Training Jobs" }));
+    fireEvent.click(screen.getByRole("button", { name: "New job" }));
+
+    const dialog = screen.getByRole("dialog");
+    const groupLabel = within(dialog).getByText(datasetGroup.name).closest("label");
+    expect(groupLabel).not.toBeNull();
+    const groupCheckbox = within(groupLabel as HTMLLabelElement).getByRole("checkbox");
+    expect(groupCheckbox).not.toBeChecked();
+
+    fireEvent.click(groupCheckbox);
+
+    for (const trainingDataset of [dataset, secondDataset]) {
+      const datasetLabel = within(dialog)
+        .getByText(trainingDataset.name)
+        .closest("label");
+      expect(datasetLabel).not.toBeNull();
+      expect(
+        within(datasetLabel as HTMLLabelElement).getByRole("checkbox"),
+      ).toBeChecked();
+    }
   });
 });

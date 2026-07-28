@@ -4106,7 +4106,7 @@ dependencies = [
 
 [[package]]
 name = "tome-desktop"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "futures-util",
@@ -4124,7 +4124,7 @@ dependencies = [
 
 [[package]]
 name = "tome-training-manager"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "chrono",

@@ -203,6 +203,14 @@ worker combines those datasets into one corpus before tokenization. Every select
 must be valid and registered on the same Training Manager. A job specification is
 immutable after dispatch. Retrying creates a new attempt linked to the original job.
 
+Dataset groups are desktop-side organizational containers. A group owns zero or more local
+dataset catalog records and provides bulk add, existing-record assignment, upload, and
+delete actions. Assignment changes only group metadata, preserving validation, artifacts,
+and upload state. Selecting a group in the job form expands it into the current ordered
+set of valid dataset IDs; the remote Training Manager protocol remains dataset-based and
+requires no group-specific coupling. Existing and intentionally independent datasets
+remain available under `Ungrouped`.
+
 ## ETA estimation
 
 Server-provided ETA is authoritative. Otherwise Tome estimates:
@@ -238,6 +246,7 @@ Compression creates an application-managed ZIP artifact without modifying the so
 SQLite stores:
 
 - training servers and capability snapshots;
+- dataset groups and nullable dataset-to-group membership;
 - datasets and validation results;
 - upload sessions and acknowledged offsets;
 - job specifications, attempts, status, metrics, and heartbeat timestamps;
@@ -275,6 +284,12 @@ The Training route contains:
 - History
 - Server Resources
 - Logs
+
+The Datasets section renders collapsible group rows with aggregate dataset count, valid
+count, storage size, upload state, and group-level actions. Individual dataset controls
+remain available inside expanded groups. Deleting a group first deletes its local dataset
+records and Tome-managed artifacts; source files and remote Training Manager copies are
+not silently removed.
 
 Empty and unavailable states are explicit. When no training server is configured, users
 can still catalog, preview, validate, compress datasets, and create job drafts. Network

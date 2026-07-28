@@ -17,6 +17,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type {
   OllamaModel,
+  TrainingDatasetGroupRecord,
   TrainingDatasetRecord,
   TrainingJobRecord,
   TrainingStreamEvent,
@@ -30,11 +31,15 @@ import {
   CircleAlert,
   CircleHelp,
   Clock3,
+  ChevronRight,
   Database,
   FileArchive,
+  Folder,
+  FolderOpen,
   Gauge,
   HardDrive,
   History,
+  ListPlus,
   ListChecks,
   Logs,
   MemoryStick,
@@ -75,6 +80,7 @@ interface ServerForm {
 
 interface DatasetForm {
   readonly id?: string;
+  readonly groupId: string | null;
   readonly name: string;
   readonly sourcePath: string;
   readonly compress: boolean;
@@ -83,11 +89,39 @@ interface DatasetForm {
 
 interface DatasetPreparationInput {
   readonly id?: string;
+  readonly groupId?: string | null;
   readonly name: string;
   readonly sourcePath: string;
   readonly compress: boolean;
   readonly supportedFormats: string | readonly string[];
 }
+
+interface DatasetGroupForm {
+  readonly id?: string;
+  readonly name: string;
+}
+
+interface DatasetGroupDeleteConfirmation {
+  readonly group: TrainingDatasetGroupRecord;
+  readonly datasets: readonly TrainingDatasetRecord[];
+}
+
+interface DatasetGroupAssignment {
+  readonly datasetIds: readonly string[];
+  readonly group: TrainingDatasetGroupRecord;
+}
+
+type DatasetListRow =
+  | {
+      readonly datasets: readonly TrainingDatasetRecord[];
+      readonly group: TrainingDatasetGroupRecord | null;
+      readonly id: string;
+      readonly kind: "group";
+    }
+  | {
+      readonly dataset: TrainingDatasetRecord;
+      readonly kind: "dataset";
+    };
 
 interface JobForm {
   readonly datasetIds: readonly string[];
@@ -248,6 +282,14 @@ export function TrainingPage(): React.JSX.Element {
   const [section, setSection] = useState<SectionId>("dashboard");
   const [serverForm, setServerForm] = useState<ServerForm | null>(null);
   const [datasetForm, setDatasetForm] = useState<DatasetForm | null>(null);
+  const [datasetGroupForm, setDatasetGroupForm] = useState<DatasetGroupForm | null>(null);
+  const [datasetGroupDeleteConfirmation, setDatasetGroupDeleteConfirmation] =
+    useState<DatasetGroupDeleteConfirmation | null>(null);
+  const [datasetGroupAssignment, setDatasetGroupAssignment] =
+    useState<DatasetGroupAssignment | null>(null);
+  const [collapsedDatasetGroups, setCollapsedDatasetGroups] = useState<
+    ReadonlySet<string>
+  >(new Set());
   const [datasetDeleteConfirmation, setDatasetDeleteConfirmation] =
     useState<DatasetDeleteConfirmation | null>(null);
   const [trainingDeleteConfirmation, setTrainingDeleteConfirmation] =
@@ -263,6 +305,7 @@ export function TrainingPage(): React.JSX.Element {
   } | null>(null);
   const [jobForm, setJobForm] = useState<JobForm | null>(null);
   const [dragActive, setDragActive] = useState(false);
+  const [datasetDropGroupId, setDatasetDropGroupId] = useState<string | null>(null);
   const [streamStatus, setStreamStatus] = useState<StreamStatus>("disabled");
   const pendingRefreshes = useRef(new Map<string, number>());
   const jobsRef = useRef<readonly TrainingJobRecord[]>([]);
@@ -299,6 +342,11 @@ export function TrainingPage(): React.JSX.Element {
     enabled: isTauriRuntime(),
     queryFn: backend.listTrainingDatasets,
     queryKey: ["training-datasets"],
+  });
+  const datasetGroups = useQuery({
+    enabled: isTauriRuntime(),
+    queryFn: backend.listTrainingDatasetGroups,
+    queryKey: ["training-dataset-groups"],
   });
   const uploads = useQuery({
     enabled: isTauriRuntime(),
@@ -504,6 +552,7 @@ export function TrainingPage(): React.JSX.Element {
             return prepare({
               id: crypto.randomUUID(),
               compress: true,
+              groupId: datasetDropGroupId,
               name,
               sourcePath,
               supportedFormats: ["jsonl", "json", "csv", "parquet", "txt", "md"],
@@ -541,7 +590,7 @@ export function TrainingPage(): React.JSX.Element {
       disposed = true;
       unlisten?.();
     };
-  }, [queryClient]);
+  }, [datasetDropGroupId, queryClient]);
 
   useEffect(() => {
     if (activeServer === null || activeServer.status !== "connected") {
@@ -622,6 +671,7 @@ export function TrainingPage(): React.JSX.Element {
   const refreshAll = (): void => {
     void Promise.all([
       queryClient.invalidateQueries({ queryKey: ["training-servers"] }),
+      queryClient.invalidateQueries({ queryKey: ["training-dataset-groups"] }),
       queryClient.invalidateQueries({ queryKey: ["training-datasets"] }),
       queryClient.invalidateQueries({ queryKey: ["dataset-uploads"] }),
       queryClient.invalidateQueries({ queryKey: ["training-jobs"] }),
@@ -714,6 +764,33 @@ export function TrainingPage(): React.JSX.Element {
       refreshAll();
     },
   });
+  const saveDatasetGroup = useMutation({
+    mutationFn: backend.saveTrainingDatasetGroup,
+    onError: (error) => toast.error(errorMessage(error)),
+    onSuccess: (group) => {
+      setDatasetGroupForm(null);
+      setDatasetDropGroupId(group.id);
+      setCollapsedDatasetGroups((current) => {
+        const next = new Set(current);
+        next.delete(group.id);
+        return next;
+      });
+      refreshAll();
+      toast.success(`Dataset group ${group.name} saved.`);
+    },
+  });
+  const assignDatasetsToGroup = useMutation({
+    mutationFn: (assignment: DatasetGroupAssignment) =>
+      backend.assignTrainingDatasetsToGroup(assignment.group.id, assignment.datasetIds),
+    onError: (error) => toast.error(errorMessage(error)),
+    onSuccess: (_, assignment) => {
+      setDatasetGroupAssignment(null);
+      refreshAll();
+      toast.success(
+        `Added ${assignment.datasetIds.length} dataset${assignment.datasetIds.length === 1 ? "" : "s"} to ${assignment.group.name}.`,
+      );
+    },
+  });
   const saveJob = useMutation({
     mutationFn: backend.saveTrainingJob,
     onError: (error) => toast.error(errorMessage(error)),
@@ -754,6 +831,45 @@ export function TrainingPage(): React.JSX.Element {
   const selectableDatasets = useMemo(
     () => (datasets.data ?? []).filter((dataset) => dataset.validationStatus === "valid"),
     [datasets.data],
+  );
+  const datasetRows = useMemo<readonly DatasetListRow[]>(() => {
+    const allDatasets = datasets.data ?? [];
+    const rows: DatasetListRow[] = [];
+    for (const group of datasetGroups.data ?? []) {
+      const members = allDatasets.filter((dataset) => dataset.groupId === group.id);
+      rows.push({ datasets: members, group, id: group.id, kind: "group" });
+      if (!collapsedDatasetGroups.has(group.id)) {
+        rows.push(...members.map((dataset) => ({ dataset, kind: "dataset" as const })));
+      }
+    }
+    const ungrouped = allDatasets.filter((dataset) => dataset.groupId === null);
+    if (ungrouped.length > 0) {
+      const id = "__ungrouped__";
+      rows.push({ datasets: ungrouped, group: null, id, kind: "group" });
+      if (!collapsedDatasetGroups.has(id)) {
+        rows.push(...ungrouped.map((dataset) => ({ dataset, kind: "dataset" as const })));
+      }
+    }
+    return rows;
+  }, [collapsedDatasetGroups, datasetGroups.data, datasets.data]);
+  const selectableDatasetGroups = useMemo(
+    () =>
+      (datasetGroups.data ?? [])
+        .map((group) => ({
+          datasets: selectableDatasets.filter((dataset) => dataset.groupId === group.id),
+          group,
+        }))
+        .filter((entry) => entry.datasets.length > 0),
+    [datasetGroups.data, selectableDatasets],
+  );
+  const datasetGroupAssignmentCandidates = useMemo(
+    () =>
+      datasetGroupAssignment === null
+        ? []
+        : (datasets.data ?? []).filter(
+            (dataset) => dataset.groupId !== datasetGroupAssignment.group.id,
+          ),
+    [datasetGroupAssignment, datasets.data],
   );
   const pendingUploadDatasets = useMemo(
     () =>
@@ -1110,6 +1226,49 @@ export function TrainingPage(): React.JSX.Element {
     });
   };
 
+  const confirmDatasetGroupDeletion = (): void => {
+    if (datasetGroupDeleteConfirmation === null) return;
+    const { datasets: members, group } = datasetGroupDeleteConfirmation;
+    setDatasetGroupDeleteConfirmation(null);
+    if (members.length > 0) {
+      setBulkDeleteProgress({ completed: 0, total: members.length });
+    }
+    void Promise.allSettled(
+      members.map((dataset) =>
+        removeDataset(dataset, false).finally(() =>
+          setBulkDeleteProgress((current) =>
+            current === null ? null : { ...current, completed: current.completed + 1 },
+          ),
+        ),
+      ),
+    )
+      .then(async (results) => {
+        const failedCount = results.filter(
+          (result) => result.status === "rejected",
+        ).length;
+        if (failedCount > 0) {
+          throw new Error(
+            `${failedCount} dataset${failedCount === 1 ? "" : "s"} could not be deleted. The group was preserved.`,
+          );
+        }
+        await backend.deleteTrainingDatasetGroup(group.id);
+        setDatasetDropGroupId((current) => (current === group.id ? null : current));
+        setCollapsedDatasetGroups((current) => {
+          const next = new Set(current);
+          next.delete(group.id);
+          return next;
+        });
+        toast.success(
+          `Deleted ${group.name} and ${members.length} dataset${members.length === 1 ? "" : "s"}.`,
+        );
+      })
+      .catch((error: unknown) => toast.error(errorMessage(error)))
+      .finally(() => {
+        setBulkDeleteProgress(null);
+        refreshAll();
+      });
+  };
+
   return (
     <div className="min-h-full">
       <PageHeader
@@ -1340,8 +1499,8 @@ export function TrainingPage(): React.JSX.Element {
                 <div>
                   <h2 className="text-sm font-semibold">Datasets</h2>
                   <p className="mt-1 text-[10px] text-muted-foreground">
-                    Validate local files, optionally create a managed ZIP, then upload in
-                    resumable chunks.
+                    Organize related data into groups, validate locally, then upload a
+                    complete group in resumable chunks.
                   </p>
                 </div>
                 <div className="flex items-center gap-2">
@@ -1405,9 +1564,18 @@ export function TrainingPage(): React.JSX.Element {
                       : `Deleting ${bulkDeleteProgress.completed}/${bulkDeleteProgress.total}`}
                   </Button>
                   <Button
+                    onClick={() => setDatasetGroupForm({ name: "" })}
+                    size="sm"
+                    variant="outline"
+                  >
+                    <Folder className="size-3.5" />
+                    New group
+                  </Button>
+                  <Button
                     onClick={() =>
                       setDatasetForm({
                         compress: true,
+                        groupId: null,
                         name: "",
                         sourcePath: "",
                         supportedFormats: "jsonl,json,csv,parquet,txt,md",
@@ -1434,18 +1602,199 @@ export function TrainingPage(): React.JSX.Element {
                   Drop one or more files or folders. Tome validates and catalogs them
                   locally; upload remains an explicit action.
                 </p>
+                <label className="mx-auto mt-3 flex max-w-sm items-center justify-center gap-2 text-[10px] text-muted-foreground">
+                  <span className="shrink-0">Save dropped data in</span>
+                  <select
+                    className={cn(inputClassName, "h-8 min-w-0 py-1 text-[10px]")}
+                    onChange={(event) =>
+                      setDatasetDropGroupId(event.target.value || null)
+                    }
+                    value={datasetDropGroupId ?? ""}
+                  >
+                    <option value="">Ungrouped</option>
+                    {(datasetGroups.data ?? []).map((group) => (
+                      <option key={group.id} value={group.id}>
+                        {group.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
               </Card>
-              {(datasets.data?.length ?? 0) === 0 ? (
+              {(datasets.data?.length ?? 0) === 0 &&
+              (datasetGroups.data?.length ?? 0) === 0 ? (
                 <Card>
                   <EmptyState
-                    description="Add a local dataset file or directory. Tome validates it before any network upload."
+                    description="Create a group, then add a local dataset file or directory. Tome validates it before any network upload."
                     icon={FileArchive}
-                    title="No datasets"
+                    title="No dataset groups"
                   />
                 </Card>
               ) : (
                 <div className="grid gap-3">
-                  {datasets.data?.map((dataset) => {
+                  {datasetRows.map((row) => {
+                    if (row.kind === "group") {
+                      const isCollapsed = collapsedDatasetGroups.has(row.id);
+                      const validMembers = row.datasets.filter(
+                        (dataset) => dataset.validationStatus === "valid",
+                      );
+                      const pendingMembers = validMembers.filter(
+                        (dataset) =>
+                          activeServer !== null &&
+                          (dataset.remoteDatasetId === null ||
+                            dataset.trainingServerId !== activeServer.id),
+                      );
+                      const groupUploadActive = row.datasets.some((dataset) =>
+                        uploads.data?.some(
+                          (upload) =>
+                            upload.datasetId === dataset.id &&
+                            upload.status === "uploading",
+                        ),
+                      );
+                      const assignableDatasets =
+                        row.group === null
+                          ? []
+                          : (datasets.data ?? []).filter(
+                              (dataset) => dataset.groupId !== row.group?.id,
+                            );
+                      return (
+                        <Card
+                          className="border-violet-500/20 bg-violet-500/[0.035] p-3"
+                          key={`group:${row.id}`}
+                        >
+                          <div className="flex flex-wrap items-center gap-3">
+                            <button
+                              aria-label={`${isCollapsed ? "Expand" : "Collapse"} ${row.group?.name ?? "Ungrouped"}`}
+                              className="flex min-w-0 flex-1 items-center gap-3 rounded-md text-left"
+                              onClick={() =>
+                                setCollapsedDatasetGroups((current) => {
+                                  const next = new Set(current);
+                                  if (next.has(row.id)) next.delete(row.id);
+                                  else next.add(row.id);
+                                  return next;
+                                })
+                              }
+                              type="button"
+                            >
+                              <ChevronRight
+                                className={cn(
+                                  "size-4 shrink-0 text-muted-foreground transition-transform",
+                                  !isCollapsed && "rotate-90",
+                                )}
+                              />
+                              <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-violet-500/10 text-violet-400">
+                                {isCollapsed ? (
+                                  <Folder className="size-4" />
+                                ) : (
+                                  <FolderOpen className="size-4" />
+                                )}
+                              </span>
+                              <span className="min-w-0">
+                                <span className="block truncate text-xs font-semibold">
+                                  {row.group?.name ?? "Ungrouped"}
+                                </span>
+                                <span className="mt-0.5 block text-[9px] text-muted-foreground">
+                                  {row.datasets.length} dataset
+                                  {row.datasets.length === 1 ? "" : "s"} ·{" "}
+                                  {validMembers.length} valid ·{" "}
+                                  {formatBytes(
+                                    row.datasets.reduce(
+                                      (total, dataset) => total + dataset.size,
+                                      0,
+                                    ),
+                                  )}
+                                </span>
+                              </span>
+                            </button>
+                            <div className="flex flex-wrap items-center gap-1">
+                              <Button
+                                disabled={
+                                  activeServer === null ||
+                                  activeServer.status !== "connected" ||
+                                  pendingMembers.length === 0 ||
+                                  bulkUploadProgress !== null ||
+                                  groupUploadActive
+                                }
+                                onClick={() => {
+                                  void uploadDatasetsSequentially(pendingMembers);
+                                }}
+                                size="sm"
+                                variant="outline"
+                              >
+                                <UploadCloud className="size-3.5" />
+                                Upload group
+                                {pendingMembers.length > 0
+                                  ? ` (${pendingMembers.length})`
+                                  : ""}
+                              </Button>
+                              <Button
+                                onClick={() =>
+                                  setDatasetForm({
+                                    compress: true,
+                                    groupId: row.group?.id ?? null,
+                                    name: "",
+                                    sourcePath: "",
+                                    supportedFormats: "jsonl,json,csv,parquet,txt,md",
+                                  })
+                                }
+                                size="sm"
+                                variant="outline"
+                              >
+                                <Plus className="size-3.5" />
+                                Add data
+                              </Button>
+                              {row.group === null ? null : (
+                                <>
+                                  <Button
+                                    disabled={assignableDatasets.length === 0}
+                                    onClick={() =>
+                                      setDatasetGroupAssignment({
+                                        datasetIds: [],
+                                        group: row.group as TrainingDatasetGroupRecord,
+                                      })
+                                    }
+                                    size="sm"
+                                    variant="outline"
+                                  >
+                                    <ListPlus className="size-3.5" />
+                                    Add existing
+                                  </Button>
+                                  <Button
+                                    aria-label={`Rename ${row.group.name}`}
+                                    onClick={() =>
+                                      setDatasetGroupForm({
+                                        id: row.group!.id,
+                                        name: row.group!.name,
+                                      })
+                                    }
+                                    size="icon"
+                                    variant="ghost"
+                                  >
+                                    <Pencil className="size-3.5" />
+                                  </Button>
+                                  <Button
+                                    aria-label={`Delete group ${row.group.name}`}
+                                    disabled={
+                                      groupUploadActive || bulkDeleteProgress !== null
+                                    }
+                                    onClick={() =>
+                                      setDatasetGroupDeleteConfirmation({
+                                        datasets: row.datasets,
+                                        group: row.group as TrainingDatasetGroupRecord,
+                                      })
+                                    }
+                                    size="icon"
+                                    variant="ghost"
+                                  >
+                                    <Trash2 className="size-3.5" />
+                                  </Button>
+                                </>
+                              )}
+                            </div>
+                          </div>
+                        </Card>
+                      );
+                    }
+                    const dataset = row.dataset;
                     const validationErrors = parseValidationErrors(dataset);
                     const latest = uploads.data?.find(
                       (upload) => upload.datasetId === dataset.id,
@@ -1612,6 +1961,7 @@ export function TrainingPage(): React.JSX.Element {
                               onClick={() =>
                                 setDatasetForm({
                                   compress: dataset.compressed,
+                                  groupId: dataset.groupId,
                                   id: dataset.id,
                                   name: dataset.name,
                                   sourcePath: dataset.sourcePath,
@@ -2192,6 +2542,215 @@ export function TrainingPage(): React.JSX.Element {
         </Modal>
       )}
 
+      {datasetGroupForm === null ? null : (
+        <Modal
+          onClose={() => setDatasetGroupForm(null)}
+          title={
+            datasetGroupForm.id === undefined ? "Create dataset group" : "Rename group"
+          }
+        >
+          <form
+            className="space-y-4 p-5"
+            onSubmit={(event) => {
+              event.preventDefault();
+              saveDatasetGroup.mutate(datasetGroupForm);
+            }}
+          >
+            <label className="block space-y-1.5 text-xs">
+              <span>Group name</span>
+              <input
+                autoFocus
+                className={inputClassName}
+                onChange={(event) =>
+                  setDatasetGroupForm({ ...datasetGroupForm, name: event.target.value })
+                }
+                placeholder="Planning Agent"
+                required
+                value={datasetGroupForm.name}
+              />
+            </label>
+            <FieldHelp>
+              A group is a reusable dataset collection. Adding the group to a training job
+              selects every valid dataset inside it.
+            </FieldHelp>
+            <div className="flex justify-end gap-2">
+              <Button
+                disabled={saveDatasetGroup.isPending}
+                onClick={() => setDatasetGroupForm(null)}
+                type="button"
+                variant="outline"
+              >
+                Cancel
+              </Button>
+              <Button disabled={saveDatasetGroup.isPending} type="submit">
+                {saveDatasetGroup.isPending ? "Saving…" : "Save group"}
+              </Button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
+      {datasetGroupAssignment === null ? null : (
+        <Modal
+          onClose={() => setDatasetGroupAssignment(null)}
+          title={`Add existing data to ${datasetGroupAssignment.group.name}`}
+          width="max-w-xl"
+        >
+          <div className="space-y-4 p-5">
+            <div className="flex items-center justify-between gap-3 text-xs">
+              <span>Available datasets</span>
+              <label className="flex cursor-pointer items-center gap-2 text-[10px] text-muted-foreground">
+                <input
+                  checked={
+                    datasetGroupAssignmentCandidates.length > 0 &&
+                    datasetGroupAssignmentCandidates.every((dataset) =>
+                      datasetGroupAssignment.datasetIds.includes(dataset.id),
+                    )
+                  }
+                  className="accent-violet-500"
+                  onChange={(event) =>
+                    setDatasetGroupAssignment({
+                      ...datasetGroupAssignment,
+                      datasetIds: event.target.checked
+                        ? datasetGroupAssignmentCandidates.map((dataset) => dataset.id)
+                        : [],
+                    })
+                  }
+                  type="checkbox"
+                />
+                Select all ({datasetGroupAssignmentCandidates.length})
+              </label>
+            </div>
+            <div className="max-h-72 overflow-y-auto overscroll-contain rounded-lg border border-border bg-background p-2">
+              {datasetGroupAssignmentCandidates.length === 0 ? (
+                <p className="p-4 text-center text-[10px] text-muted-foreground">
+                  Every dataset is already in this group.
+                </p>
+              ) : (
+                datasetGroupAssignmentCandidates.map((dataset) => {
+                  const currentGroup = datasetGroups.data?.find(
+                    (group) => group.id === dataset.groupId,
+                  );
+                  return (
+                    <label
+                      className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 hover:bg-secondary"
+                      key={dataset.id}
+                    >
+                      <input
+                        checked={datasetGroupAssignment.datasetIds.includes(dataset.id)}
+                        className="accent-violet-500"
+                        onChange={(event) =>
+                          setDatasetGroupAssignment({
+                            ...datasetGroupAssignment,
+                            datasetIds: event.target.checked
+                              ? [...datasetGroupAssignment.datasetIds, dataset.id]
+                              : datasetGroupAssignment.datasetIds.filter(
+                                  (id) => id !== dataset.id,
+                                ),
+                          })
+                        }
+                        type="checkbox"
+                      />
+                      <Database className="size-3.5 shrink-0 text-violet-400" />
+                      <span className="min-w-0 flex-1 truncate">{dataset.name}</span>
+                      <span className="shrink-0 text-[9px] text-muted-foreground">
+                        {currentGroup?.name ?? "Ungrouped"} · {formatBytes(dataset.size)}
+                      </span>
+                    </label>
+                  );
+                })
+              )}
+            </div>
+            <FieldHelp>
+              This moves existing catalog records into the group immediately. Dataset
+              validation, managed artifacts, and completed upload state are preserved.
+            </FieldHelp>
+            <div className="flex justify-end gap-2">
+              <Button
+                disabled={assignDatasetsToGroup.isPending}
+                onClick={() => setDatasetGroupAssignment(null)}
+                type="button"
+                variant="outline"
+              >
+                Cancel
+              </Button>
+              <Button
+                disabled={
+                  assignDatasetsToGroup.isPending ||
+                  datasetGroupAssignment.datasetIds.length === 0
+                }
+                onClick={() => assignDatasetsToGroup.mutate(datasetGroupAssignment)}
+                type="button"
+              >
+                {assignDatasetsToGroup.isPending ? (
+                  <RefreshCw className="size-3.5 animate-spin" />
+                ) : (
+                  <ListPlus className="size-3.5" />
+                )}
+                Add {datasetGroupAssignment.datasetIds.length || ""} dataset
+                {datasetGroupAssignment.datasetIds.length === 1 ? "" : "s"}
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {datasetGroupDeleteConfirmation === null ? null : (
+        <Modal
+          onClose={() => setDatasetGroupDeleteConfirmation(null)}
+          title={`Delete ${datasetGroupDeleteConfirmation.group.name}?`}
+        >
+          <div className="space-y-4 p-5">
+            <div className="rounded-lg border border-red-500/25 bg-red-500/5 p-4">
+              <div className="flex items-start gap-3">
+                <CircleAlert className="mt-0.5 size-5 shrink-0 text-red-400" />
+                <div>
+                  <p className="text-sm font-medium">
+                    Delete this group and all datasets inside it?
+                  </p>
+                  <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
+                    This removes {datasetGroupDeleteConfirmation.datasets.length} local
+                    dataset record
+                    {datasetGroupDeleteConfirmation.datasets.length === 1 ? "" : "s"} and
+                    any managed ZIP artifacts. Source files outside Tome and already
+                    uploaded Training Manager copies are not deleted.
+                  </p>
+                </div>
+              </div>
+            </div>
+            {datasetGroupDeleteConfirmation.datasets.length === 0 ? null : (
+              <div className="max-h-44 overflow-auto rounded-lg border border-border bg-background/50 p-3">
+                {datasetGroupDeleteConfirmation.datasets.map((dataset) => (
+                  <p className="truncate py-1 text-[10px]" key={dataset.id}>
+                    {dataset.name}
+                    <span className="ml-2 text-muted-foreground">
+                      {formatBytes(dataset.size)}
+                    </span>
+                  </p>
+                ))}
+              </div>
+            )}
+            <div className="flex justify-end gap-2">
+              <Button
+                onClick={() => setDatasetGroupDeleteConfirmation(null)}
+                type="button"
+                variant="outline"
+              >
+                Cancel
+              </Button>
+              <Button
+                className="bg-red-600 text-white hover:bg-red-500"
+                onClick={confirmDatasetGroupDeletion}
+                type="button"
+              >
+                <Trash2 className="size-3.5" />
+                Delete group and datasets
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
       {datasetForm === null ? null : (
         <Modal
           onClose={() => setDatasetForm(null)}
@@ -2222,6 +2781,30 @@ export function TrainingPage(): React.JSX.Element {
                 required
                 value={datasetForm.name}
               />
+            </label>
+            <label className="block space-y-1.5 text-xs">
+              <span>Dataset group</span>
+              <select
+                className={inputClassName}
+                onChange={(event) =>
+                  setDatasetForm({
+                    ...datasetForm,
+                    groupId: event.target.value || null,
+                  })
+                }
+                value={datasetForm.groupId ?? ""}
+              >
+                <option value="">Ungrouped</option>
+                {(datasetGroups.data ?? []).map((group) => (
+                  <option key={group.id} value={group.id}>
+                    {group.name}
+                  </option>
+                ))}
+              </select>
+              <FieldHelp>
+                Group related files so the complete collection can be uploaded or selected
+                for training in one action.
+              </FieldHelp>
             </label>
             <label className="block space-y-1.5 text-xs">
               <span>Local file or directory path</span>
@@ -2292,6 +2875,51 @@ export function TrainingPage(): React.JSX.Element {
             }}
           >
             <div className="space-y-1.5 text-xs">
+              {selectableDatasetGroups.length === 0 ? null : (
+                <div className="mb-3 space-y-1.5">
+                  <span>Select by group</span>
+                  <div className="grid max-h-32 gap-1 overflow-y-auto overscroll-contain rounded-lg border border-violet-500/20 bg-violet-500/[0.035] p-2 sm:grid-cols-2">
+                    {selectableDatasetGroups.map(({ datasets: members, group }) => {
+                      const selectedCount = members.filter((dataset) =>
+                        jobForm.datasetIds.includes(dataset.id),
+                      ).length;
+                      const allSelected = selectedCount === members.length;
+                      return (
+                        <label
+                          className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 hover:bg-secondary"
+                          key={group.id}
+                        >
+                          <input
+                            checked={allSelected}
+                            className="accent-violet-500"
+                            onChange={(event) => {
+                              const memberIds = members.map((dataset) => dataset.id);
+                              setJobForm({
+                                ...jobForm,
+                                datasetIds: event.target.checked
+                                  ? [...new Set([...jobForm.datasetIds, ...memberIds])]
+                                  : jobForm.datasetIds.filter(
+                                      (id) => !memberIds.includes(id),
+                                    ),
+                              });
+                            }}
+                            type="checkbox"
+                          />
+                          <Folder className="size-3.5 shrink-0 text-violet-400" />
+                          <span className="min-w-0 flex-1 truncate">{group.name}</span>
+                          <span className="shrink-0 text-[9px] text-muted-foreground">
+                            {selectedCount}/{members.length}
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                  <FieldHelp>
+                    Selecting a group adds every valid dataset currently stored inside
+                    that group. You can still adjust individual datasets below.
+                  </FieldHelp>
+                </div>
+              )}
               <div className="flex items-center justify-between gap-3">
                 <span>Training datasets</span>
                 <label className="flex cursor-pointer items-center gap-2 text-[10px] text-muted-foreground">

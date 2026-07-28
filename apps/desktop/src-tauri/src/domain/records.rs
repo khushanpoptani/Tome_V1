@@ -137,8 +137,25 @@ pub struct TrainingServerInput {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TrainingDatasetGroupRecord {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingDatasetGroupInput {
+    pub id: Option<String>,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TrainingDatasetRecord {
     pub id: String,
+    pub group_id: Option<String>,
     pub name: String,
     pub source_path: String,
     pub artifact_path: Option<String>,
@@ -160,6 +177,7 @@ pub struct TrainingDatasetRecord {
 #[serde(rename_all = "camelCase")]
 pub struct TrainingDatasetInput {
     pub id: Option<String>,
+    pub group_id: Option<String>,
     pub name: String,
     pub source_path: String,
     #[serde(default)]

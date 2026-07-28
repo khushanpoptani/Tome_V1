@@ -20,6 +20,8 @@ import type {
   TaskInput,
   TaskRecord,
   DatasetUploadRecord,
+  TrainingDatasetGroupInput,
+  TrainingDatasetGroupRecord,
   TrainingDatasetInput,
   TrainingDatasetRecord,
   TrainingJobInput,
@@ -130,6 +132,16 @@ export const backend = {
   deleteTrainingServer: (id: string) => command<void>("delete_training_server", { id }),
   testTrainingServer: (id: string) =>
     command<TrainingServerRecord>("test_training_server", { id }),
+  listTrainingDatasetGroups: () =>
+    command<TrainingDatasetGroupRecord[]>("list_training_dataset_groups"),
+  saveTrainingDatasetGroup: (input: TrainingDatasetGroupInput) =>
+    command<TrainingDatasetGroupRecord>("save_training_dataset_group", { input }),
+  deleteTrainingDatasetGroup: (id: string) =>
+    command<void>("delete_training_dataset_group", { id }),
+  assignTrainingDatasetsToGroup: (
+    groupId: string | null,
+    datasetIds: readonly string[],
+  ) => command<void>("assign_training_datasets_to_group", { groupId, datasetIds }),
   listTrainingDatasets: () => command<TrainingDatasetRecord[]>("list_training_datasets"),
   listDatasetUploads: () => command<DatasetUploadRecord[]>("list_dataset_uploads"),
   cancelDatasetUpload: (id: string) => command<void>("cancel_dataset_upload", { id }),

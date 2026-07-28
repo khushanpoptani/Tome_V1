@@ -224,6 +224,7 @@ export interface TrainingServerInput {
 
 export interface TrainingDatasetRecord {
   readonly id: string;
+  readonly groupId: string | null;
   readonly name: string;
   readonly sourcePath: string;
   readonly artifactPath: string | null;
@@ -243,10 +244,23 @@ export interface TrainingDatasetRecord {
 
 export interface TrainingDatasetInput {
   readonly id?: string;
+  readonly groupId?: string | null;
   readonly name: string;
   readonly sourcePath: string;
   readonly compress: boolean;
   readonly supportedFormats?: readonly string[];
+}
+
+export interface TrainingDatasetGroupRecord {
+  readonly id: string;
+  readonly name: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface TrainingDatasetGroupInput {
+  readonly id?: string;
+  readonly name: string;
 }
 
 export interface DatasetUploadRecord {

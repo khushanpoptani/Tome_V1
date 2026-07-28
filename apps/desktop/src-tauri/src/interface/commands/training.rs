@@ -22,9 +22,9 @@ use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 use crate::{
     domain::records::{
-        DatasetUploadRecord, TrainingDatasetInput, TrainingDatasetRecord, TrainingJobInput,
-        TrainingJobRecord, TrainingLogRecord, TrainingResourceRecord, TrainingServerInput,
-        TrainingServerRecord,
+        DatasetUploadRecord, TrainingDatasetGroupInput, TrainingDatasetGroupRecord,
+        TrainingDatasetInput, TrainingDatasetRecord, TrainingJobInput, TrainingJobRecord,
+        TrainingLogRecord, TrainingResourceRecord, TrainingServerInput, TrainingServerRecord,
     },
     infrastructure::state::AppState,
     interface::commands::data::add_log,
@@ -82,6 +82,7 @@ fn map_training_server(row: &Row<'_>) -> rusqlite::Result<TrainingServerRecord> 
 fn map_dataset(row: &Row<'_>) -> rusqlite::Result<TrainingDatasetRecord> {
     Ok(TrainingDatasetRecord {
         id: row.get(0)?,
+        group_id: row.get(16)?,
         name: row.get(1)?,
         source_path: row.get(2)?,
         artifact_path: row.get(3)?,
@@ -97,6 +98,15 @@ fn map_dataset(row: &Row<'_>) -> rusqlite::Result<TrainingDatasetRecord> {
         training_server_id: row.get(13)?,
         created_at: row.get(14)?,
         updated_at: row.get(15)?,
+    })
+}
+
+fn map_dataset_group(row: &Row<'_>) -> rusqlite::Result<TrainingDatasetGroupRecord> {
+    Ok(TrainingDatasetGroupRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        created_at: row.get(2)?,
+        updated_at: row.get(3)?,
     })
 }
 
@@ -706,6 +716,165 @@ fn inspect_dataset(
 }
 
 #[tauri::command]
+pub fn list_training_dataset_groups(
+    state: State<'_, AppState>,
+) -> Result<Vec<TrainingDatasetGroupRecord>, String> {
+    let database = state.database.lock().map_err(|error| error.to_string())?;
+    let mut statement = database
+        .prepare(
+            "SELECT id, name, created_at, updated_at
+             FROM training_dataset_groups
+             ORDER BY name COLLATE NOCASE",
+        )
+        .map_err(|error| database_error("preparing dataset groups", error))?;
+    let records = statement
+        .query_map([], map_dataset_group)
+        .map_err(|error| database_error("reading dataset groups", error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| database_error("reading dataset groups", error))?;
+    Ok(records)
+}
+
+#[tauri::command]
+pub fn save_training_dataset_group(
+    state: State<'_, AppState>,
+    input: TrainingDatasetGroupInput,
+) -> Result<TrainingDatasetGroupRecord, String> {
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err("Dataset group name is required".into());
+    }
+    let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let timestamp = now();
+    let database = state.database.lock().map_err(|error| error.to_string())?;
+    database
+        .execute(
+            "INSERT INTO training_dataset_groups(id, name, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name, updated_at=excluded.updated_at",
+            params![id, name, timestamp],
+        )
+        .map_err(|error| database_error("saving dataset group", error))?;
+    let group = database
+        .query_row(
+            "SELECT id, name, created_at, updated_at
+             FROM training_dataset_groups WHERE id=?1",
+            [id],
+            map_dataset_group,
+        )
+        .map_err(|error| database_error("reloading dataset group", error))?;
+    drop(database);
+    add_log(
+        &state,
+        "training-dataset-group",
+        "info",
+        "Dataset group saved",
+        Some(name),
+    );
+    Ok(group)
+}
+
+#[tauri::command]
+pub fn delete_training_dataset_group(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let database = state.database.lock().map_err(|error| error.to_string())?;
+    let member_count = database
+        .query_row(
+            "SELECT COUNT(*) FROM training_datasets WHERE group_id=?1",
+            [&id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| database_error("checking dataset group", error))?;
+    if member_count > 0 {
+        return Err("Delete the datasets in this group before deleting the group itself".into());
+    }
+    let deleted = database
+        .execute("DELETE FROM training_dataset_groups WHERE id=?1", [&id])
+        .map_err(|error| database_error("deleting dataset group", error))?;
+    if deleted == 0 {
+        return Err("The selected dataset group no longer exists".into());
+    }
+    drop(database);
+    add_log(
+        &state,
+        "training-dataset-group",
+        "info",
+        "Dataset group deleted",
+        Some(&id),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub fn assign_training_datasets_to_group(
+    state: State<'_, AppState>,
+    group_id: Option<String>,
+    dataset_ids: Vec<String>,
+) -> Result<(), String> {
+    let group_id = group_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let mut unique_ids = Vec::new();
+    for id in dataset_ids {
+        let id = id.trim();
+        if !id.is_empty() && !unique_ids.iter().any(|existing| existing == id) {
+            unique_ids.push(id.to_string());
+        }
+    }
+    if unique_ids.is_empty() {
+        return Err("Select at least one dataset to add to the group".into());
+    }
+    let mut database = state.database.lock().map_err(|error| error.to_string())?;
+    if let Some(group_id) = &group_id {
+        let exists = database
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM training_dataset_groups WHERE id=?1
+                 )",
+                [group_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| database_error("checking dataset group", error))?
+            != 0;
+        if !exists {
+            return Err("The selected dataset group no longer exists".into());
+        }
+    }
+    let transaction = database
+        .transaction()
+        .map_err(|error| database_error("starting dataset group assignment", error))?;
+    let mut updated = 0;
+    let timestamp = now();
+    for id in &unique_ids {
+        updated += transaction
+            .execute(
+                "UPDATE training_datasets
+                 SET group_id=?2, updated_at=?3
+                 WHERE id=?1",
+                params![id, group_id, timestamp],
+            )
+            .map_err(|error| database_error("assigning dataset group", error))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| database_error("committing dataset group assignment", error))?;
+    drop(database);
+    if updated == 0 {
+        return Err("None of the selected datasets still exist".into());
+    }
+    add_log(
+        &state,
+        "training-dataset-group",
+        "info",
+        "Datasets assigned to group",
+        Some(&format!("{updated} dataset(s)")),
+    );
+    Ok(())
+}
+
+#[tauri::command]
 pub fn list_training_datasets(
     state: State<'_, AppState>,
 ) -> Result<Vec<TrainingDatasetRecord>, String> {
@@ -714,7 +883,8 @@ pub fn list_training_datasets(
         .prepare(
             "SELECT id, name, source_path, artifact_path, format, size, file_count,
                     checksum, compressed, validation_status, validation_errors_json,
-                    preview, remote_dataset_id, training_server_id, created_at, updated_at
+                    preview, remote_dataset_id, training_server_id, created_at, updated_at,
+                    group_id
              FROM training_datasets ORDER BY updated_at DESC",
         )
         .map_err(|error| database_error("preparing training datasets", error))?;
@@ -733,6 +903,12 @@ pub async fn save_training_dataset(
     on_event: Channel<TrainingStreamEvent>,
 ) -> Result<TrainingDatasetRecord, String> {
     let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let group_id = input
+        .group_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
     let timestamp = now();
     {
         let database = state.database.lock().map_err(|error| error.to_string())?;
@@ -740,10 +916,11 @@ pub async fn save_training_dataset(
             .execute(
                 "INSERT INTO training_datasets(
                     id, name, source_path, format, validation_status,
-                    validation_errors_json, compressed, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, 'detecting', 'pending', '[]', ?4, ?5, ?5)
+                    validation_errors_json, compressed, group_id, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 'detecting', 'pending', '[]', ?4, ?5, ?6, ?6)
                 ON CONFLICT(id) DO UPDATE SET
                     name=excluded.name, source_path=excluded.source_path,
+                    group_id=excluded.group_id,
                     validation_status='pending', validation_errors_json='[]',
                     artifact_path=NULL, checksum=NULL, size=0, file_count=0,
                     remote_dataset_id=NULL, training_server_id=NULL,
@@ -753,7 +930,8 @@ pub async fn save_training_dataset(
                     input.name.trim(),
                     input.source_path.trim(),
                     i64::from(input.compress),
-                    timestamp
+                    group_id,
+                    timestamp,
                 ],
             )
             .map_err(|error| database_error("creating pending dataset", error))?;
@@ -857,10 +1035,11 @@ pub async fn save_training_dataset(
             "INSERT INTO training_datasets(
                 id, name, source_path, artifact_path, format, size, file_count,
                 checksum, compressed, validation_status, validation_errors_json,
-                preview, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
+                preview, group_id, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
              ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name, source_path=excluded.source_path,
+                group_id=excluded.group_id,
                 artifact_path=excluded.artifact_path, format=excluded.format,
                 size=excluded.size, file_count=excluded.file_count,
                 checksum=excluded.checksum, compressed=excluded.compressed,
@@ -881,6 +1060,7 @@ pub async fn save_training_dataset(
                 inspection.status,
                 errors_json,
                 inspection.preview,
+                group_id,
                 timestamp
             ],
         )
