@@ -131,9 +131,6 @@ export const backend = {
   testTrainingServer: (id: string) =>
     command<TrainingServerRecord>("test_training_server", { id }),
   listTrainingDatasets: () => command<TrainingDatasetRecord[]>("list_training_datasets"),
-  saveTrainingDataset: (input: TrainingDatasetInput) =>
-    command<TrainingDatasetRecord>("save_training_dataset", { input }),
-  deleteTrainingDataset: (id: string) => command<void>("delete_training_dataset", { id }),
   listDatasetUploads: () => command<DatasetUploadRecord[]>("list_dataset_uploads"),
   cancelDatasetUpload: (id: string) => command<void>("cancel_dataset_upload", { id }),
   listTrainingJobs: () => command<TrainingJobRecord[]>("list_training_jobs"),
@@ -169,6 +166,28 @@ export async function startDatasetUpload(
   await command<void>("start_dataset_upload", {
     datasetId,
     trainingServerId,
+    onEvent: onEventChannel,
+  });
+}
+
+export async function prepareTrainingDataset(
+  input: TrainingDatasetInput,
+  onEvent: (event: TrainingStreamEvent) => void,
+): Promise<TrainingDatasetRecord> {
+  const onEventChannel = new Channel<TrainingStreamEvent>(onEvent);
+  return command<TrainingDatasetRecord>("save_training_dataset", {
+    input,
+    onEvent: onEventChannel,
+  });
+}
+
+export async function deleteTrainingDataset(
+  id: string,
+  onEvent: (event: TrainingStreamEvent) => void,
+): Promise<void> {
+  const onEventChannel = new Channel<TrainingStreamEvent>(onEvent);
+  await command<void>("delete_training_dataset", {
+    id,
     onEvent: onEventChannel,
   });
 }

@@ -355,6 +355,16 @@ struct DatasetInspection {
     errors: Vec<String>,
 }
 
+#[derive(Debug)]
+struct InspectionProgress {
+    stage: &'static str,
+    message: String,
+    progress: f64,
+    bytes_processed: i64,
+    total_bytes: i64,
+    current_file: Option<String>,
+}
+
 fn collect_dataset_files(
     root: &Path,
     path: &Path,
@@ -469,7 +479,16 @@ fn inspect_dataset(
     formats: &[String],
     compress: bool,
     data_dir: &Path,
+    mut on_progress: impl FnMut(InspectionProgress),
 ) -> Result<DatasetInspection, String> {
+    on_progress(InspectionProgress {
+        stage: "Preparing Dataset",
+        message: "Reading dataset metadata".into(),
+        progress: 2.0,
+        bytes_processed: 0,
+        total_bytes: 0,
+        current_file: None,
+    });
     if !source_path.exists() {
         return Err(format!(
             "Dataset path does not exist: {}",
@@ -482,7 +501,23 @@ fn inspect_dataset(
         source_path.parent().unwrap_or_else(|| Path::new("."))
     };
     let mut files = Vec::new();
+    on_progress(InspectionProgress {
+        stage: "Scanning Files",
+        message: "Discovering supported files".into(),
+        progress: 8.0,
+        bytes_processed: 0,
+        total_bytes: 0,
+        current_file: None,
+    });
     collect_dataset_files(root, source_path, formats, &mut files);
+    on_progress(InspectionProgress {
+        stage: "Counting Files",
+        message: format!("Found {} supported files", files.len()),
+        progress: 18.0,
+        bytes_processed: 0,
+        total_bytes: 0,
+        current_file: None,
+    });
     if files.is_empty() {
         return Ok(DatasetInspection {
             artifact_path: None,
@@ -503,13 +538,28 @@ fn inspect_dataset(
     let mut total_size = 0_i64;
     let mut extensions = Vec::new();
     let mut preview = None;
-    for (path, _) in &files {
+    let mut file_sizes = Vec::with_capacity(files.len());
+    for (index, (path, _)) in files.iter().enumerate() {
         let metadata = fs::metadata(path)
             .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
+        file_sizes.push(metadata.len() as i64);
         if metadata.len() == 0 {
             errors.push(format!("{} is empty", path.display()));
         }
         total_size = total_size.saturating_add(metadata.len() as i64);
+        if index == 0 || index + 1 == files.len() || index % 100 == 0 {
+            on_progress(InspectionProgress {
+                stage: "Calculating Total Size",
+                message: format!("Measured {} of {} files", index + 1, files.len()),
+                progress: 18.0 + ((index + 1) as f64 / files.len() as f64) * 12.0,
+                bytes_processed: total_size,
+                total_bytes: 0,
+                current_file: Some(path.to_string_lossy().to_string()),
+            });
+        }
+    }
+    let mut validated_bytes = 0_i64;
+    for (index, ((path, _), file_size)) in files.iter().zip(file_sizes.iter()).enumerate() {
         let extension = path
             .extension()
             .and_then(|value| value.to_str())
@@ -527,6 +577,18 @@ fn inspect_dataset(
                 .read(&mut bytes)
                 .map_err(|error| format!("Could not preview {}: {error}", path.display()))?;
             preview = Some(String::from_utf8_lossy(&bytes[..count]).to_string());
+        }
+        validated_bytes = validated_bytes.saturating_add(*file_size);
+        let reporting_interval = (files.len() / 100).max(1);
+        if index == 0 || index + 1 == files.len() || index % reporting_interval == 0 {
+            on_progress(InspectionProgress {
+                stage: "Validating Structure",
+                message: format!("Validated {} of {} files", index + 1, files.len()),
+                progress: 30.0 + ((index + 1) as f64 / files.len() as f64) * 30.0,
+                bytes_processed: validated_bytes,
+                total_bytes: total_size,
+                current_file: Some(path.to_string_lossy().to_string()),
+            });
         }
     }
     extensions.sort();
@@ -546,7 +608,10 @@ fn inspect_dataset(
             .map_err(|error| format!("Could not create compressed dataset: {error}"))?;
         let mut archive = ZipWriter::new(file);
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-        for (path, relative) in &files {
+        let mut compressed_source_bytes = 0_i64;
+        for (index, ((path, relative), file_size)) in
+            files.iter().zip(file_sizes.iter()).enumerate()
+        {
             archive
                 .start_file(relative.replace('\\', "/"), options)
                 .map_err(|error| format!("Could not add a file to the dataset archive: {error}"))?;
@@ -554,6 +619,18 @@ fn inspect_dataset(
                 .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
             std::io::copy(&mut source, &mut archive)
                 .map_err(|error| format!("Could not compress {}: {error}", path.display()))?;
+            compressed_source_bytes = compressed_source_bytes.saturating_add(*file_size);
+            let reporting_interval = (files.len() / 100).max(1);
+            if index == 0 || index + 1 == files.len() || index % reporting_interval == 0 {
+                on_progress(InspectionProgress {
+                    stage: "Compressing",
+                    message: format!("Compressed {} of {} files", index + 1, files.len()),
+                    progress: 60.0 + ((index + 1) as f64 / files.len() as f64) * 30.0,
+                    bytes_processed: compressed_source_bytes,
+                    total_bytes: total_size,
+                    current_file: Some(path.to_string_lossy().to_string()),
+                });
+            }
         }
         archive
             .finish()
@@ -575,6 +652,18 @@ fn inspect_dataset(
     } else {
         (None, None, total_size)
     };
+    on_progress(InspectionProgress {
+        stage: "Ready for Upload",
+        message: if errors.is_empty() {
+            "Validation complete".into()
+        } else {
+            format!("Validation completed with {} error(s)", errors.len())
+        },
+        progress: 100.0,
+        bytes_processed: size,
+        total_bytes: size,
+        current_file: None,
+    });
     Ok(DatasetInspection {
         artifact_path,
         checksum,
@@ -617,8 +706,41 @@ pub fn list_training_datasets(
 pub async fn save_training_dataset(
     state: State<'_, AppState>,
     input: TrainingDatasetInput,
+    on_event: Channel<TrainingStreamEvent>,
 ) -> Result<TrainingDatasetRecord, String> {
     let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let timestamp = now();
+    {
+        let database = state.database.lock().map_err(|error| error.to_string())?;
+        database
+            .execute(
+                "INSERT INTO training_datasets(
+                    id, name, source_path, format, validation_status,
+                    validation_errors_json, compressed, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 'detecting', 'pending', '[]', ?4, ?5, ?5)
+                ON CONFLICT(id) DO UPDATE SET
+                    name=excluded.name, source_path=excluded.source_path,
+                    validation_status='pending', validation_errors_json='[]',
+                    artifact_path=NULL, checksum=NULL, size=0, file_count=0,
+                    remote_dataset_id=NULL, training_server_id=NULL,
+                    updated_at=excluded.updated_at",
+                params![
+                    id,
+                    input.name.trim(),
+                    input.source_path.trim(),
+                    i64::from(input.compress),
+                    timestamp
+                ],
+            )
+            .map_err(|error| database_error("creating pending dataset", error))?;
+    }
+    add_log(
+        &state,
+        "training-dataset",
+        "info",
+        "Dataset validation started",
+        Some(input.source_path.trim()),
+    );
     let source_path = PathBuf::from(input.source_path.trim());
     let formats = input
         .supported_formats
@@ -626,7 +748,9 @@ pub async fn save_training_dataset(
         .unwrap_or_else(|| DEFAULT_FORMATS.iter().map(ToString::to_string).collect());
     let data_dir = state.data_dir.clone();
     let inspection_id = id.clone();
-    let inspection = tokio::task::spawn_blocking(move || {
+    let operation_id = format!("dataset-prepare:{id}");
+    let progress_channel = on_event.clone();
+    let inspection_result = tokio::task::spawn_blocking(move || {
         inspect_dataset(
             &inspection_id,
             &source_path,
@@ -636,10 +760,70 @@ pub async fn save_training_dataset(
                 .collect::<Vec<_>>(),
             input.compress,
             &data_dir,
+            |progress| {
+                let _ = progress_channel.send(TrainingStreamEvent::OperationProgress {
+                    operation_id: operation_id.clone(),
+                    stage: progress.stage.into(),
+                    message: progress.message,
+                    progress: progress.progress,
+                    bytes_processed: progress.bytes_processed,
+                    total_bytes: progress.total_bytes,
+                    current_file: progress.current_file,
+                });
+            },
         )
     })
-    .await
-    .map_err(|error| format!("Dataset validation worker failed: {error}"))??;
+    .await;
+    let inspection = match inspection_result {
+        Ok(Ok(inspection)) => inspection,
+        Ok(Err(message)) => {
+            let errors_json = json!([message]).to_string();
+            let database = state.database.lock().map_err(|error| error.to_string())?;
+            database
+                .execute(
+                    "UPDATE training_datasets SET validation_status='invalid',
+                        validation_errors_json=?2, updated_at=?3 WHERE id=?1",
+                    params![id, errors_json, now()],
+                )
+                .map_err(|error| database_error("saving dataset validation failure", error))?;
+            drop(database);
+            add_log(
+                &state,
+                "training-dataset",
+                "error",
+                "Dataset validation failed",
+                Some(&message),
+            );
+            let _ = on_event.send(TrainingStreamEvent::Error {
+                message: message.clone(),
+            });
+            return Err(message);
+        }
+        Err(error) => {
+            let message = format!("Dataset validation worker failed: {error}");
+            let errors_json = json!([message]).to_string();
+            let database = state.database.lock().map_err(|error| error.to_string())?;
+            database
+                .execute(
+                    "UPDATE training_datasets SET validation_status='invalid',
+                        validation_errors_json=?2, updated_at=?3 WHERE id=?1",
+                    params![id, errors_json, now()],
+                )
+                .map_err(|error| database_error("saving dataset worker failure", error))?;
+            drop(database);
+            add_log(
+                &state,
+                "training-dataset",
+                "error",
+                "Dataset validation worker failed",
+                Some(&message),
+            );
+            let _ = on_event.send(TrainingStreamEvent::Error {
+                message: message.clone(),
+            });
+            return Err(message);
+        }
+    };
     let timestamp = now();
     let errors_json = serde_json::to_string(&inspection.errors)
         .map_err(|error| format!("Could not serialize dataset validation results: {error}"))?;
@@ -689,26 +873,105 @@ pub async fn save_training_dataset(
         "Dataset validation completed",
         Some(input.source_path.trim()),
     );
-    list_training_datasets(state)?
+    let dataset = list_training_datasets(state)?
         .into_iter()
         .find(|dataset| dataset.id == id)
-        .ok_or_else(|| "Saved dataset could not be reloaded".into())
+        .ok_or_else(|| "Saved dataset could not be reloaded".to_string())?;
+    let _ = on_event.send(TrainingStreamEvent::Complete {
+        message: if dataset.validation_status == "valid" {
+            format!("{} is ready for upload", dataset.name)
+        } else {
+            format!("{} failed validation", dataset.name)
+        },
+    });
+    Ok(dataset)
 }
 
 #[tauri::command]
-pub fn delete_training_dataset(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let artifact = {
-        let database = state.database.lock().map_err(|error| error.to_string())?;
-        database
-            .query_row(
-                "SELECT artifact_path FROM training_datasets WHERE id = ?1",
-                [&id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()
-            .map_err(|error| database_error("reading dataset artifact", error))?
-            .flatten()
+pub async fn delete_training_dataset(
+    state: State<'_, AppState>,
+    id: String,
+    on_event: Channel<TrainingStreamEvent>,
+) -> Result<(), String> {
+    let dataset = list_training_datasets(state.clone())?
+        .into_iter()
+        .find(|dataset| dataset.id == id)
+        .ok_or_else(|| "The selected dataset no longer exists".to_string())?;
+    let operation_id = format!("dataset-delete:{id}");
+    let send_progress = |stage: &str, message: &str, progress: f64| {
+        let _ = on_event.send(TrainingStreamEvent::OperationProgress {
+            operation_id: operation_id.clone(),
+            stage: stage.into(),
+            message: message.into(),
+            progress,
+            bytes_processed: 0,
+            total_bytes: dataset.size,
+            current_file: None,
+        });
     };
+    add_log(
+        &state,
+        "training-dataset",
+        "info",
+        "Dataset delete started",
+        Some(&dataset.name),
+    );
+    send_progress("Deleting Dataset", "Preparing deletion", 10.0);
+    if let (Some(remote_id), Some(server_id)) =
+        (&dataset.remote_dataset_id, &dataset.training_server_id)
+    {
+        send_progress(
+            "Removing Remote Dataset",
+            "Removing files from the Training Manager",
+            35.0,
+        );
+        if let Some(server) = list_training_servers(state.clone())?
+            .into_iter()
+            .find(|server| &server.id == server_id)
+        {
+            match state
+                .http
+                .delete(api_url(&server.url, &format!("/v1/datasets/{remote_id}")))
+                .send()
+                .await
+            {
+                Ok(response)
+                    if response.status().is_success()
+                        || response.status() == reqwest::StatusCode::NOT_FOUND => {}
+                Ok(response) => {
+                    let message = response_failure(response, "Deleting the remote dataset").await;
+                    add_log(
+                        &state,
+                        "training-dataset",
+                        "error",
+                        "Dataset delete failed",
+                        Some(&message),
+                    );
+                    return Err(message);
+                }
+                Err(error) => {
+                    let message = format!(
+                        "Could not delete the remote dataset from {}: {error}",
+                        server.url
+                    );
+                    add_log(
+                        &state,
+                        "training-dataset",
+                        "error",
+                        "Dataset delete failed",
+                        Some(&message),
+                    );
+                    return Err(message);
+                }
+            }
+        }
+    }
+    send_progress(
+        "Removing Files",
+        "Removing the managed local artifact",
+        65.0,
+    );
+    let artifact = dataset.artifact_path;
     if let Some(artifact) = artifact {
         let path = PathBuf::from(artifact);
         if path.starts_with(state.data_dir.join("training").join("datasets")) && path.is_file() {
@@ -716,10 +979,27 @@ pub fn delete_training_dataset(state: State<'_, AppState>, id: String) -> Result
                 .map_err(|error| format!("Could not remove managed dataset artifact: {error}"))?;
         }
     }
+    send_progress(
+        "Cleaning Metadata",
+        "Removing upload and dataset metadata",
+        85.0,
+    );
     let database = state.database.lock().map_err(|error| error.to_string())?;
     database
-        .execute("DELETE FROM training_datasets WHERE id = ?1", [id])
+        .execute("DELETE FROM training_datasets WHERE id = ?1", [&id])
         .map_err(|error| database_error("deleting training dataset", error))?;
+    drop(database);
+    add_log(
+        &state,
+        "training-dataset",
+        "info",
+        "Dataset delete completed",
+        Some(&dataset.name),
+    );
+    send_progress("Completed", "Dataset deleted", 100.0);
+    let _ = on_event.send(TrainingStreamEvent::Complete {
+        message: format!("{} deleted", dataset.name),
+    });
     Ok(())
 }
 
@@ -736,6 +1016,15 @@ pub enum TrainingStreamEvent {
         progress: f64,
         speed_bps: f64,
         eta_seconds: Option<i64>,
+    },
+    OperationProgress {
+        operation_id: String,
+        stage: String,
+        message: String,
+        progress: f64,
+        bytes_processed: i64,
+        total_bytes: i64,
+        current_file: Option<String>,
     },
     Complete {
         message: String,
@@ -824,6 +1113,13 @@ fn fail_upload(
         .to_string();
     let upload_id = progress.id.to_string();
     save_upload_progress(state, progress)?;
+    add_log(
+        state,
+        "training-upload",
+        "error",
+        "Dataset upload failed",
+        Some(&message),
+    );
     let _ = on_event.send(TrainingStreamEvent::Error {
         message: message.clone(),
     });
@@ -914,6 +1210,17 @@ pub async fn start_dataset_upload(
             )
             .map_err(|error| database_error("creating dataset upload", error))?;
     }
+    add_log(
+        &state,
+        "training-upload",
+        "info",
+        if existing.is_some() {
+            "Dataset upload resumed"
+        } else {
+            "Dataset upload started"
+        },
+        Some(&dataset.name),
+    );
 
     let cancellation = Arc::new(AtomicBool::new(false));
     state
@@ -923,6 +1230,15 @@ pub async fn start_dataset_upload(
         .insert(upload_id.clone(), Arc::clone(&cancellation));
     let _ = on_event.send(TrainingStreamEvent::Status {
         message: "Negotiating a resumable upload session".into(),
+    });
+    let _ = on_event.send(TrainingStreamEvent::OperationProgress {
+        operation_id: upload_id.clone(),
+        stage: "Preparing Upload".into(),
+        message: "Negotiating a resumable upload session".into(),
+        progress: 1.0,
+        bytes_processed: existing.as_ref().map_or(0, |upload| upload.bytes_uploaded),
+        total_bytes,
+        current_file: Some(artifact_path.clone()),
     });
     let handshake = state
         .http
@@ -1140,6 +1456,13 @@ pub async fn start_dataset_upload(
                 },
             )?;
             let _ = on_event.send(TrainingStreamEvent::Cancelled);
+            add_log(
+                &state,
+                "training-upload",
+                "warning",
+                "Dataset upload cancelled",
+                Some(&dataset.name),
+            );
             state
                 .cancellations
                 .lock()
@@ -1288,6 +1611,22 @@ pub async fn start_dataset_upload(
             eta_seconds,
         });
     }
+    let _ = on_event.send(TrainingStreamEvent::OperationProgress {
+        operation_id: upload_id.clone(),
+        stage: "Server Validation".into(),
+        message: "Upload complete; validating checksum and registering the dataset".into(),
+        progress: 99.0,
+        bytes_processed: total_bytes,
+        total_bytes,
+        current_file: Some(artifact_path.clone()),
+    });
+    add_log(
+        &state,
+        "training-upload",
+        "info",
+        "Server dataset validation started",
+        Some(&dataset.name),
+    );
     let completion = state
         .http
         .post(api_url(
@@ -1387,6 +1726,15 @@ pub async fn start_dataset_upload(
         "Dataset upload completed",
         Some(&dataset.name),
     );
+    let _ = on_event.send(TrainingStreamEvent::OperationProgress {
+        operation_id: upload_id,
+        stage: "Dataset Registered".into(),
+        message: "Dataset is available on the Training Manager".into(),
+        progress: 100.0,
+        bytes_processed: total_bytes,
+        total_bytes,
+        current_file: None,
+    });
     let _ = on_event.send(TrainingStreamEvent::Complete {
         message: format!("{} uploaded", dataset.name),
     });
@@ -1434,7 +1782,15 @@ pub async fn cancel_dataset_upload(state: State<'_, AppState>, id: String) -> Re
             last_error: None,
             finished: true,
         },
-    )
+    )?;
+    add_log(
+        &state,
+        "training-upload",
+        "warning",
+        "Dataset upload cancellation requested",
+        Some(&upload.dataset_id),
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -1918,9 +2274,21 @@ pub fn list_training_logs(
     let mut statement = database
         .prepare(
             "SELECT id, training_job_id, level, message, cursor, created_at
-             FROM training_logs
-             WHERE (?1 IS NULL OR training_job_id = ?1)
-             ORDER BY id DESC LIMIT ?2",
+             FROM (
+                SELECT id, training_job_id, level, message, cursor, created_at
+                FROM training_logs
+                WHERE (?1 IS NULL OR training_job_id = ?1)
+                UNION ALL
+                SELECT -id, NULL, level,
+                       message || CASE
+                           WHEN details IS NULL OR details = '' THEN ''
+                           ELSE ': ' || details
+                       END,
+                       NULL, created_at
+                FROM logs
+                WHERE ?1 IS NULL AND category LIKE 'training-%'
+             )
+             ORDER BY created_at DESC, id DESC LIMIT ?2",
         )
         .map_err(|error| database_error("preparing training logs", error))?;
     let records = statement
@@ -2041,8 +2409,16 @@ mod tests {
         )
         .expect("test dataset should be written");
 
-        let result = inspect_dataset("fixture", &dataset, &["jsonl".into()], true, &root)
-            .expect("dataset should be inspected");
+        let mut stages = Vec::new();
+        let result = inspect_dataset(
+            "fixture",
+            &dataset,
+            &["jsonl".into()],
+            true,
+            &root,
+            |progress| stages.push(progress.stage),
+        )
+        .expect("dataset should be inspected");
 
         assert_eq!(result.status, "valid");
         assert_eq!(result.file_count, 1);
@@ -2051,6 +2427,10 @@ mod tests {
             .artifact_path
             .as_deref()
             .is_some_and(|path| path.ends_with("fixture.zip")));
+        assert!(stages.contains(&"Scanning Files"));
+        assert!(stages.contains(&"Validating Structure"));
+        assert!(stages.contains(&"Compressing"));
+        assert_eq!(stages.last(), Some(&"Ready for Upload"));
         fs::remove_dir_all(&root).expect("test directory should be removed");
     }
 
@@ -2062,7 +2442,7 @@ mod tests {
         fs::write(&dataset, "{\"valid\":true}\nnot-json\n")
             .expect("test dataset should be written");
 
-        let result = inspect_dataset("invalid", &dataset, &["jsonl".into()], false, &root)
+        let result = inspect_dataset("invalid", &dataset, &["jsonl".into()], false, &root, |_| {})
             .expect("dataset should be inspected");
 
         assert_eq!(result.status, "invalid");

@@ -1,6 +1,6 @@
 # Tome Training Management Architecture
 
-Status: Windows Training Manager implementation baseline Last reviewed: 2026-07-27
+Status: Windows Training Manager implementation baseline Last reviewed: 2026-07-28
 
 ## Decision
 
@@ -240,6 +240,8 @@ SQLite stores:
 - upload sessions and acknowledged offsets;
 - job specifications, attempts, status, metrics, and heartbeat timestamps;
 - bounded job logs and resource snapshots.
+- dataset preparation, upload, validation, and deletion tasks with progress and stage logs
+  for the global Task Queue and Context Panel.
 
 Secrets belong in the platform credential store when authenticated adapters are added.
 SQLite stores only a credential reference.
@@ -252,7 +254,10 @@ SQLite stores only a credential reference.
   never deletes the user's source dataset.
 - Remote requests use explicit timeouts and detailed errors.
 - Upload and job operations are idempotent and persisted before network mutation.
-- Restart reconciliation queries every non-terminal upload/job before resuming.
+- On desktop restart, interrupted uploads become resumable `paused` records with their
+  acknowledged byte offsets intact. Interrupted local validation or deletion work is
+  marked failed with an explicit restart reason because an in-process filesystem worker
+  cannot survive application termination.
 - Logs redact authorization headers and never include dataset contents.
 
 ## UI contract
@@ -272,6 +277,18 @@ The Training route contains:
 Empty and unavailable states are explicit. When no training server is configured, users
 can still catalog, preview, validate, compress datasets, and create job drafts. Network
 actions explain that a compatible external Training Manager must be configured.
+
+Dataset operations expose a continuous stage model:
+
+`Preparing Dataset → Scanning Files → Counting Files → Calculating Total Size → Validating Structure → Compressing → Ready for Upload → Uploading → Server Validation → Dataset Registered`.
+
+Cards report processed and total bytes, current file, transfer speed, remaining bytes,
+percentage, and ETA where available. Every dataset owns independent operation state, so
+parallel preparation and uploads do not overwrite each other. Validation errors retain
+their exact file and parser reason; the card renders a bounded first page to remain
+responsive for very large invalid datasets while SQLite retains the complete result.
+Delete state is per dataset, disables duplicate actions immediately, and keeps the card
+visible with stage feedback until local and remote cleanup succeeds.
 
 ## Operational constraints
 

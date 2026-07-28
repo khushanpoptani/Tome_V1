@@ -5,7 +5,13 @@ import {
   PageHeader,
   textAreaClassName,
 } from "@/components/common/page";
-import { backend, isTauriRuntime, startDatasetUpload } from "@/lib/backend";
+import {
+  backend,
+  deleteTrainingDataset,
+  isTauriRuntime,
+  prepareTrainingDataset,
+  startDatasetUpload,
+} from "@/lib/backend";
 import { errorMessage, formatBytes, formatDate } from "@/lib/format";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -73,6 +79,14 @@ interface DatasetForm {
   readonly supportedFormats: string;
 }
 
+interface DatasetPreparationInput {
+  readonly id?: string;
+  readonly name: string;
+  readonly sourcePath: string;
+  readonly compress: boolean;
+  readonly supportedFormats: string | readonly string[];
+}
+
 interface JobForm {
   readonly datasetId: string;
   readonly model: string;
@@ -83,6 +97,16 @@ interface JobForm {
 }
 
 type StreamStatus = "disabled" | "connecting" | "connected" | "fallback";
+type OperationProgressEvent = Extract<
+  TrainingStreamEvent,
+  { readonly type: "operationProgress" }
+>;
+
+interface DatasetOperationState {
+  readonly kind: "delete" | "prepare";
+  readonly event: OperationProgressEvent;
+  readonly error: string | null;
+}
 
 function percent(value: number | null | undefined): string {
   return `${Math.round(Math.max(0, Math.min(100, value ?? 0)))}%`;
@@ -176,8 +200,16 @@ export function TrainingPage(): React.JSX.Element {
   const [streamStatus, setStreamStatus] = useState<StreamStatus>("disabled");
   const pendingRefreshes = useRef(new Map<string, number>());
   const jobsRef = useRef<readonly TrainingJobRecord[]>([]);
+  const operationStarts = useRef(new Map<string, string>());
+  const operationLogs = useRef(new Map<string, string[]>());
+  const prepareDatasetRef = useRef<
+    ((input: DatasetPreparationInput) => Promise<TrainingDatasetRecord>) | undefined
+  >(undefined);
   const [uploadProgress, setUploadProgress] = useState<
     Readonly<Record<string, TrainingStreamEvent>>
+  >({});
+  const [datasetOperations, setDatasetOperations] = useState<
+    Readonly<Record<string, DatasetOperationState>>
   >({});
 
   const servers = useQuery({
@@ -195,6 +227,12 @@ export function TrainingPage(): React.JSX.Element {
     queryFn: backend.listDatasetUploads,
     queryKey: ["dataset-uploads"],
     refetchInterval: 2_000,
+  });
+  const tasks = useQuery({
+    enabled: isTauriRuntime(),
+    queryFn: backend.listTasks,
+    queryKey: ["tasks"],
+    refetchInterval: 1_000,
   });
   const jobs = useQuery({
     enabled: isTauriRuntime(),
@@ -219,6 +257,146 @@ export function TrainingPage(): React.JSX.Element {
     jobsRef.current = jobs.data ?? [];
   }, [jobs.data]);
 
+  const persistOperationTask = (
+    id: string,
+    kind: string,
+    title: string,
+    event: OperationProgressEvent,
+    status: "cancelled" | "completed" | "failed" | "running" = "running",
+    error?: string,
+  ): void => {
+    const startedAt = operationStarts.current.get(id) ?? new Date().toISOString();
+    operationStarts.current.set(id, startedAt);
+    const lines = operationLogs.current.get(id) ?? [];
+    const nextLine = `${event.stage}: ${error ?? event.message}`;
+    if (lines.at(-1) !== nextLine) {
+      lines.push(nextLine);
+      if (lines.length > 250) lines.splice(0, lines.length - 250);
+      operationLogs.current.set(id, lines);
+    }
+    void backend
+      .saveTask({
+        endedAt: status === "running" ? null : new Date().toISOString(),
+        id,
+        kind,
+        logs: lines.join("\n"),
+        progress: event.progress,
+        startedAt,
+        status,
+        title,
+      })
+      .then(() => queryClient.invalidateQueries({ queryKey: ["tasks"] }))
+      .catch(() => undefined);
+  };
+
+  const prepareDataset = async (
+    input: DatasetPreparationInput,
+  ): Promise<TrainingDatasetRecord> => {
+    const id = input.id ?? crypto.randomUUID();
+    const supportedFormats =
+      typeof input.supportedFormats === "string"
+        ? input.supportedFormats
+            .split(",")
+            .map((value) => value.trim())
+            .filter(Boolean)
+        : input.supportedFormats;
+    const taskId = `dataset-prepare:${id}`;
+    const title = `Prepare ${input.name || "dataset"}`;
+    let lastProgress: OperationProgressEvent | null = null;
+    toast.info(`Preparing ${input.name || "dataset"}…`);
+    try {
+      const dataset = await prepareTrainingDataset(
+        { ...input, id, supportedFormats },
+        (event) => {
+          if (event.type !== "operationProgress") return;
+          lastProgress = event;
+          setDatasetOperations((current) => ({
+            ...current,
+            [id]: { error: null, event, kind: "prepare" },
+          }));
+          persistOperationTask(taskId, "dataset-preparation", title, event, "running");
+          void queryClient.invalidateQueries({ queryKey: ["training-datasets"] });
+        },
+      );
+      const lastEvent = lastProgress ?? {
+        bytesProcessed: dataset.size,
+        currentFile: null,
+        message:
+          dataset.validationStatus === "valid"
+            ? "Validation complete"
+            : "Validation failed",
+        operationId: taskId,
+        progress: 100,
+        stage:
+          dataset.validationStatus === "valid" ? "Ready for Upload" : "Validation Failed",
+        totalBytes: dataset.size,
+        type: "operationProgress" as const,
+      };
+      persistOperationTask(
+        taskId,
+        "dataset-preparation",
+        title,
+        lastEvent,
+        dataset.validationStatus === "valid" ? "completed" : "failed",
+        dataset.validationStatus === "valid"
+          ? undefined
+          : parseValidationErrors(dataset).join("; "),
+      );
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["training-datasets"] }),
+        queryClient.invalidateQueries({ queryKey: ["training-logs"] }),
+      ]);
+      if (dataset.validationStatus === "valid") {
+        setDatasetOperations((current) => {
+          const next = { ...current };
+          delete next[id];
+          return next;
+        });
+        toast.success(`${dataset.name} validated and is ready for upload.`);
+      } else {
+        const validationError =
+          parseValidationErrors(dataset)[0] ?? "See validation details.";
+        setDatasetOperations((current) => ({
+          ...current,
+          [id]: {
+            error: validationError,
+            event: { ...lastEvent, message: validationError, stage: "Validation Failed" },
+            kind: "prepare",
+          },
+        }));
+        toast.error(`${dataset.name} failed validation: ${validationError}`);
+      }
+      return dataset;
+    } catch (error) {
+      const message = errorMessage(error);
+      const failureEvent: OperationProgressEvent = {
+        bytesProcessed: 0,
+        currentFile: null,
+        message,
+        operationId: taskId,
+        progress: 0,
+        stage: "Preparation Failed",
+        totalBytes: 0,
+        type: "operationProgress",
+      };
+      setDatasetOperations((current) => ({
+        ...current,
+        [id]: { error: message, event: failureEvent, kind: "prepare" },
+      }));
+      persistOperationTask(
+        taskId,
+        "dataset-preparation",
+        title,
+        failureEvent,
+        "failed",
+        message,
+      );
+      toast.error(`Dataset preparation failed: ${message}`);
+      throw error;
+    }
+  };
+  prepareDatasetRef.current = prepareDataset;
+
   useEffect(() => {
     if (!isTauriRuntime()) {
       return;
@@ -241,7 +419,12 @@ export function TrainingPage(): React.JSX.Element {
           paths.map((sourcePath) => {
             const filename = sourcePath.split(/[\\/]/).pop() ?? "Dataset";
             const name = filename.replace(/\.[^.]+$/, "") || filename;
-            return backend.saveTrainingDataset({
+            const prepare = prepareDatasetRef.current;
+            if (prepare === undefined) {
+              return Promise.reject(new Error("Dataset preparation is unavailable."));
+            }
+            return prepare({
+              id: crypto.randomUUID(),
               compress: true,
               name,
               sourcePath,
@@ -249,23 +432,19 @@ export function TrainingPage(): React.JSX.Element {
             });
           }),
         ).then((results) => {
-          const saved = results.filter((result) => result.status === "fulfilled").length;
-          const failedCount = results.length - saved;
+          const failedCount = results.filter(
+            (result) => result.status === "rejected",
+          ).length;
           void Promise.all([
             queryClient.invalidateQueries({ queryKey: ["training-datasets"] }),
             queryClient.invalidateQueries({ queryKey: ["training-logs"] }),
           ]);
-          if (saved > 0) {
-            toast.success(
-              `${saved} dataset${saved === 1 ? "" : "s"} validated and saved.`,
-            );
-          }
           if (failedCount > 0) {
             const firstFailure = results.find(
               (result): result is PromiseRejectedResult => result.status === "rejected",
             );
             toast.error(
-              `${failedCount} dataset${failedCount === 1 ? "" : "s"} failed validation: ${errorMessage(firstFailure?.reason)}`,
+              `${failedCount} dataset operation(s) failed: ${errorMessage(firstFailure?.reason)}`,
             );
           }
         });
@@ -449,24 +628,9 @@ export function TrainingPage(): React.JSX.Element {
     },
   });
   const saveDataset = useMutation({
-    mutationFn: backend.saveTrainingDataset,
-    onError: (error) => toast.error(errorMessage(error)),
-    onSuccess: (dataset) => {
-      setDatasetForm(null);
-      refreshAll();
-      if (dataset.validationStatus === "valid") {
-        toast.success("Dataset validated and saved.");
-      } else {
-        toast.warning("Dataset saved with validation errors.");
-      }
-    },
-  });
-  const removeDataset = useMutation({
-    mutationFn: backend.deleteTrainingDataset,
-    onError: (error) => toast.error(errorMessage(error)),
+    mutationFn: prepareDataset,
     onSuccess: () => {
       refreshAll();
-      toast.success("Dataset and managed archive removed.");
     },
   });
   const saveJob = useMutation({
@@ -541,16 +705,175 @@ export function TrainingPage(): React.JSX.Element {
       toast.error("Configure and activate an external Training Manager first.");
       return;
     }
+    toast.info(`Upload started for ${dataset.name}.`);
+    let taskId: string | null = null;
+    let lastOperationEvent: OperationProgressEvent | null = null;
     void startDatasetUpload(dataset.id, activeServer.id, (event) => {
       setUploadProgress((current) => ({ ...current, [dataset.id]: event }));
-      if (event.type === "complete") {
+      if (event.type === "operationProgress") {
+        taskId = event.operationId;
+        lastOperationEvent = event;
+        persistOperationTask(
+          event.operationId,
+          "dataset-upload",
+          `Upload ${dataset.name}`,
+          event,
+        );
+        if (event.stage === "Server Validation") {
+          toast.info(`Upload complete. Validating ${dataset.name} on the server…`);
+        }
+      } else if (event.type === "uploadProgress") {
+        taskId = event.uploadId;
+        const progressEvent: OperationProgressEvent = {
+          bytesProcessed: event.bytesUploaded,
+          currentFile: dataset.artifactPath ?? dataset.sourcePath,
+          message: `${formatBytes(event.bytesUploaded)} of ${formatBytes(event.totalBytes)}`,
+          operationId: event.uploadId,
+          progress: event.progress,
+          stage: "Uploading",
+          totalBytes: event.totalBytes,
+          type: "operationProgress",
+        };
+        lastOperationEvent = progressEvent;
+        persistOperationTask(
+          event.uploadId,
+          "dataset-upload",
+          `Upload ${dataset.name}`,
+          progressEvent,
+        );
+      } else if (event.type === "complete") {
+        if (taskId !== null && lastOperationEvent !== null) {
+          persistOperationTask(
+            taskId,
+            "dataset-upload",
+            `Upload ${dataset.name}`,
+            { ...lastOperationEvent, message: event.message, progress: 100 },
+            "completed",
+          );
+        }
         toast.success(event.message);
         refreshAll();
       } else if (event.type === "error") {
+        if (taskId !== null && lastOperationEvent !== null) {
+          persistOperationTask(
+            taskId,
+            "dataset-upload",
+            `Upload ${dataset.name}`,
+            lastOperationEvent,
+            "failed",
+            event.message,
+          );
+        }
         toast.error(event.message);
         refreshAll();
+      } else if (event.type === "cancelled") {
+        if (taskId !== null && lastOperationEvent !== null) {
+          persistOperationTask(
+            taskId,
+            "dataset-upload",
+            `Upload ${dataset.name}`,
+            { ...lastOperationEvent, message: "Upload cancelled" },
+            "cancelled",
+          );
+        }
+        toast.info(`${dataset.name} upload cancelled.`);
+        refreshAll();
       }
-    }).catch((error: unknown) => toast.error(errorMessage(error)));
+    }).catch((error: unknown) => {
+      const message = errorMessage(error);
+      if (taskId !== null && lastOperationEvent !== null) {
+        persistOperationTask(
+          taskId,
+          "dataset-upload",
+          `Upload ${dataset.name}`,
+          lastOperationEvent,
+          "failed",
+          message,
+        );
+      }
+      toast.error(`Upload failed: ${message}`);
+      refreshAll();
+    });
+  };
+
+  const removeDataset = (dataset: TrainingDatasetRecord): void => {
+    const existing = datasetOperations[dataset.id];
+    if (existing?.kind === "delete" && existing.error === null) return;
+    const taskId = `dataset-delete:${dataset.id}`;
+    const title = `Delete ${dataset.name}`;
+    let lastProgress: OperationProgressEvent | null = null;
+    const initialEvent: OperationProgressEvent = {
+      bytesProcessed: 0,
+      currentFile: null,
+      message: "Preparing deletion",
+      operationId: taskId,
+      progress: 0,
+      stage: "Deleting Dataset",
+      totalBytes: dataset.size,
+      type: "operationProgress",
+    };
+    setDatasetOperations((current) => ({
+      ...current,
+      [dataset.id]: { error: null, event: initialEvent, kind: "delete" },
+    }));
+    persistOperationTask(taskId, "dataset-delete", title, initialEvent);
+    toast.info(`Deleting ${dataset.name}…`);
+    void deleteTrainingDataset(dataset.id, (event) => {
+      if (event.type !== "operationProgress") return;
+      lastProgress = event;
+      setDatasetOperations((current) => ({
+        ...current,
+        [dataset.id]: { error: null, event, kind: "delete" },
+      }));
+      persistOperationTask(taskId, "dataset-delete", title, event);
+    })
+      .then(() => {
+        const completeEvent: OperationProgressEvent = {
+          bytesProcessed: dataset.size,
+          currentFile: null,
+          message: "Dataset deleted",
+          operationId: taskId,
+          progress: 100,
+          stage: "Completed",
+          totalBytes: dataset.size,
+          type: "operationProgress",
+        };
+        persistOperationTask(taskId, "dataset-delete", title, completeEvent, "completed");
+        setDatasetOperations((current) => {
+          const next = { ...current };
+          delete next[dataset.id];
+          return next;
+        });
+        refreshAll();
+        toast.success(`${dataset.name} and its managed files were deleted.`);
+      })
+      .catch((error: unknown) => {
+        const message = errorMessage(error);
+        const lastEvent = lastProgress ?? {
+          bytesProcessed: 0,
+          currentFile: null,
+          message,
+          operationId: taskId,
+          progress: 0,
+          stage: "Delete Failed",
+          totalBytes: dataset.size,
+          type: "operationProgress" as const,
+        };
+        setDatasetOperations((current) => ({
+          ...current,
+          [dataset.id]: { error: message, event: lastEvent, kind: "delete" },
+        }));
+        persistOperationTask(
+          taskId,
+          "dataset-delete",
+          title,
+          lastEvent,
+          "failed",
+          message,
+        );
+        refreshAll();
+        toast.error(`Delete failed for ${dataset.name}: ${message}`);
+      });
   };
 
   return (
@@ -821,18 +1144,79 @@ export function TrainingPage(): React.JSX.Element {
               ) : (
                 <div className="grid gap-3">
                   {datasets.data?.map((dataset) => {
+                    const validationErrors = parseValidationErrors(dataset);
                     const latest = uploads.data?.find(
                       (upload) => upload.datasetId === dataset.id,
                     );
                     const event = uploadProgress[dataset.id];
-                    const progress =
+                    const operation = datasetOperations[dataset.id];
+                    const persistedOperation = tasks.data?.find(
+                      (task) =>
+                        task.id === `dataset-delete:${dataset.id}` ||
+                        task.id === `dataset-prepare:${dataset.id}`,
+                    );
+                    const persistedUpload = tasks.data?.find(
+                      (task) => task.id === latest?.id,
+                    );
+                    const isDeleting =
+                      (operation?.kind === "delete" &&
+                        operation.error === null &&
+                        operation.event.progress < 100) ||
+                      (persistedOperation?.id === `dataset-delete:${dataset.id}` &&
+                        persistedOperation.status === "running");
+                    const uploadProgressValue =
                       event?.type === "uploadProgress"
                         ? event.progress
-                        : latest === undefined || latest.totalBytes === 0
-                          ? 0
-                          : (latest.bytesUploaded / latest.totalBytes) * 100;
+                        : event?.type === "operationProgress"
+                          ? event.progress
+                          : latest === undefined || latest.totalBytes === 0
+                            ? 0
+                            : (latest.bytesUploaded / latest.totalBytes) * 100;
+                    const operationProgressValue =
+                      operation?.event.progress ?? persistedOperation?.progress ?? 0;
+                    const operationIsVisible =
+                      operation !== undefined ||
+                      dataset.validationStatus === "pending" ||
+                      (persistedOperation !== undefined &&
+                        ["running", "failed"].includes(persistedOperation.status));
+                    const uploadStage =
+                      event?.type === "operationProgress"
+                        ? event.stage
+                        : (persistedUpload?.logs.split("\n").at(-1)?.split(":")[0] ??
+                          (latest?.status === "uploading"
+                            ? "Uploading"
+                            : latest?.status === "completed"
+                              ? "Dataset Registered"
+                              : latest?.status === "failed"
+                                ? "Upload Failed"
+                                : (latest?.status ?? "Waiting")));
+                    const bytesUploaded =
+                      event?.type === "uploadProgress"
+                        ? event.bytesUploaded
+                        : (latest?.bytesUploaded ?? 0);
+                    const totalUploadBytes =
+                      event?.type === "uploadProgress"
+                        ? event.totalBytes
+                        : (latest?.totalBytes ?? dataset.size);
+                    const uploadStatus =
+                      latest?.status ??
+                      (event?.type === "uploadProgress" ? "uploading" : "pending");
+                    const uploadSpeed =
+                      event?.type === "uploadProgress"
+                        ? event.speedBps
+                        : (latest?.speedBps ?? 0);
+                    const uploadEta =
+                      event?.type === "uploadProgress"
+                        ? event.etaSeconds
+                        : (latest?.etaSeconds ?? null);
                     return (
-                      <Card className="p-4" key={dataset.id}>
+                      <Card
+                        className={cn(
+                          "p-4 transition-opacity",
+                          isDeleting && "opacity-80",
+                        )}
+                        key={dataset.id}
+                      >
                         <div className="flex flex-wrap items-start gap-3">
                           <span className="grid size-9 place-items-center rounded-lg bg-secondary">
                             {dataset.compressed ? (
@@ -862,7 +1246,8 @@ export function TrainingPage(): React.JSX.Element {
                               disabled={
                                 dataset.validationStatus !== "valid" ||
                                 activeServer === null ||
-                                latest?.status === "uploading"
+                                latest?.status === "uploading" ||
+                                isDeleting
                               }
                               onClick={() => beginUpload(dataset)}
                               size="sm"
@@ -882,7 +1267,30 @@ export function TrainingPage(): React.JSX.Element {
                                 onClick={() => {
                                   void backend
                                     .cancelDatasetUpload(latest.id)
-                                    .then(refreshAll)
+                                    .then(() => {
+                                      const cancelEvent: OperationProgressEvent = {
+                                        bytesProcessed: latest.bytesUploaded,
+                                        currentFile:
+                                          dataset.artifactPath ?? dataset.sourcePath,
+                                        message: "Upload cancellation requested",
+                                        operationId: latest.id,
+                                        progress: uploadProgressValue,
+                                        stage: "Cancelled",
+                                        totalBytes: latest.totalBytes,
+                                        type: "operationProgress",
+                                      };
+                                      persistOperationTask(
+                                        latest.id,
+                                        "dataset-upload",
+                                        `Upload ${dataset.name}`,
+                                        cancelEvent,
+                                        "cancelled",
+                                      );
+                                      toast.info(
+                                        `Cancellation requested for ${dataset.name}.`,
+                                      );
+                                      refreshAll();
+                                    })
                                     .catch((error: unknown) =>
                                       toast.error(errorMessage(error)),
                                     );
@@ -896,6 +1304,9 @@ export function TrainingPage(): React.JSX.Element {
                             ) : null}
                             <Button
                               aria-label={`Replace ${dataset.name}`}
+                              disabled={
+                                isDeleting || dataset.validationStatus === "pending"
+                              }
                               onClick={() =>
                                 setDatasetForm({
                                   compress: dataset.compressed,
@@ -912,50 +1323,151 @@ export function TrainingPage(): React.JSX.Element {
                             </Button>
                             <Button
                               aria-label={`Delete ${dataset.name}`}
+                              disabled={isDeleting || latest?.status === "uploading"}
                               onClick={() => {
                                 if (window.confirm(`Remove dataset "${dataset.name}"?`)) {
-                                  removeDataset.mutate(dataset.id);
+                                  removeDataset(dataset);
                                 }
                               }}
                               size="icon"
                               variant="ghost"
                             >
-                              <Trash2 className="size-3.5" />
+                              {isDeleting ? (
+                                <RotateCcw className="size-3.5 animate-spin" />
+                              ) : (
+                                <Trash2 className="size-3.5" />
+                              )}
                             </Button>
                           </div>
                         </div>
-                        {latest === undefined ? null : (
-                          <div className="mt-3 rounded-lg border border-border bg-background/50 p-3">
-                            <div className="mb-2 flex items-center justify-between text-[10px]">
-                              <span>
-                                <StatusBadge value={latest.status} />
-                              </span>
-                              <span className="text-muted-foreground">
-                                {formatBytes(latest.speedBps)}/s · ETA{" "}
-                                {duration(latest.etaSeconds)}
+                        {operationIsVisible ? (
+                          <div
+                            aria-live="polite"
+                            className="mt-3 rounded-lg border border-violet-500/20 bg-violet-500/5 p-3"
+                          >
+                            <div className="mb-2 flex items-start justify-between gap-3">
+                              <div>
+                                <p className="text-[11px] font-medium">
+                                  {operation?.event.stage ??
+                                    (persistedOperation?.status === "failed"
+                                      ? "Operation Failed"
+                                      : "Preparing Dataset")}
+                                </p>
+                                <p className="mt-0.5 text-[10px] text-muted-foreground">
+                                  {operation?.error ??
+                                    operation?.event.message ??
+                                    persistedOperation?.logs.split("\n").at(-1) ??
+                                    "Processing in the background"}
+                                </p>
+                              </div>
+                              <span className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                                {persistedOperation?.status === "failed" ||
+                                (operation?.error !== null &&
+                                  operation?.error !== undefined) ? (
+                                  <CircleAlert className="size-3.5 text-red-400" />
+                                ) : (
+                                  <RefreshCw className="size-3.5 animate-spin text-violet-400" />
+                                )}
+                                {Math.round(operationProgressValue)}%
                               </span>
                             </div>
-                            <ProgressBar value={progress} />
-                            {latest.lastError === null ? null : (
-                              <p className="mt-2 text-[10px] text-red-400">
-                                {latest.lastError}
+                            <ProgressBar value={operationProgressValue} />
+                            {operation?.event.currentFile === null ||
+                            operation?.event.currentFile === undefined ? null : (
+                              <p className="mt-2 truncate font-mono text-[9px] text-muted-foreground">
+                                Current file: {operation.event.currentFile}
+                              </p>
+                            )}
+                            {operation?.event.totalBytes === 0 ||
+                            operation?.event.totalBytes === undefined ? null : (
+                              <p className="mt-1 text-[9px] text-muted-foreground">
+                                {formatBytes(operation.event.bytesProcessed)} /{" "}
+                                {formatBytes(operation.event.totalBytes)}
                               </p>
                             )}
                           </div>
+                        ) : null}
+                        {latest === undefined && event === undefined ? null : (
+                          <div className="mt-3 rounded-lg border border-border bg-background/50 p-3">
+                            <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-[10px]">
+                              <span className="flex items-center gap-2">
+                                <StatusBadge value={uploadStatus} />
+                                <span className="font-medium">{uploadStage}</span>
+                              </span>
+                              <span className="text-muted-foreground">
+                                {formatBytes(uploadSpeed)}/s · ETA {duration(uploadEta)}
+                              </span>
+                            </div>
+                            <ProgressBar value={uploadProgressValue} />
+                            <div className="mt-2 grid gap-1 text-[9px] text-muted-foreground sm:grid-cols-2">
+                              <span>
+                                {formatBytes(bytesUploaded)} /{" "}
+                                {formatBytes(totalUploadBytes)} (
+                                {Math.round(uploadProgressValue)}%)
+                              </span>
+                              <span className="sm:text-right">
+                                Remaining{" "}
+                                {formatBytes(
+                                  Math.max(0, totalUploadBytes - bytesUploaded),
+                                )}
+                              </span>
+                              <span className="truncate sm:col-span-2">
+                                Current file:{" "}
+                                {event?.type === "operationProgress"
+                                  ? (event.currentFile ?? "Server-side validation")
+                                  : (dataset.artifactPath ?? dataset.sourcePath)}
+                              </span>
+                            </div>
+                            {latest?.lastError === null ||
+                            latest?.lastError === undefined ? null : (
+                              <div className="mt-2 rounded-md border border-red-500/20 bg-red-500/5 p-2">
+                                <p className="text-[10px] text-red-400">
+                                  {latest.lastError}
+                                </p>
+                                <div className="mt-2 flex gap-2">
+                                  <Button
+                                    onClick={() => beginUpload(dataset)}
+                                    size="sm"
+                                    variant="outline"
+                                  >
+                                    <RotateCcw className="size-3" />
+                                    Retry
+                                  </Button>
+                                  <Button
+                                    onClick={() => setSection("logs")}
+                                    size="sm"
+                                    variant="ghost"
+                                  >
+                                    <Logs className="size-3" />
+                                    View logs
+                                  </Button>
+                                </div>
+                              </div>
+                            )}
+                          </div>
                         )}
-                        {dataset.preview === null ? null : (
+                        {dataset.preview === null &&
+                        validationErrors.length === 0 ? null : (
                           <details className="mt-3 text-[10px]">
                             <summary className="text-muted-foreground">
                               Preview and validation
                             </summary>
-                            <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-background p-3 font-mono text-[9px]">
-                              {dataset.preview}
-                            </pre>
-                            {parseValidationErrors(dataset).map((message) => (
+                            {dataset.preview === null ? null : (
+                              <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-background p-3 font-mono text-[9px]">
+                                {dataset.preview}
+                              </pre>
+                            )}
+                            {validationErrors.slice(0, 25).map((message) => (
                               <p className="mt-1 text-red-400" key={message}>
                                 {message}
                               </p>
                             ))}
+                            {validationErrors.length <= 25 ? null : (
+                              <p className="mt-2 text-muted-foreground">
+                                {validationErrors.length - 25} additional errors hidden to
+                                keep this view responsive.
+                              </p>
+                            )}
                           </details>
                         )}
                       </Card>
@@ -1220,6 +1732,7 @@ export function TrainingPage(): React.JSX.Element {
             className="space-y-4 p-5"
             onSubmit={(event) => {
               event.preventDefault();
+              setDatasetForm(null);
               saveDataset.mutate({
                 ...datasetForm,
                 supportedFormats: datasetForm.supportedFormats

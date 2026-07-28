@@ -63,7 +63,7 @@ export function TaskQueuePage(): React.JSX.Element {
             Clear finished
           </Button>
         }
-        description="Track model downloads, inference checks, and other background work."
+        description="Track dataset preparation, uploads, model downloads, inference checks, and other background work."
         icon={ListTodo}
         title="Task Queue"
       />
@@ -109,7 +109,9 @@ export function TaskQueuePage(): React.JSX.Element {
                       {Math.round(task.progress)}%
                     </span>
                   </button>
-                  {task.status === "running" ? (
+                  {task.status === "running" &&
+                  task.kind !== "dataset-preparation" &&
+                  task.kind !== "dataset-delete" ? (
                     <Button
                       onClick={() => {
                         void backend

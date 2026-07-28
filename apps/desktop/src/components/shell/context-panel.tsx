@@ -63,6 +63,34 @@ export function ContextPanel(): React.JSX.Element {
             <span className="block truncate text-xs">{value}</span>
           </section>
         ))}
+        {running.length === 0 ? null : (
+          <section className="rounded-lg border border-violet-500/20 bg-violet-500/5 p-3">
+            <p className="mb-2 text-[11px] font-medium text-violet-300">
+              Background activity
+            </p>
+            <div className="space-y-3">
+              {running.slice(0, 3).map((task) => (
+                <div key={task.id}>
+                  <div className="flex items-center justify-between gap-2 text-[10px]">
+                    <span className="truncate">{task.title}</span>
+                    <span className="text-muted-foreground">
+                      {Math.round(task.progress)}%
+                    </span>
+                  </div>
+                  <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-secondary">
+                    <div
+                      className="h-full rounded-full bg-violet-500 transition-[width]"
+                      style={{ width: `${Math.max(0, Math.min(100, task.progress))}%` }}
+                    />
+                  </div>
+                  <p className="mt-1 truncate text-[9px] text-muted-foreground">
+                    {task.logs.split("\n").at(-1) ?? task.kind}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
       </div>
       <div className="mt-auto border-t border-border p-4">
         <div className="rounded-lg bg-violet-500/8 p-3">

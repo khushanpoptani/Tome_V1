@@ -354,6 +354,16 @@ export type TrainingStreamEvent =
       readonly speedBps: number;
       readonly etaSeconds: number | null;
     }
+  | {
+      readonly type: "operationProgress";
+      readonly operationId: string;
+      readonly stage: string;
+      readonly message: string;
+      readonly progress: number;
+      readonly bytesProcessed: number;
+      readonly totalBytes: number;
+      readonly currentFile: string | null;
+    }
   | { readonly type: "status"; readonly message: string }
   | { readonly type: "error"; readonly message: string }
   | { readonly type: "cancelled" }
