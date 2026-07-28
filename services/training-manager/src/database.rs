@@ -227,7 +227,14 @@ impl Database {
                 expected_sha256, uploaded_bytes, chunk_size, status, partial_path,
                 created_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, 'pending', ?9, ?10, ?10)
-             ON CONFLICT(client_upload_id) DO NOTHING",
+             ON CONFLICT(client_upload_id) DO UPDATE SET
+                dataset_id=excluded.dataset_id,
+                name=excluded.name,
+                format=excluded.format,
+                updated_at=excluded.updated_at
+             WHERE uploads.status != 'completed'
+               AND uploads.expected_size=excluded.expected_size
+               AND uploads.expected_sha256=excluded.expected_sha256",
             params![
                 id,
                 request.client_upload_id,
@@ -241,8 +248,16 @@ impl Database {
                 timestamp
             ],
         )?;
-        query_upload(&connection, "client_upload_id", &request.client_upload_id)?
-            .ok_or_else(|| ApiError::internal("Upload session could not be loaded"))
+        let upload = query_upload(&connection, "client_upload_id", &request.client_upload_id)?
+            .ok_or_else(|| ApiError::internal("Upload session could not be loaded"))?;
+        if upload.expected_size != request.size
+            || upload.expected_sha256 != normalize_sha256(&request.sha256)
+        {
+            return Err(ApiError::conflict(
+                "This upload ID already belongs to a different dataset artifact",
+            ));
+        }
+        Ok(upload)
     }
 
     pub fn upload(&self, id: &str) -> ApiResult<UploadRecord> {
@@ -865,11 +880,42 @@ pub fn normalize_sha256(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::Database;
-    use crate::models::JobRequest;
+    use crate::models::{JobRequest, UploadRequest};
     use rusqlite::params;
     use serde_json::json;
     use std::fs;
     use uuid::Uuid;
+
+    #[test]
+    fn refreshes_metadata_when_a_matching_upload_is_resumed() {
+        let root = std::env::temp_dir().join(format!("tome-training-resume-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("test directory should be created");
+        let database =
+            Database::open(&root.join("training.sqlite3")).expect("training database should open");
+        let partial_path = root.join("dataset.partial");
+        let mut request = UploadRequest {
+            client_upload_id: "client-upload".into(),
+            dataset_id: "dataset".into(),
+            name: "dataset".into(),
+            format: "jsonl".into(),
+            size: 1024,
+            sha256: "abc123".into(),
+        };
+        database
+            .create_or_resume_upload(&request, &partial_path, 4 * 1024 * 1024)
+            .expect("upload should be created");
+
+        request.name = "dataset.zip".into();
+        request.format = "zip".into();
+        let resumed = database
+            .create_or_resume_upload(&request, &partial_path, 4 * 1024 * 1024)
+            .expect("upload should resume");
+
+        assert_eq!(resumed.name, "dataset.zip");
+        assert_eq!(resumed.format, "zip");
+        drop(database);
+        fs::remove_dir_all(root).expect("test directory should be removed");
+    }
 
     #[test]
     fn persists_all_datasets_selected_for_one_job() {

@@ -477,28 +477,40 @@ fn validate_dataset_file(path: &FsPath) -> ApiResult<()> {
         .as_str()
     {
         "json" => {
-            serde_json::from_reader::<_, serde_json::Value>(File::open(path)?).map_err(
-                |error| {
-                    ApiError::invalid(format!("{} contains invalid JSON: {error}", path.display()))
-                },
-            )?;
-        }
-        "jsonl" => {
-            for (index, line) in BufReader::new(File::open(path)?).lines().enumerate() {
-                let line = line?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                serde_json::from_str::<serde_json::Value>(&line).map_err(|error| {
+            if let Err(document_error) =
+                serde_json::from_reader::<_, serde_json::Value>(File::open(path)?)
+            {
+                validate_json_lines(path).map_err(|line_error| {
                     ApiError::invalid(format!(
-                        "{} line {} contains invalid JSON: {error}",
+                        "{} is neither a valid JSON document ({document_error}) nor valid JSON Lines ({})",
                         path.display(),
-                        index + 1
+                        line_error.message
                     ))
                 })?;
             }
         }
+        "jsonl" => {
+            validate_json_lines(path)?;
+        }
         _ => {}
+    }
+    Ok(())
+}
+
+fn validate_json_lines(path: &FsPath) -> ApiResult<()> {
+    let mut record_count = 0_u64;
+    for (index, line) in BufReader::new(File::open(path)?).lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        serde_json::from_str::<serde_json::Value>(&line).map_err(|error| {
+            ApiError::invalid(format!("line {} contains invalid JSON: {error}", index + 1))
+        })?;
+        record_count += 1;
+    }
+    if record_count == 0 {
+        return Err(ApiError::invalid("the file contains no JSON records"));
     }
     Ok(())
 }
@@ -509,7 +521,11 @@ fn count_files(path: &FsPath) -> ApiResult<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_content_range;
+    use std::fs;
+
+    use uuid::Uuid;
+
+    use super::{parse_content_range, validate_dataset_file};
 
     #[test]
     fn parses_content_ranges() {
@@ -519,5 +535,15 @@ mod tests {
         );
         assert!(parse_content_range("items 0-9/10").is_err());
         assert!(parse_content_range("bytes 9-0/10").is_err());
+    }
+
+    #[test]
+    fn accepts_json_lines_with_a_json_extension() {
+        let path = std::env::temp_dir().join(format!("tome-{}.json", Uuid::new_v4()));
+        fs::write(&path, "{\"prompt\":\"one\"}\n{\"prompt\":\"two\"}\n")
+            .expect("fixture should be written");
+        let result = validate_dataset_file(&path);
+        let _ = fs::remove_file(path);
+        assert!(result.is_ok(), "{result:?}");
     }
 }

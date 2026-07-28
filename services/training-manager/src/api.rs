@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{ws::Message, Query, State, WebSocketUpgrade},
+    extract::{ws::Message, DefaultBodyLimit, Query, State, WebSocketUpgrade},
     http::{header::ORIGIN, HeaderMap, StatusCode},
     middleware,
     response::{IntoResponse, Response},
@@ -81,6 +81,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/jobs/{id}/retry", post(jobs::retry_job))
         .route("/v1/jobs/{id}/logs", get(jobs::get_logs))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        // `Bytes` extractors otherwise retain Axum's 2 MiB default even though
+        // the protocol advertises a larger resumable chunk size.
+        .layer(DefaultBodyLimit::max(chunk_limit))
         .layer(RequestBodyLimitLayer::new(chunk_limit))
         .layer(TraceLayer::new_for_http())
         .with_state(state)

@@ -1208,6 +1208,21 @@ pub async fn start_dataset_upload(
     let total_bytes = fs::metadata(&artifact_path)
         .map_err(|error| format!("The dataset artifact is unavailable: {error}"))?
         .len() as i64;
+    let artifact_is_zip = dataset.compressed
+        || std::path::Path::new(&artifact_path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("zip"));
+    let upload_name = if artifact_is_zip && !dataset.name.to_ascii_lowercase().ends_with(".zip") {
+        format!("{}.zip", dataset.name)
+    } else {
+        dataset.name.clone()
+    };
+    let upload_format = if artifact_is_zip {
+        "zip"
+    } else {
+        dataset.format.as_str()
+    };
 
     let existing = list_dataset_uploads(state.clone())?
         .into_iter()
@@ -1281,8 +1296,8 @@ pub async fn start_dataset_upload(
             .json(&json!({
                 "clientUploadId": upload_id,
                 "datasetId": dataset.id,
-                "name": dataset.name,
-                "format": dataset.format,
+                "name": upload_name,
+                "format": upload_format,
                 "size": total_bytes,
                 "sha256": checksum
             }))
