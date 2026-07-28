@@ -887,6 +887,25 @@ pub async fn save_training_dataset(
     Ok(dataset)
 }
 
+fn delete_local_dataset(
+    state: &AppState,
+    id: &str,
+    artifact_path: Option<&str>,
+) -> Result<(), String> {
+    if let Some(artifact) = artifact_path {
+        let path = PathBuf::from(artifact);
+        if path.starts_with(state.data_dir.join("training").join("datasets")) && path.is_file() {
+            fs::remove_file(&path)
+                .map_err(|error| format!("Could not remove managed dataset artifact: {error}"))?;
+        }
+    }
+    let database = state.database.lock().map_err(|error| error.to_string())?;
+    database
+        .execute("DELETE FROM training_datasets WHERE id = ?1", [id])
+        .map_err(|error| database_error("deleting training dataset", error))?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn delete_training_dataset(
     state: State<'_, AppState>,
@@ -971,24 +990,12 @@ pub async fn delete_training_dataset(
         "Removing the managed local artifact",
         65.0,
     );
-    let artifact = dataset.artifact_path;
-    if let Some(artifact) = artifact {
-        let path = PathBuf::from(artifact);
-        if path.starts_with(state.data_dir.join("training").join("datasets")) && path.is_file() {
-            fs::remove_file(&path)
-                .map_err(|error| format!("Could not remove managed dataset artifact: {error}"))?;
-        }
-    }
     send_progress(
         "Cleaning Metadata",
         "Removing upload and dataset metadata",
         85.0,
     );
-    let database = state.database.lock().map_err(|error| error.to_string())?;
-    database
-        .execute("DELETE FROM training_datasets WHERE id = ?1", [&id])
-        .map_err(|error| database_error("deleting training dataset", error))?;
-    drop(database);
+    delete_local_dataset(&state, &id, dataset.artifact_path.as_deref())?;
     add_log(
         &state,
         "training-dataset",
@@ -2394,9 +2401,57 @@ pub fn get_training_resources(
 
 #[cfg(test)]
 mod tests {
-    use super::inspect_dataset;
+    use super::{delete_local_dataset, inspect_dataset};
+    use crate::infrastructure::state::AppState;
+    use rusqlite::params;
     use std::fs;
     use uuid::Uuid;
+
+    #[test]
+    fn deletes_dataset_metadata_and_managed_artifact() {
+        let root = std::env::temp_dir().join(format!("tome-delete-test-{}", Uuid::new_v4()));
+        let database_path = root.join("tome.sqlite3");
+        let artifact_dir = root.join("training").join("datasets");
+        let artifact = artifact_dir.join("fixture.zip");
+        fs::create_dir_all(&artifact_dir).expect("managed artifact directory should be created");
+        fs::write(&artifact, b"managed test artifact").expect("managed artifact should be written");
+        let state = AppState::new(&database_path).expect("test state should be created");
+        {
+            let database = state.database.lock().expect("test database should lock");
+            database
+                .execute(
+                    "INSERT INTO training_datasets(
+                        id, name, source_path, artifact_path, format, compressed,
+                        validation_status, validation_errors_json, created_at, updated_at
+                     ) VALUES (?1, 'Fixture', '/external/source.jsonl', ?2, 'jsonl', 1,
+                               'valid', '[]', ?3, ?3)",
+                    params![
+                        "fixture",
+                        artifact.to_string_lossy().to_string(),
+                        "2026-07-28T00:00:00Z"
+                    ],
+                )
+                .expect("test dataset should be inserted");
+        }
+
+        delete_local_dataset(&state, "fixture", artifact.to_str())
+            .expect("dataset should be deleted");
+
+        assert!(!artifact.exists());
+        let remaining = state
+            .database
+            .lock()
+            .expect("test database should lock")
+            .query_row(
+                "SELECT COUNT(*) FROM training_datasets WHERE id='fixture'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("dataset count should be readable");
+        assert_eq!(remaining, 0);
+        drop(state);
+        fs::remove_dir_all(&root).expect("test directory should be removed");
+    }
 
     #[test]
     fn validates_and_compresses_jsonl_datasets() {

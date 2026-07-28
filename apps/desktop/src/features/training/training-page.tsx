@@ -108,6 +108,11 @@ interface DatasetOperationState {
   readonly error: string | null;
 }
 
+interface DatasetDeleteConfirmation {
+  readonly datasets: readonly TrainingDatasetRecord[];
+  readonly mode: "all" | "single";
+}
+
 function percent(value: number | null | undefined): string {
   return `${Math.round(Math.max(0, Math.min(100, value ?? 0)))}%`;
 }
@@ -195,6 +200,12 @@ export function TrainingPage(): React.JSX.Element {
   const [section, setSection] = useState<SectionId>("dashboard");
   const [serverForm, setServerForm] = useState<ServerForm | null>(null);
   const [datasetForm, setDatasetForm] = useState<DatasetForm | null>(null);
+  const [datasetDeleteConfirmation, setDatasetDeleteConfirmation] =
+    useState<DatasetDeleteConfirmation | null>(null);
+  const [bulkDeleteProgress, setBulkDeleteProgress] = useState<{
+    readonly completed: number;
+    readonly total: number;
+  } | null>(null);
   const [jobForm, setJobForm] = useState<JobForm | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [streamStatus, setStreamStatus] = useState<StreamStatus>("disabled");
@@ -796,9 +807,14 @@ export function TrainingPage(): React.JSX.Element {
     });
   };
 
-  const removeDataset = (dataset: TrainingDatasetRecord): void => {
+  const removeDataset = (
+    dataset: TrainingDatasetRecord,
+    notify = true,
+  ): Promise<void> => {
     const existing = datasetOperations[dataset.id];
-    if (existing?.kind === "delete" && existing.error === null) return;
+    if (existing?.kind === "delete" && existing.error === null) {
+      return Promise.resolve();
+    }
     const taskId = `dataset-delete:${dataset.id}`;
     const title = `Delete ${dataset.name}`;
     let lastProgress: OperationProgressEvent | null = null;
@@ -818,7 +834,7 @@ export function TrainingPage(): React.JSX.Element {
     }));
     persistOperationTask(taskId, "dataset-delete", title, initialEvent);
     toast.info(`Deleting ${dataset.name}…`);
-    void deleteTrainingDataset(dataset.id, (event) => {
+    return deleteTrainingDataset(dataset.id, (event) => {
       if (event.type !== "operationProgress") return;
       lastProgress = event;
       setDatasetOperations((current) => ({
@@ -845,7 +861,9 @@ export function TrainingPage(): React.JSX.Element {
           return next;
         });
         refreshAll();
-        toast.success(`${dataset.name} and its managed files were deleted.`);
+        if (notify) {
+          toast.success(`${dataset.name} and its managed files were deleted.`);
+        }
       })
       .catch((error: unknown) => {
         const message = errorMessage(error);
@@ -872,8 +890,53 @@ export function TrainingPage(): React.JSX.Element {
           message,
         );
         refreshAll();
-        toast.error(`Delete failed for ${dataset.name}: ${message}`);
+        if (notify) {
+          toast.error(`Delete failed for ${dataset.name}: ${message}`);
+          return;
+        }
+        throw error;
       });
+  };
+
+  const confirmDatasetDeletion = (): void => {
+    if (datasetDeleteConfirmation === null) return;
+    const targets = datasetDeleteConfirmation.datasets.filter(
+      (dataset) =>
+        !(
+          datasetOperations[dataset.id]?.kind === "delete" &&
+          datasetOperations[dataset.id]?.error === null
+        ),
+    );
+    const bulk = datasetDeleteConfirmation.mode === "all";
+    setDatasetDeleteConfirmation(null);
+    if (!bulk) {
+      const target = targets[0];
+      if (target !== undefined) void removeDataset(target);
+      return;
+    }
+    if (targets.length === 0) return;
+    setBulkDeleteProgress({ completed: 0, total: targets.length });
+    void Promise.allSettled(
+      targets.map((dataset) =>
+        removeDataset(dataset, false).finally(() =>
+          setBulkDeleteProgress((current) =>
+            current === null ? null : { ...current, completed: current.completed + 1 },
+          ),
+        ),
+      ),
+    ).then((results) => {
+      const failedCount = results.filter((result) => result.status === "rejected").length;
+      const deletedCount = results.length - failedCount;
+      setBulkDeleteProgress(null);
+      refreshAll();
+      if (failedCount === 0) {
+        toast.success(`Deleted ${deletedCount} dataset${deletedCount === 1 ? "" : "s"}.`);
+      } else {
+        toast.error(
+          `Deleted ${deletedCount} dataset${deletedCount === 1 ? "" : "s"}; ${failedCount} failed and remain available for retry.`,
+        );
+      }
+    });
   };
 
   return (
@@ -1103,20 +1166,51 @@ export function TrainingPage(): React.JSX.Element {
                     resumable chunks.
                   </p>
                 </div>
-                <Button
-                  onClick={() =>
-                    setDatasetForm({
-                      compress: true,
-                      name: "",
-                      sourcePath: "",
-                      supportedFormats: "jsonl,json,csv,parquet,txt,md",
-                    })
-                  }
-                  size="sm"
-                >
-                  <Plus className="size-3.5" />
-                  Add dataset
-                </Button>
+                <div className="flex items-center gap-2">
+                  <Button
+                    className="text-red-400 hover:border-red-500/40 hover:bg-red-500/10"
+                    disabled={
+                      (datasets.data?.length ?? 0) === 0 ||
+                      bulkDeleteProgress !== null ||
+                      Object.values(datasetOperations).some(
+                        (operation) =>
+                          operation.kind === "delete" && operation.error === null,
+                      ) ||
+                      uploads.data?.some((upload) => upload.status === "uploading")
+                    }
+                    onClick={() =>
+                      setDatasetDeleteConfirmation({
+                        datasets: datasets.data ?? [],
+                        mode: "all",
+                      })
+                    }
+                    size="sm"
+                    variant="outline"
+                  >
+                    {bulkDeleteProgress === null ? (
+                      <Trash2 className="size-3.5" />
+                    ) : (
+                      <RefreshCw className="size-3.5 animate-spin" />
+                    )}
+                    {bulkDeleteProgress === null
+                      ? "Delete all"
+                      : `Deleting ${bulkDeleteProgress.completed}/${bulkDeleteProgress.total}`}
+                  </Button>
+                  <Button
+                    onClick={() =>
+                      setDatasetForm({
+                        compress: true,
+                        name: "",
+                        sourcePath: "",
+                        supportedFormats: "jsonl,json,csv,parquet,txt,md",
+                      })
+                    }
+                    size="sm"
+                  >
+                    <Plus className="size-3.5" />
+                    Add dataset
+                  </Button>
+                </div>
               </div>
               <Card
                 className={cn(
@@ -1324,11 +1418,12 @@ export function TrainingPage(): React.JSX.Element {
                             <Button
                               aria-label={`Delete ${dataset.name}`}
                               disabled={isDeleting || latest?.status === "uploading"}
-                              onClick={() => {
-                                if (window.confirm(`Remove dataset "${dataset.name}"?`)) {
-                                  removeDataset(dataset);
-                                }
-                              }}
+                              onClick={() =>
+                                setDatasetDeleteConfirmation({
+                                  datasets: [dataset],
+                                  mode: "single",
+                                })
+                              }
                               size="icon"
                               variant="ghost"
                             >
@@ -1720,6 +1815,67 @@ export function TrainingPage(): React.JSX.Element {
               </Button>
             </div>
           </form>
+        </Modal>
+      )}
+
+      {datasetDeleteConfirmation === null ? null : (
+        <Modal
+          onClose={() => setDatasetDeleteConfirmation(null)}
+          title={
+            datasetDeleteConfirmation.mode === "all"
+              ? "Delete all datasets?"
+              : `Delete ${datasetDeleteConfirmation.datasets[0]?.name ?? "dataset"}?`
+          }
+        >
+          <div className="space-y-4 p-5">
+            <div className="rounded-lg border border-red-500/25 bg-red-500/5 p-4">
+              <div className="flex items-start gap-3">
+                <CircleAlert className="mt-0.5 size-5 shrink-0 text-red-400" />
+                <div>
+                  <p className="text-sm font-medium">
+                    {datasetDeleteConfirmation.mode === "all"
+                      ? `${datasetDeleteConfirmation.datasets.length} datasets will be removed from Tome.`
+                      : "This dataset will be removed from Tome."}
+                  </p>
+                  <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
+                    Managed archives, upload metadata, and registered remote copies are
+                    deleted. Your original source files and folders are never deleted.
+                  </p>
+                </div>
+              </div>
+            </div>
+            {datasetDeleteConfirmation.mode === "all" ? (
+              <div className="max-h-44 overflow-auto rounded-lg border border-border bg-background/50 p-3">
+                {datasetDeleteConfirmation.datasets.map((dataset) => (
+                  <p className="truncate py-1 text-[10px]" key={dataset.id}>
+                    {dataset.name}
+                    <span className="ml-2 text-muted-foreground">
+                      {formatBytes(dataset.size)}
+                    </span>
+                  </p>
+                ))}
+              </div>
+            ) : null}
+            <div className="flex justify-end gap-2">
+              <Button
+                onClick={() => setDatasetDeleteConfirmation(null)}
+                type="button"
+                variant="outline"
+              >
+                Cancel
+              </Button>
+              <Button
+                className="bg-red-600 text-white hover:bg-red-500"
+                onClick={confirmDatasetDeletion}
+                type="button"
+              >
+                <Trash2 className="size-3.5" />
+                {datasetDeleteConfirmation.mode === "all"
+                  ? "Delete all datasets"
+                  : "Delete dataset"}
+              </Button>
+            </div>
+          </div>
         </Modal>
       )}
 
