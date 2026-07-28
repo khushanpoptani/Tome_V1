@@ -45,8 +45,10 @@ Set-ExecutionPolicy -Scope Process Bypass -Force
 (Invoke-RestMethod http://127.0.0.1:11435/v1/health).version
 ```
 
-The installer stops the existing service, replaces the executable and worker files,
-preserves `config.json`, restarts the service, and performs a health check.
+The installer stops the existing service, terminates an orphan process only when it is
+running from the installed Training Manager path, retries replacement while Windows
+releases executable or antivirus file handles, preserves `config.json`, restarts the
+service, and performs a health check.
 
 Defaults:
 

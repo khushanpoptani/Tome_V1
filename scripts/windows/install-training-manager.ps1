@@ -21,6 +21,96 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw "Run this installer from an elevated PowerShell session."
 }
 
+function Get-InstalledTrainingManagerProcesses {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetPath
+    )
+
+    $normalizedTarget = [IO.Path]::GetFullPath($TargetPath)
+    return @(
+        Get-CimInstance Win32_Process `
+            -Filter "Name = 'tome-training-manager.exe'" `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.ExecutablePath -and
+                [string]::Equals(
+                    [IO.Path]::GetFullPath($_.ExecutablePath),
+                    $normalizedTarget,
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+            }
+    )
+}
+
+function Stop-InstalledTrainingManager {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetPath,
+        [int]$KnownProcessId = 0
+    )
+
+    if ($KnownProcessId -gt 0) {
+        $normalizedTarget = [IO.Path]::GetFullPath($TargetPath)
+        $knownProcess = Get-CimInstance Win32_Process `
+            -Filter "ProcessId = $KnownProcessId" `
+            -ErrorAction SilentlyContinue
+        $isInstalledProcess = (
+            $null -ne $knownProcess -and
+            $knownProcess.ExecutablePath -and
+            [string]::Equals(
+                [IO.Path]::GetFullPath($knownProcess.ExecutablePath),
+                $normalizedTarget,
+                [StringComparison]::OrdinalIgnoreCase
+            )
+        )
+        if ($isInstalledProcess) {
+            Write-Host "Stopping Training Manager service process $KnownProcessId..."
+            Stop-Process -Id $KnownProcessId -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    foreach ($process in @(Get-InstalledTrainingManagerProcesses -TargetPath $TargetPath)) {
+        Write-Host "Stopping stale installed Training Manager process $($process.ProcessId)..."
+        Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    $runningProcesses = @(Get-InstalledTrainingManagerProcesses -TargetPath $TargetPath)
+    while ($runningProcesses.Count -gt 0) {
+        if ([DateTime]::UtcNow -ge $deadline) {
+            throw "The installed Training Manager process did not exit within 30 seconds."
+        }
+        Start-Sleep -Milliseconds 250
+        $runningProcesses = @(Get-InstalledTrainingManagerProcesses -TargetPath $TargetPath)
+    }
+}
+
+function Copy-FileWithRetry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Source,
+        [Parameter(Mandatory = $true)]
+        [string]$Destination,
+        [int]$Attempts = 20
+    )
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+            return
+        }
+        catch {
+            if ($attempt -eq $Attempts) {
+                throw "Could not replace '$Destination' after $Attempts attempts. $($_.Exception.Message)"
+            }
+
+            Write-Host "Installed executable is still busy; retrying copy ($attempt/$Attempts)..."
+            Start-Sleep -Milliseconds 750
+        }
+    }
+}
+
 foreach ($command in @("cargo", "py", "ollama")) {
     if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
         throw "Required command '$command' was not found in PATH."
@@ -39,13 +129,40 @@ finally {
 }
 
 $existingService = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-if ($null -ne $existingService -and $existingService.Status -ne "Stopped") {
-    Stop-Service -Name $serviceName -Force
-    $existingService.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
+$serviceProcessId = 0
+if ($null -ne $existingService) {
+    $serviceInstance = Get-CimInstance Win32_Service `
+        -Filter "Name = '$serviceName'" `
+        -ErrorAction SilentlyContinue
+    if ($null -ne $serviceInstance) {
+        $serviceProcessId = [int]$serviceInstance.ProcessId
+    }
 }
 
+if ($null -ne $existingService -and $existingService.Status -ne "Stopped") {
+    Write-Host "Stopping the existing Tome Training Manager service..."
+    Stop-Service -Name $serviceName -Force
+    try {
+        $existingService.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
+    }
+    catch {
+        Write-Warning "The service did not report Stopped in time; checking its exact process."
+    }
+}
+
+Stop-InstalledTrainingManager -TargetPath $binaryTarget -KnownProcessId $serviceProcessId
+
 New-Item -ItemType Directory -Force -Path $InstallRoot, $workerRoot | Out-Null
-Copy-Item -Force $binarySource $binaryTarget
+try {
+    Copy-FileWithRetry -Source $binarySource -Destination $binaryTarget
+}
+catch {
+    if ($null -ne $existingService) {
+        Write-Warning "Executable replacement failed; attempting to restore the existing service."
+        Start-Service -Name $serviceName -ErrorAction SilentlyContinue
+    }
+    throw
+}
 Copy-Item -Force (Join-Path $sourceRoot "services\training-manager\workers\train.py") $workerRoot
 Copy-Item -Force (Join-Path $sourceRoot "services\training-manager\workers\requirements.txt") $workerRoot
 
