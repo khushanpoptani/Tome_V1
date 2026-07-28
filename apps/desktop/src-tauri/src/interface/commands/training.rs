@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{BufRead, BufReader, Read},
+    io::{BufReader, Read},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -416,43 +416,44 @@ fn collect_dataset_files(
     }
 }
 
-fn validate_structured_file(path: &Path, extension: &str, errors: &mut Vec<String>) {
-    if extension == "json" {
-        match fs::read_to_string(path) {
-            Ok(content) => {
-                if let Err(error) = serde_json::from_str::<Value>(&content) {
-                    errors.push(format!("{}: invalid JSON ({error})", path.display()));
-                }
-            }
-            Err(error) => errors.push(format!("{}: could not be read ({error})", path.display())),
+fn validate_structured_file(path: &Path, extension: &str, errors: &mut Vec<String>) -> String {
+    if !matches!(extension, "json" | "jsonl") {
+        return extension.to_string();
+    }
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            errors.push(format!("{}: could not be read ({error})", path.display()));
+            return extension.to_string();
         }
-    } else if extension == "jsonl" {
-        let file = match File::open(path) {
-            Ok(file) => file,
+    };
+    let values = serde_json::Deserializer::from_reader(BufReader::new(file)).into_iter::<Value>();
+    let mut record_count = 0_usize;
+    for value in values {
+        match value {
+            Ok(_) => record_count += 1,
             Err(error) => {
-                errors.push(format!("{}: could not be read ({error})", path.display()));
-                return;
-            }
-        };
-        for (index, line) in BufReader::new(file).lines().enumerate() {
-            match line {
-                Ok(line) if line.trim().is_empty() => continue,
-                Ok(line) => {
-                    if let Err(error) = serde_json::from_str::<Value>(&line) {
-                        errors.push(format!(
-                            "{} line {}: invalid JSON ({error})",
-                            path.display(),
-                            index + 1
-                        ));
-                        break;
-                    }
-                }
-                Err(error) => {
-                    errors.push(format!("{}: could not be read ({error})", path.display()));
-                    break;
-                }
+                let format = if extension == "jsonl" || record_count > 0 {
+                    "NDJSON"
+                } else {
+                    "JSON"
+                };
+                errors.push(format!(
+                    "{} line {}: invalid {format} record ({error})",
+                    path.display(),
+                    error.line()
+                ));
+                break;
             }
         }
+    }
+    if record_count == 0 && errors.is_empty() {
+        errors.push(format!("{} contains no JSON records", path.display()));
+    }
+    if extension == "json" && record_count > 1 {
+        "jsonl".into()
+    } else {
+        extension.to_string()
     }
 }
 
@@ -565,8 +566,7 @@ fn inspect_dataset(
             .and_then(|value| value.to_str())
             .unwrap_or_default()
             .to_lowercase();
-        extensions.push(extension.clone());
-        validate_structured_file(path, &extension, &mut errors);
+        extensions.push(validate_structured_file(path, &extension, &mut errors));
         if preview.is_none()
             && matches!(extension.as_str(), "jsonl" | "json" | "csv" | "txt" | "md")
         {
@@ -2486,6 +2486,33 @@ mod tests {
         assert!(stages.contains(&"Validating Structure"));
         assert!(stages.contains(&"Compressing"));
         assert_eq!(stages.last(), Some(&"Ready for Upload"));
+        fs::remove_dir_all(&root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn detects_ndjson_records_stored_with_a_json_extension() {
+        let root = std::env::temp_dir().join(format!("tome-dataset-test-{}", Uuid::new_v4()));
+        let dataset = root.join("github-events.json");
+        fs::create_dir_all(&root).expect("test directory should be created");
+        fs::write(
+            &dataset,
+            "{\"id\":\"1\",\"body\":\"first\u{2028}second\"}\n{\"id\":\"2\",\"type\":\"IssuesEvent\"}\n",
+        )
+        .expect("test dataset should be written");
+
+        let result = inspect_dataset(
+            "github-events",
+            &dataset,
+            &["json".into()],
+            false,
+            &root,
+            |_| {},
+        )
+        .expect("dataset should be inspected");
+
+        assert_eq!(result.status, "valid");
+        assert_eq!(result.format, "jsonl");
+        assert!(result.errors.is_empty());
         fs::remove_dir_all(&root).expect("test directory should be removed");
     }
 

@@ -16,7 +16,7 @@ export function DesktopShell(): React.JSX.Element {
         <Sidebar collapsed={sidebarCollapsed} />
         <div className="flex min-w-0 flex-1">
           <main className="grid min-w-0 flex-1 grid-rows-[minmax(0,1fr)_auto] bg-workspace">
-            <div className="min-h-0 overflow-auto">
+            <div className="min-h-0 overflow-y-auto overflow-x-hidden">
               <Outlet />
             </div>
             <PromptBar />

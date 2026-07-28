@@ -1543,26 +1543,35 @@ export function TrainingPage(): React.JSX.Element {
                         )}
                         {dataset.preview === null &&
                         validationErrors.length === 0 ? null : (
-                          <details className="mt-3 text-[10px]">
+                          <details className="mt-3 min-w-0 max-w-full overflow-hidden text-[10px]">
                             <summary className="text-muted-foreground">
                               Preview and validation
                             </summary>
-                            {dataset.preview === null ? null : (
-                              <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-background p-3 font-mono text-[9px]">
-                                {dataset.preview}
-                              </pre>
-                            )}
-                            {validationErrors.slice(0, 25).map((message) => (
-                              <p className="mt-1 text-red-400" key={message}>
-                                {message}
-                              </p>
-                            ))}
-                            {validationErrors.length <= 25 ? null : (
-                              <p className="mt-2 text-muted-foreground">
-                                {validationErrors.length - 25} additional errors hidden to
-                                keep this view responsive.
-                              </p>
-                            )}
+                            <div className="mt-2 max-h-56 max-w-full overflow-auto overscroll-contain rounded-lg border border-border bg-background">
+                              {dataset.preview === null ? null : (
+                                <pre className="max-w-full whitespace-pre-wrap break-all p-3 font-mono text-[9px]">
+                                  {dataset.preview}
+                                </pre>
+                              )}
+                              {validationErrors.length === 0 ? null : (
+                                <div className="border-t border-border p-3">
+                                  {validationErrors.slice(0, 25).map((message) => (
+                                    <p
+                                      className="mt-1 break-words text-red-400 first:mt-0"
+                                      key={message}
+                                    >
+                                      {message}
+                                    </p>
+                                  ))}
+                                  {validationErrors.length <= 25 ? null : (
+                                    <p className="mt-2 text-muted-foreground">
+                                      {validationErrors.length - 25} additional errors
+                                      hidden to keep this view responsive.
+                                    </p>
+                                  )}
+                                </div>
+                              )}
+                            </div>
                           </details>
                         )}
                       </Card>
