@@ -109,36 +109,44 @@ fn map_upload(row: &Row<'_>) -> rusqlite::Result<DatasetUploadRecord> {
 }
 
 fn map_job(row: &Row<'_>) -> rusqlite::Result<TrainingJobRecord> {
+    let dataset_id = row.get::<_, String>(3)?;
+    let dataset_ids_json = row.get::<_, String>(4)?;
+    let mut dataset_ids =
+        serde_json::from_str::<Vec<String>>(&dataset_ids_json).unwrap_or_default();
+    if dataset_ids.is_empty() {
+        dataset_ids.push(dataset_id.clone());
+    }
     Ok(TrainingJobRecord {
         id: row.get(0)?,
         training_server_id: row.get(1)?,
         remote_job_id: row.get(2)?,
-        dataset_id: row.get(3)?,
-        model: row.get(4)?,
-        base_model: row.get(5)?,
-        backend: row.get(6)?,
-        parameters_json: row.get(7)?,
-        status: row.get(8)?,
-        stage: row.get(9)?,
-        progress: row.get(10)?,
-        eta_seconds: row.get(11)?,
-        started_at: row.get(12)?,
-        finished_at: row.get(13)?,
-        gpu_usage: row.get(14)?,
-        cpu_usage: row.get(15)?,
-        ram_usage: row.get(16)?,
-        disk_usage: row.get(17)?,
-        current_epoch: row.get(18)?,
-        total_epochs: row.get(19)?,
-        loss: row.get(20)?,
-        learning_rate: row.get(21)?,
-        training_speed: row.get(22)?,
-        heartbeat_at: row.get(23)?,
-        warning: row.get(24)?,
-        error: row.get(25)?,
-        retry_of: row.get(26)?,
-        created_at: row.get(27)?,
-        updated_at: row.get(28)?,
+        dataset_id,
+        dataset_ids,
+        model: row.get(5)?,
+        base_model: row.get(6)?,
+        backend: row.get(7)?,
+        parameters_json: row.get(8)?,
+        status: row.get(9)?,
+        stage: row.get(10)?,
+        progress: row.get(11)?,
+        eta_seconds: row.get(12)?,
+        started_at: row.get(13)?,
+        finished_at: row.get(14)?,
+        gpu_usage: row.get(15)?,
+        cpu_usage: row.get(16)?,
+        ram_usage: row.get(17)?,
+        disk_usage: row.get(18)?,
+        current_epoch: row.get(19)?,
+        total_epochs: row.get(20)?,
+        loss: row.get(21)?,
+        learning_rate: row.get(22)?,
+        training_speed: row.get(23)?,
+        heartbeat_at: row.get(24)?,
+        warning: row.get(25)?,
+        error: row.get(26)?,
+        retry_of: row.get(27)?,
+        created_at: row.get(28)?,
+        updated_at: row.get(29)?,
     })
 }
 
@@ -1805,8 +1813,9 @@ pub fn list_training_jobs(state: State<'_, AppState>) -> Result<Vec<TrainingJobR
     let database = state.database.lock().map_err(|error| error.to_string())?;
     let mut statement = database
         .prepare(
-            "SELECT id, training_server_id, remote_job_id, dataset_id, model, base_model, backend,
-                    parameters_json, status, stage, progress, eta_seconds, started_at,
+            "SELECT id, training_server_id, remote_job_id, dataset_id, dataset_ids_json,
+                    model, base_model, backend, parameters_json, status, stage, progress,
+                    eta_seconds, started_at,
                     finished_at, gpu_usage, cpu_usage, ram_usage, disk_usage,
                     current_epoch, total_epochs, loss, learning_rate, training_speed, heartbeat_at,
                     warning, error, retry_of, created_at, updated_at
@@ -1837,32 +1846,49 @@ pub fn save_training_job(
     if input.base_model.trim().is_empty() {
         return Err("The Ollama base model is required".into());
     }
-    let datasets = list_training_datasets(state.clone())?;
-    if !datasets
-        .iter()
-        .any(|dataset| dataset.id == input.dataset_id)
-    {
-        return Err("The selected dataset no longer exists".into());
+    let mut dataset_ids = Vec::new();
+    for value in &input.dataset_ids {
+        let id = value.trim();
+        if !id.is_empty() && !dataset_ids.iter().any(|existing| existing == id) {
+            dataset_ids.push(id.to_string());
+        }
     }
+    if dataset_ids.is_empty() {
+        return Err("Select at least one training dataset".into());
+    }
+    let datasets = list_training_datasets(state.clone())?;
+    if let Some(missing_id) = dataset_ids
+        .iter()
+        .find(|id| !datasets.iter().any(|dataset| &dataset.id == *id))
+    {
+        return Err(format!(
+            "The selected dataset {missing_id} no longer exists"
+        ));
+    }
+    let dataset_id = dataset_ids[0].clone();
+    let dataset_ids_json = serde_json::to_string(&dataset_ids)
+        .map_err(|error| format!("Could not encode selected datasets: {error}"))?;
     let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let timestamp = now();
     let database = state.database.lock().map_err(|error| error.to_string())?;
     database
         .execute(
             "INSERT INTO training_jobs(
-                id, training_server_id, dataset_id, model, base_model, backend,
+                id, training_server_id, dataset_id, dataset_ids_json, model, base_model, backend,
                 parameters_json, status, stage, total_epochs, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'draft', 'Draft', ?8, ?9, ?9)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'draft', 'Draft', ?9, ?10, ?10)
              ON CONFLICT(id) DO UPDATE SET
                 training_server_id=excluded.training_server_id,
-                dataset_id=excluded.dataset_id, model=excluded.model,
+                dataset_id=excluded.dataset_id, dataset_ids_json=excluded.dataset_ids_json,
+                model=excluded.model,
                 base_model=excluded.base_model,
                 backend=excluded.backend, parameters_json=excluded.parameters_json,
                 total_epochs=excluded.total_epochs, updated_at=excluded.updated_at",
             params![
                 id,
                 input.training_server_id,
-                input.dataset_id,
+                dataset_id,
+                dataset_ids_json,
                 input.model.trim(),
                 input.base_model.trim(),
                 input.backend.trim(),
@@ -1949,15 +1975,28 @@ pub async fn dispatch_training_job(
     if job.status != "draft" && job.status != "failed" {
         return Err("Only draft or failed jobs can be dispatched".into());
     }
-    let dataset = list_training_datasets(state.clone())?
-        .into_iter()
-        .find(|dataset| dataset.id == job.dataset_id)
-        .ok_or_else(|| "The job dataset no longer exists".to_string())?;
-    let remote_dataset_id = dataset.remote_dataset_id.ok_or_else(|| {
-        "Upload the validated dataset to the selected Training Manager before dispatching this job"
-            .to_string()
-    })?;
     let server = active_training_server(state.clone(), job.training_server_id.as_deref())?;
+    let datasets = list_training_datasets(state.clone())?;
+    let mut remote_dataset_ids = Vec::with_capacity(job.dataset_ids.len());
+    for dataset_id in &job.dataset_ids {
+        let dataset = datasets
+            .iter()
+            .find(|dataset| &dataset.id == dataset_id)
+            .ok_or_else(|| format!("The job dataset {dataset_id} no longer exists"))?;
+        let remote_dataset_id = dataset.remote_dataset_id.as_ref().ok_or_else(|| {
+            format!(
+                "Upload {} to the selected Training Manager before dispatching this job",
+                dataset.name
+            )
+        })?;
+        if dataset.training_server_id.as_deref() != Some(server.id.as_str()) {
+            return Err(format!(
+                "{} was uploaded to a different Training Manager; upload it to {}",
+                dataset.name, server.name
+            ));
+        }
+        remote_dataset_ids.push(remote_dataset_id.clone());
+    }
     let parameters = serde_json::from_str::<Value>(&job.parameters_json)
         .map_err(|error| format!("Stored training parameters are invalid: {error}"))?;
     let response = state
@@ -1966,7 +2005,8 @@ pub async fn dispatch_training_job(
         .header("Idempotency-Key", &job.id)
         .json(&json!({
             "clientJobId": job.id,
-            "datasetId": remote_dataset_id,
+            "datasetId": remote_dataset_ids[0],
+            "datasetIds": remote_dataset_ids,
             "model": job.model,
             "baseModel": job.base_model,
             "backend": job.backend,
@@ -2242,18 +2282,21 @@ pub async fn retry_training_job(
         database
             .execute(
                 "INSERT INTO training_jobs(
-                    id, training_server_id, remote_job_id, dataset_id, model, base_model, backend,
+                    id, training_server_id, remote_job_id, dataset_id, dataset_ids_json,
+                    model, base_model, backend,
                     parameters_json, status, stage, progress, started_at,
                     current_epoch, total_epochs, retry_of, created_at, updated_at
                  ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', 'Queued', 0, ?9,
-                    0, ?10, ?11, ?9, ?9
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued', 'Queued', 0, ?10,
+                    0, ?11, ?12, ?10, ?10
                  )",
                 params![
                     retry_id,
                     server.id,
                     new_remote_id,
                     source.dataset_id,
+                    serde_json::to_string(&source.dataset_ids)
+                        .map_err(|error| format!("Could not encode retry datasets: {error}"))?,
                     source.model,
                     source.base_model,
                     source.backend,

@@ -49,6 +49,7 @@ pub struct JobRecord {
     pub id: String,
     pub client_job_id: String,
     pub dataset_id: String,
+    pub dataset_ids: Vec<String>,
     pub model: String,
     pub base_model: String,
     pub backend: String,
@@ -112,6 +113,7 @@ impl Database {
                 id TEXT PRIMARY KEY,
                 client_job_id TEXT NOT NULL UNIQUE,
                 dataset_id TEXT NOT NULL,
+                dataset_ids_json TEXT NOT NULL DEFAULT '[]',
                 model TEXT NOT NULL,
                 base_model TEXT NOT NULL,
                 backend TEXT NOT NULL,
@@ -157,6 +159,34 @@ impl Database {
             VALUES (1, datetime('now'));
             "#,
         )?;
+        let has_dataset_ids = {
+            let mut statement = connection.prepare("PRAGMA table_info(jobs)")?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            columns.iter().any(|column| column == "dataset_ids_json")
+        };
+        if !has_dataset_ids {
+            connection.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                ALTER TABLE jobs
+                    ADD COLUMN dataset_ids_json TEXT NOT NULL DEFAULT '[]';
+                UPDATE jobs
+                SET dataset_ids_json='["' || dataset_id || '"]'
+                WHERE dataset_ids_json='[]';
+                INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+                VALUES (2, datetime('now'));
+                COMMIT;
+                "#,
+            )?;
+        } else {
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+                 VALUES (2, datetime('now'))",
+                [],
+            )?;
+        }
         connection.execute(
             "UPDATE jobs SET status='queued', stage='Recovering after restart',
                 warning='The Training Manager restarted; the job was re-queued',
@@ -356,7 +386,31 @@ impl Database {
                 "clientJobId, model, baseModel, and at least one epoch are required",
             ));
         }
-        self.dataset(&request.dataset_id)?;
+        let requested_dataset_ids = if request.dataset_ids.is_empty() {
+            vec![request.dataset_id.trim().to_string()]
+        } else {
+            request
+                .dataset_ids
+                .iter()
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty())
+                .collect::<Vec<_>>()
+        };
+        let mut dataset_ids = Vec::new();
+        for dataset_id in requested_dataset_ids {
+            if !dataset_ids.contains(&dataset_id) {
+                dataset_ids.push(dataset_id);
+            }
+        }
+        if dataset_ids.is_empty() {
+            return Err(ApiError::invalid("At least one datasetId is required"));
+        }
+        for dataset_id in &dataset_ids {
+            self.dataset(dataset_id)?;
+        }
+        let dataset_id = dataset_ids[0].clone();
+        let dataset_ids_json = serde_json::to_string(&dataset_ids)
+            .map_err(|error| ApiError::invalid(format!("datasetIds are invalid: {error}")))?;
         let id = Uuid::new_v4().to_string();
         let timestamp = now();
         let parameters = serde_json::to_string(&request.parameters)
@@ -367,15 +421,16 @@ impl Database {
             .map_err(|error| ApiError::internal(format!("Database lock was poisoned: {error}")))?;
         let inserted = connection.execute(
             "INSERT INTO jobs(
-                id, client_job_id, dataset_id, model, base_model, backend,
+                id, client_job_id, dataset_id, dataset_ids_json, model, base_model, backend,
                 parameters_json, status, stage, progress, current_epoch,
                 total_epochs, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', 'Queued', 0, 0, ?8, ?9, ?9)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', 'Queued', 0, 0, ?9, ?10, ?10)
              ON CONFLICT(client_job_id) DO NOTHING",
             params![
                 id,
                 request.client_job_id,
-                request.dataset_id,
+                dataset_id,
+                dataset_ids_json,
                 request.model.trim(),
                 request.base_model.trim(),
                 request.backend.trim(),
@@ -404,10 +459,10 @@ impl Database {
             .map_err(|error| ApiError::internal(format!("Database lock was poisoned: {error}")))?;
         connection.execute(
             "INSERT INTO jobs(
-                id, client_job_id, dataset_id, model, base_model, backend,
+                id, client_job_id, dataset_id, dataset_ids_json, model, base_model, backend,
                 parameters_json, status, stage, progress, current_epoch,
                 total_epochs, retry_of, created_at, updated_at
-             ) SELECT ?1, ?2, dataset_id, model, base_model, backend,
+             ) SELECT ?1, ?2, dataset_id, dataset_ids_json, model, base_model, backend,
                       parameters_json, 'queued', 'Queued', 0, 0,
                       total_epochs, id, ?3, ?3
                FROM jobs WHERE id=?4",
@@ -695,23 +750,31 @@ fn query_job_record(
     connection
         .query_row(
             &format!(
-                "SELECT id, client_job_id, dataset_id, model, base_model,
+                "SELECT id, client_job_id, dataset_id, dataset_ids_json, model, base_model,
                         backend, parameters_json, status, total_epochs
                  FROM jobs WHERE {column}=?1"
             ),
             [value],
             |row| {
-                let parameters = row.get::<_, String>(6)?;
+                let dataset_id = row.get::<_, String>(2)?;
+                let dataset_ids_json = row.get::<_, String>(3)?;
+                let mut dataset_ids =
+                    serde_json::from_str::<Vec<String>>(&dataset_ids_json).unwrap_or_default();
+                if dataset_ids.is_empty() {
+                    dataset_ids.push(dataset_id.clone());
+                }
+                let parameters = row.get::<_, String>(7)?;
                 Ok(JobRecord {
                     id: row.get(0)?,
                     client_job_id: row.get(1)?,
-                    dataset_id: row.get(2)?,
-                    model: row.get(3)?,
-                    base_model: row.get(4)?,
-                    backend: row.get(5)?,
+                    dataset_id,
+                    dataset_ids,
+                    model: row.get(4)?,
+                    base_model: row.get(5)?,
+                    backend: row.get(6)?,
                     parameters: serde_json::from_str(&parameters).unwrap_or(Value::Null),
-                    status: row.get(7)?,
-                    total_epochs: row.get(8)?,
+                    status: row.get(8)?,
+                    total_epochs: row.get(9)?,
                 })
             },
         )
@@ -722,8 +785,8 @@ fn query_job_record(
 fn query_job_snapshot(connection: &Connection, id: &str) -> ApiResult<Option<JobSnapshot>> {
     let snapshot = connection
         .query_row(
-            "SELECT id, client_job_id, dataset_id, model, base_model, backend,
-                    parameters_json, status, stage, progress, eta_seconds,
+            "SELECT id, client_job_id, dataset_id, dataset_ids_json, model, base_model,
+                    backend, parameters_json, status, stage, progress, eta_seconds,
                     current_epoch, total_epochs, gpu_usage, cpu_usage, ram_usage,
                     disk_usage, loss, learning_rate, training_speed, warning,
                     error, registered_model, started_at, finished_at, created_at, updated_at
@@ -754,39 +817,131 @@ fn query_job_snapshot(connection: &Connection, id: &str) -> ApiResult<Option<Job
 }
 
 fn map_job_snapshot(row: &Row<'_>) -> rusqlite::Result<JobSnapshot> {
-    let parameters = row.get::<_, String>(6)?;
+    let dataset_id = row.get::<_, String>(2)?;
+    let dataset_ids_json = row.get::<_, String>(3)?;
+    let mut dataset_ids =
+        serde_json::from_str::<Vec<String>>(&dataset_ids_json).unwrap_or_default();
+    if dataset_ids.is_empty() {
+        dataset_ids.push(dataset_id.clone());
+    }
+    let parameters = row.get::<_, String>(7)?;
     Ok(JobSnapshot {
         job_id: row.get(0)?,
         client_job_id: row.get(1)?,
-        dataset_id: row.get(2)?,
-        model: row.get(3)?,
-        base_model: row.get(4)?,
-        backend: row.get(5)?,
+        dataset_id,
+        dataset_ids,
+        model: row.get(4)?,
+        base_model: row.get(5)?,
+        backend: row.get(6)?,
         parameters: serde_json::from_str(&parameters).unwrap_or(Value::Null),
-        status: row.get(7)?,
-        stage: row.get(8)?,
-        progress: row.get(9)?,
-        eta_seconds: row.get(10)?,
-        current_epoch: row.get(11)?,
-        total_epochs: row.get(12)?,
-        gpu_usage: row.get(13)?,
-        cpu_usage: row.get(14)?,
-        ram_usage: row.get(15)?,
-        disk_usage: row.get(16)?,
-        loss: row.get(17)?,
-        learning_rate: row.get(18)?,
-        training_speed: row.get(19)?,
-        warning: row.get(20)?,
-        error: row.get(21)?,
-        registered_model: row.get(22)?,
-        started_at: row.get(23)?,
-        finished_at: row.get(24)?,
-        created_at: row.get(25)?,
-        updated_at: row.get(26)?,
+        status: row.get(8)?,
+        stage: row.get(9)?,
+        progress: row.get(10)?,
+        eta_seconds: row.get(11)?,
+        current_epoch: row.get(12)?,
+        total_epochs: row.get(13)?,
+        gpu_usage: row.get(14)?,
+        cpu_usage: row.get(15)?,
+        ram_usage: row.get(16)?,
+        disk_usage: row.get(17)?,
+        loss: row.get(18)?,
+        learning_rate: row.get(19)?,
+        training_speed: row.get(20)?,
+        warning: row.get(21)?,
+        error: row.get(22)?,
+        registered_model: row.get(23)?,
+        started_at: row.get(24)?,
+        finished_at: row.get(25)?,
+        created_at: row.get(26)?,
+        updated_at: row.get(27)?,
         logs: Vec::new(),
     })
 }
 
 pub fn normalize_sha256(value: &str) -> String {
     value.trim().trim_start_matches("sha256:").to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Database;
+    use crate::models::JobRequest;
+    use rusqlite::params;
+    use serde_json::json;
+    use std::fs;
+    use uuid::Uuid;
+
+    #[test]
+    fn persists_all_datasets_selected_for_one_job() {
+        let root =
+            std::env::temp_dir().join(format!("tome-training-multi-dataset-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("test directory should be created");
+        let database =
+            Database::open(&root.join("training.sqlite3")).expect("training database should open");
+        {
+            let connection = database
+                .connection
+                .lock()
+                .expect("test database should lock");
+            for id in ["one", "two"] {
+                connection
+                    .execute(
+                        "INSERT INTO uploads(
+                            id, client_upload_id, dataset_id, name, format,
+                            expected_size, expected_sha256, uploaded_bytes,
+                            chunk_size, status, partial_path, created_at, updated_at
+                         ) VALUES (?1, ?2, ?3, ?3, 'jsonl', 10, 'sha', 10, 4,
+                                   'completed', ?4, ?5, ?5)",
+                        params![
+                            format!("upload-{id}"),
+                            format!("client-upload-{id}"),
+                            id,
+                            root.join(format!("{id}.part")).to_string_lossy(),
+                            "2026-07-28T00:00:00Z"
+                        ],
+                    )
+                    .expect("test upload should be inserted");
+                connection
+                    .execute(
+                        "INSERT INTO datasets(
+                            id, source_upload_id, name, format, size, sha256,
+                            artifact_path, content_path, file_count, validation_status,
+                            created_at, updated_at
+                         ) VALUES (?1, ?2, ?1, 'jsonl', 10, 'sha', ?3, ?4, 1,
+                                   'valid', ?5, ?5)",
+                        params![
+                            id,
+                            format!("upload-{id}"),
+                            root.join(format!("{id}.zip")).to_string_lossy(),
+                            root.join(id).to_string_lossy(),
+                            "2026-07-28T00:00:00Z"
+                        ],
+                    )
+                    .expect("test dataset should be inserted");
+            }
+        }
+
+        let request = JobRequest {
+            client_job_id: "client-job".into(),
+            dataset_id: "one".into(),
+            dataset_ids: vec!["one".into(), "two".into()],
+            model: "tome-test:latest".into(),
+            base_model: "llama3.2:3b".into(),
+            backend: "lora".into(),
+            parameters: json!({"sourceModel": "meta-llama/Llama-3.2-3B"}),
+            epochs: 1,
+        };
+        let (job, inserted) = database
+            .create_job(&request)
+            .expect("multi-dataset job should be created");
+
+        assert!(inserted);
+        assert_eq!(job.dataset_ids, ["one", "two"]);
+        let snapshot = database
+            .job_snapshot(&job.id)
+            .expect("snapshot should load");
+        assert_eq!(snapshot.dataset_ids, ["one", "two"]);
+        drop(database);
+        fs::remove_dir_all(root).expect("test directory should be removed");
+    }
 }

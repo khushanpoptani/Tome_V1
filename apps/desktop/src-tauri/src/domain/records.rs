@@ -195,6 +195,7 @@ pub struct TrainingJobRecord {
     pub training_server_id: Option<String>,
     pub remote_job_id: Option<String>,
     pub dataset_id: String,
+    pub dataset_ids: Vec<String>,
     pub model: String,
     pub base_model: String,
     pub backend: String,
@@ -227,7 +228,7 @@ pub struct TrainingJobRecord {
 pub struct TrainingJobInput {
     pub id: Option<String>,
     pub training_server_id: Option<String>,
-    pub dataset_id: String,
+    pub dataset_ids: Vec<String>,
     pub model: String,
     pub base_model: String,
     pub backend: String,

@@ -361,6 +361,27 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             "#,
         )?;
     }
+
+    let has_v6 = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 6)",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if !has_v6 {
+        connection.execute_batch(
+            r#"
+            BEGIN IMMEDIATE;
+            ALTER TABLE training_jobs
+                ADD COLUMN dataset_ids_json TEXT NOT NULL DEFAULT '[]';
+            UPDATE training_jobs
+            SET dataset_ids_json='["' || dataset_id || '"]'
+            WHERE dataset_ids_json='[]';
+            INSERT INTO schema_migrations(version, applied_at)
+            VALUES (6, datetime('now'));
+            COMMIT;
+            "#,
+        )?;
+    }
     Ok(())
 }
 
@@ -386,7 +407,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("schema version should be readable");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         for table in [
             "training_servers",
             "training_datasets",
@@ -406,6 +427,7 @@ mod tests {
             "training_jobs",
             "heartbeat_failures"
         ));
+        assert!(has_column(&connection, "training_jobs", "dataset_ids_json"));
     }
 
     fn has_table(connection: &Connection, table: &str) -> bool {

@@ -40,6 +40,8 @@ pub struct CompleteUploadResponse {
 pub struct JobRequest {
     pub client_job_id: String,
     pub dataset_id: String,
+    #[serde(default)]
+    pub dataset_ids: Vec<String>,
     pub model: String,
     pub base_model: String,
     pub backend: String,
@@ -60,6 +62,7 @@ pub struct JobSnapshot {
     pub job_id: String,
     pub client_job_id: String,
     pub dataset_id: String,
+    pub dataset_ids: Vec<String>,
     pub model: String,
     pub base_model: String,
     pub backend: String,

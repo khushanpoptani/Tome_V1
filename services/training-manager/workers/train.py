@@ -45,19 +45,50 @@ def probe() -> int:
         return 1
 
 
-def read_records(dataset_path: Path, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+def read_json_records(path: Path) -> list[Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        try:
+            value = json.load(handle)
+            return value if isinstance(value, list) else [value]
+        except json.JSONDecodeError as document_error:
+            handle.seek(0)
+            records: list[Any] = []
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError as line_error:
+                    raise ValueError(
+                        f"{path} line {line_number} is neither valid JSON nor NDJSON: "
+                        f"{line_error}"
+                    ) from document_error
+            if records:
+                return records
+            raise ValueError(f"{path} contains no JSON records") from document_error
+
+
+def read_records(
+    dataset_paths: list[Path], parameters: dict[str, Any]
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    files = sorted(path for path in dataset_path.rglob("*") if path.is_file())
+    files = sorted(
+        {
+            path.resolve()
+            for dataset_path in dataset_paths
+            for path in dataset_path.rglob("*")
+            if path.is_file()
+        }
+    )
     if not files:
-        raise ValueError(f"No dataset files found under {dataset_path}")
+        raise ValueError("No dataset files found under the selected datasets")
     for path in files:
         suffix = path.suffix.lower()
         if suffix == ".jsonl":
             with path.open("r", encoding="utf-8") as handle:
                 records.extend(json.loads(line) for line in handle if line.strip())
         elif suffix == ".json":
-            value = json.loads(path.read_text(encoding="utf-8"))
-            records.extend(value if isinstance(value, list) else [value])
+            records.extend(read_json_records(path))
         elif suffix == ".csv":
             with path.open("r", encoding="utf-8", newline="") as handle:
                 records.extend(dict(row) for row in csv.DictReader(handle))
@@ -117,7 +148,8 @@ def run(spec_path: Path) -> int:
     source_model = str(parameters.get("sourceModel") or spec["baseModel"])
     output_path = Path(spec["outputPath"]).resolve()
     checkpoints = output_path.parent / "checkpoints"
-    dataset_path = Path(spec["datasetPath"]).resolve()
+    raw_dataset_paths = spec.get("datasetPaths") or [spec["datasetPath"]]
+    dataset_paths = [Path(value).resolve() for value in raw_dataset_paths]
     epochs = int(spec["epochs"])
     backend = str(spec.get("backend", "lora")).lower()
     if epochs < 1:
@@ -125,8 +157,12 @@ def run(spec_path: Path) -> int:
     if backend not in {"transformers", "peft", "lora", "qlora"}:
         raise ValueError(f"Unsupported worker backend: {backend}")
 
-    emit("log", level="info", message=f"Loading dataset from {dataset_path}")
-    records = read_records(dataset_path, parameters)
+    emit(
+        "log",
+        level="info",
+        message=f"Loading {len(dataset_paths)} selected dataset(s)",
+    )
+    records = read_records(dataset_paths, parameters)
     emit("log", level="info", message=f"Validated {len(records)} training records")
     dataset = Dataset.from_list(records)
 

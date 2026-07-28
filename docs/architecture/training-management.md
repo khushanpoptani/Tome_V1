@@ -197,9 +197,11 @@ stateDiagram-v2
     Cancelled --> [*]
 ```
 
-Training parameters are stored as versioned JSON plus normalized summary fields. A job
-specification is immutable after dispatch. Retrying creates a new attempt linked to the
-original job.
+Training parameters are stored as versioned JSON plus normalized summary fields. A job may
+reference one or more datasets; `datasetIds` preserves the ordered selection and the
+worker combines those datasets into one corpus before tokenization. Every selected dataset
+must be valid and registered on the same Training Manager. A job specification is
+immutable after dispatch. Retrying creates a new attempt linked to the original job.
 
 ## ETA estimation
 

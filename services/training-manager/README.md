@@ -13,6 +13,7 @@ with it over `tome-training/v1`; the desktop never computes gradients.
   validation
 - SQLite-backed upload sessions, datasets, immutable job attempts, logs, and restart
   recovery
+- multi-dataset job specifications that combine every selected dataset in one worker run
 - bounded job concurrency and process cancellation
 - NVIDIA, CPU, RAM, disk, and queue telemetry
 - a real Hugging Face Transformers + PEFT worker for LoRA and QLoRA
@@ -82,3 +83,8 @@ $env:TOME_TRAINING_CONFIG = "C:\ProgramData\Tome\TrainingManager\config.json"
 
 No installation or diagnostic command starts a training job. A job begins only after a
 user dispatches a validated job draft from Tome.
+
+`POST /v1/jobs` accepts both the compatibility `datasetId` field and `datasetIds`. When
+`datasetIds` contains more than one registered dataset, the worker reads their content
+paths as one combined training corpus. Every selected dataset must already be valid and
+uploaded to this Training Manager.

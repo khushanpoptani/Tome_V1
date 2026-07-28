@@ -210,9 +210,16 @@ async fn run_job(state: Arc<AppState>, id: &str) -> ApiResult<()> {
     }
     validate_backend(&job.backend)?;
     registry::validate_adapter_compatibility(&job.base_model, &job.parameters)?;
-    let dataset = state.database.dataset(&job.dataset_id)?;
-    if dataset.validation_status != "valid" {
-        return Err(ApiError::conflict("Training dataset is not valid"));
+    let mut datasets = Vec::with_capacity(job.dataset_ids.len());
+    for dataset_id in &job.dataset_ids {
+        let dataset = state.database.dataset(dataset_id)?;
+        if dataset.validation_status != "valid" {
+            return Err(ApiError::conflict(format!(
+                "Training dataset {} is not valid",
+                dataset.name
+            )));
+        }
+        datasets.push(dataset);
     }
     let cancellation = Arc::new(AtomicBool::new(false));
     state
@@ -228,9 +235,14 @@ async fn run_job(state: Arc<AppState>, id: &str) -> ApiResult<()> {
     let output_dir = job_dir.join("output");
     fs::create_dir_all(&output_dir).await?;
     let specification_path = job_dir.join("specification.json");
+    let dataset_paths = datasets
+        .iter()
+        .map(|dataset| dataset.content_path.clone())
+        .collect::<Vec<_>>();
     let specification = serde_json::json!({
         "jobId": job.id,
-        "datasetPath": dataset.content_path,
+        "datasetPath": dataset_paths[0],
+        "datasetPaths": dataset_paths,
         "outputPath": output_dir,
         "model": job.model,
         "baseModel": job.base_model,

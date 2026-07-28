@@ -16,6 +16,7 @@ import { errorMessage, formatBytes, formatDate } from "@/lib/format";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type {
+  OllamaModel,
   TrainingDatasetRecord,
   TrainingJobRecord,
   TrainingStreamEvent,
@@ -27,6 +28,7 @@ import {
   Ban,
   CheckCircle2,
   CircleAlert,
+  CircleHelp,
   Clock3,
   Database,
   FileArchive,
@@ -88,7 +90,7 @@ interface DatasetPreparationInput {
 }
 
 interface JobForm {
-  readonly datasetId: string;
+  readonly datasetIds: readonly string[];
   readonly model: string;
   readonly baseModel: string;
   readonly backend: string;
@@ -184,6 +186,19 @@ function StatusBadge({ value }: { readonly value: string }): React.JSX.Element {
   return <Badge className={tone}>{value}</Badge>;
 }
 
+function FieldHelp({
+  children,
+}: {
+  readonly children: React.ReactNode;
+}): React.JSX.Element {
+  return (
+    <span className="flex gap-1.5 text-[9px] leading-relaxed text-muted-foreground">
+      <CircleHelp className="mt-0.5 size-3 shrink-0" />
+      <span>{children}</span>
+    </span>
+  );
+}
+
 function parseValidationErrors(dataset: TrainingDatasetRecord): readonly string[] {
   try {
     const value: unknown = JSON.parse(dataset.validationErrorsJson);
@@ -193,6 +208,25 @@ function parseValidationErrors(dataset: TrainingDatasetRecord): readonly string[
   } catch {
     return ["Validation details could not be decoded."];
   }
+}
+
+function supportsOllamaAdapter(model: OllamaModel): boolean {
+  const modelName = `${model.name} ${model.model}`.toLowerCase();
+  if (["smollm", "qwen", "phi"].some((family) => modelName.includes(family))) {
+    return false;
+  }
+  if (
+    ["llama", "mistral", "mixtral", "gemma"].some((family) => modelName.includes(family))
+  ) {
+    return true;
+  }
+  const descriptor = [model.details?.family, ...(model.details?.families ?? [])]
+    .filter((value): value is string => typeof value === "string")
+    .join(" ")
+    .toLowerCase();
+  return ["llama", "mistral", "mixtral", "gemma"].some((family) =>
+    descriptor.includes(family),
+  );
 }
 
 export function TrainingPage(): React.JSX.Element {
@@ -227,6 +261,18 @@ export function TrainingPage(): React.JSX.Element {
     enabled: isTauriRuntime(),
     queryFn: backend.listTrainingServers,
     queryKey: ["training-servers"],
+  });
+  const ollamaServer = useQuery({
+    enabled: isTauriRuntime(),
+    queryFn: backend.getActiveServer,
+    queryKey: ["active-server"],
+  });
+  const ollamaModels = useQuery({
+    enabled:
+      isTauriRuntime() && ollamaServer.data !== null && ollamaServer.data !== undefined,
+    queryFn: () => backend.listModels(ollamaServer.data?.url ?? ""),
+    queryKey: ["models", ollamaServer.data?.url],
+    refetchInterval: 30_000,
   });
   const datasets = useQuery({
     enabled: isTauriRuntime(),
@@ -678,6 +724,14 @@ export function TrainingPage(): React.JSX.Element {
     },
   });
 
+  const selectableDatasets = useMemo(
+    () => (datasets.data ?? []).filter((dataset) => dataset.validationStatus === "valid"),
+    [datasets.data],
+  );
+  const compatibleOllamaModels = useMemo(
+    () => (ollamaModels.data ?? []).filter(supportsOllamaAdapter),
+    [ollamaModels.data],
+  );
   const visibleJobs = useMemo(() => {
     const all = jobs.data ?? [];
     if (section === "running") {
@@ -1596,18 +1650,21 @@ export function TrainingPage(): React.JSX.Element {
                 </div>
                 {section === "jobs" ? (
                   <Button
-                    disabled={(datasets.data?.length ?? 0) === 0}
-                    onClick={() =>
+                    disabled={selectableDatasets.length === 0}
+                    onClick={() => {
+                      const defaultBaseModel = compatibleOllamaModels[0]?.name ?? "";
                       setJobForm({
                         backend: "auto",
-                        baseModel: "",
-                        datasetId: datasets.data?.[0]?.id ?? "",
+                        baseModel: defaultBaseModel,
+                        datasetIds: selectableDatasets[0]
+                          ? [selectableDatasets[0].id]
+                          : [],
                         model: "",
                         parametersJson:
                           '{\n  "sourceModel": "meta-llama/Llama-3.2-3B",\n  "ollamaAdapterArchitecture": "llama",\n  "learningRate": 0.0002,\n  "batchSize": 2,\n  "maxLength": 2048,\n  "loraRank": 16\n}',
                         totalEpochs: 3,
-                      })
-                    }
+                      });
+                    }}
                     size="sm"
                   >
                     <Plus className="size-3.5" />
@@ -1631,8 +1688,8 @@ export function TrainingPage(): React.JSX.Element {
                 <div className="grid gap-3">
                   {visibleJobs.map((job) => (
                     <JobCard
-                      dataset={datasets.data?.find(
-                        (dataset) => dataset.id === job.datasetId,
+                      datasets={(datasets.data ?? []).filter((dataset) =>
+                        job.datasetIds.includes(dataset.id),
                       )}
                       job={job}
                       key={job.id}
@@ -1975,7 +2032,7 @@ export function TrainingPage(): React.JSX.Element {
         <Modal
           onClose={() => setJobForm(null)}
           title="New training job draft"
-          width="max-w-xl"
+          width="max-w-2xl"
         >
           <form
             className="space-y-4 p-5"
@@ -1987,24 +2044,64 @@ export function TrainingPage(): React.JSX.Element {
               });
             }}
           >
+            <div className="space-y-1.5 text-xs">
+              <div className="flex items-center justify-between gap-3">
+                <span>Training datasets</span>
+                <label className="flex cursor-pointer items-center gap-2 text-[10px] text-muted-foreground">
+                  <input
+                    checked={
+                      selectableDatasets.length > 0 &&
+                      selectableDatasets.every((dataset) =>
+                        jobForm.datasetIds.includes(dataset.id),
+                      )
+                    }
+                    className="accent-violet-500"
+                    onChange={(event) =>
+                      setJobForm({
+                        ...jobForm,
+                        datasetIds: event.target.checked
+                          ? selectableDatasets.map((dataset) => dataset.id)
+                          : [],
+                      })
+                    }
+                    type="checkbox"
+                  />
+                  Select all ({selectableDatasets.length})
+                </label>
+              </div>
+              <div className="max-h-40 overflow-y-auto overscroll-contain rounded-lg border border-border bg-background p-2">
+                {selectableDatasets.map((dataset) => (
+                  <label
+                    className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 hover:bg-secondary"
+                    key={dataset.id}
+                  >
+                    <input
+                      checked={jobForm.datasetIds.includes(dataset.id)}
+                      className="accent-violet-500"
+                      onChange={(event) =>
+                        setJobForm({
+                          ...jobForm,
+                          datasetIds: event.target.checked
+                            ? [...jobForm.datasetIds, dataset.id]
+                            : jobForm.datasetIds.filter((id) => id !== dataset.id),
+                        })
+                      }
+                      type="checkbox"
+                    />
+                    <span className="min-w-0 flex-1 truncate">{dataset.name}</span>
+                    <span className="shrink-0 text-[9px] text-muted-foreground">
+                      {formatBytes(dataset.size)}
+                    </span>
+                  </label>
+                ))}
+              </div>
+              <FieldHelp>
+                Select one or more validated datasets. Select all combines every checked
+                dataset into one training run; each must be uploaded to the same Training
+                Manager before dispatch.
+              </FieldHelp>
+            </div>
             <div className="grid gap-4 sm:grid-cols-2">
-              <label className="block space-y-1.5 text-xs">
-                <span>Dataset</span>
-                <select
-                  className={inputClassName}
-                  onChange={(event) =>
-                    setJobForm({ ...jobForm, datasetId: event.target.value })
-                  }
-                  required
-                  value={jobForm.datasetId}
-                >
-                  {datasets.data?.map((dataset) => (
-                    <option key={dataset.id} value={dataset.id}>
-                      {dataset.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
               <label className="block space-y-1.5 text-xs">
                 <span>Output Ollama model</span>
                 <input
@@ -2016,18 +2113,43 @@ export function TrainingPage(): React.JSX.Element {
                   required
                   value={jobForm.model}
                 />
+                <FieldHelp>
+                  The new Ollama name created after training, such as{" "}
+                  <code>tome-github:latest</code>. This is an output name, so it is typed
+                  rather than selected.
+                </FieldHelp>
               </label>
               <label className="block space-y-1.5 text-xs">
                 <span>Installed Ollama base model</span>
-                <input
+                <select
                   className={inputClassName}
                   onChange={(event) =>
                     setJobForm({ ...jobForm, baseModel: event.target.value })
                   }
-                  placeholder="llama3.2:3b"
                   required
                   value={jobForm.baseModel}
-                />
+                >
+                  <option value="">
+                    {ollamaServer.data === null
+                      ? "No active Ollama server"
+                      : compatibleOllamaModels.length === 0
+                        ? "No adapter-compatible models installed"
+                        : "Select an installed model"}
+                  </option>
+                  {compatibleOllamaModels.map((model) => (
+                    <option key={model.name} value={model.name}>
+                      {model.name}
+                      {model.details?.parameter_size
+                        ? ` · ${model.details.parameter_size}`
+                        : ""}
+                    </option>
+                  ))}
+                </select>
+                <FieldHelp>
+                  The installed Ollama model used as the base when Tome registers the
+                  trained adapter. Only currently supported Llama, Mistral/Mixtral, and
+                  Gemma models are shown.
+                </FieldHelp>
               </label>
               <label className="block space-y-1.5 text-xs">
                 <span>Backend adapter</span>
@@ -2044,6 +2166,10 @@ export function TrainingPage(): React.JSX.Element {
                   <option value="peft">PEFT</option>
                   <option value="transformers">Hugging Face Transformers</option>
                 </select>
+                <FieldHelp>
+                  Auto/LoRA trains a small adapter. QLoRA reduces GPU memory with 4-bit
+                  loading. Transformers uses the general worker path.
+                </FieldHelp>
               </label>
               <label className="block space-y-1.5 text-xs">
                 <span>Epochs</span>
@@ -2060,6 +2186,10 @@ export function TrainingPage(): React.JSX.Element {
                   type="number"
                   value={jobForm.totalEpochs}
                 />
+                <FieldHelp>
+                  One epoch is one complete pass through all selected records. More epochs
+                  increase time and overfitting risk.
+                </FieldHelp>
               </label>
             </div>
             <label className="block space-y-1.5 text-xs">
@@ -2072,18 +2202,55 @@ export function TrainingPage(): React.JSX.Element {
                 required
                 value={jobForm.parametersJson}
               />
-              <span className="block text-[9px] leading-relaxed text-muted-foreground">
-                <code>sourceModel</code> is the Hugging Face model used by the training
-                worker. The installed Ollama base model is used when the adapter is
-                registered after successful training. Ollama currently documents
-                Safetensors adapter registration for Llama, Mistral/Mixtral, and Gemma.
-              </span>
+              <FieldHelp>
+                Advanced worker configuration. It must remain valid JSON; unknown keys are
+                ignored by the current worker.
+              </FieldHelp>
             </label>
+            <dl className="grid gap-x-4 gap-y-2 rounded-lg border border-border bg-background p-3 text-[9px] sm:grid-cols-[auto_1fr]">
+              <dt className="font-mono text-foreground">sourceModel</dt>
+              <dd className="text-muted-foreground">
+                Hugging Face model ID loaded for training. It must be compatible with the
+                selected Ollama base model.
+              </dd>
+              <dt className="font-mono text-foreground">ollamaAdapterArchitecture</dt>
+              <dd className="text-muted-foreground">
+                Adapter family used during Ollama registration: currently llama, mistral,
+                mixtral, or gemma.
+              </dd>
+              <dt className="font-mono text-foreground">learningRate</dt>
+              <dd className="text-muted-foreground">
+                Optimizer step size. Lower values are safer but learn more slowly.
+              </dd>
+              <dt className="font-mono text-foreground">batchSize</dt>
+              <dd className="text-muted-foreground">
+                Records processed per training step on each device; higher values require
+                more GPU memory.
+              </dd>
+              <dt className="font-mono text-foreground">maxLength</dt>
+              <dd className="text-muted-foreground">
+                Maximum tokens retained from each record. Longer values increase memory
+                and training time.
+              </dd>
+              <dt className="font-mono text-foreground">loraRank</dt>
+              <dd className="text-muted-foreground">
+                LoRA adapter capacity. Higher ranks can learn more but create larger,
+                slower adapters.
+              </dd>
+            </dl>
+            <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-3 text-[9px] leading-relaxed text-amber-200">
+              Training records must contain a text field or a prompt and response pair.
+              Raw GitHub event objects need preprocessing or matching field parameters
+              before the worker can train on them.
+            </div>
             <div className="flex justify-end gap-2">
               <Button onClick={() => setJobForm(null)} type="button" variant="outline">
                 Cancel
               </Button>
-              <Button disabled={saveJob.isPending} type="submit">
+              <Button
+                disabled={saveJob.isPending || jobForm.datasetIds.length === 0}
+                type="submit"
+              >
                 Save draft
               </Button>
             </div>
@@ -2095,12 +2262,12 @@ export function TrainingPage(): React.JSX.Element {
 }
 
 function JobCard({
-  dataset,
+  datasets,
   job,
   onAction,
   pending,
 }: {
-  readonly dataset: TrainingDatasetRecord | undefined;
+  readonly datasets: readonly TrainingDatasetRecord[];
   readonly job: TrainingJobRecord;
   readonly onAction: (
     action: "cancel" | "delete" | "dispatch" | "refresh" | "retry",
@@ -2123,15 +2290,22 @@ function JobCard({
             <Badge>{job.backend}</Badge>
           </div>
           <p className="mt-1 text-[10px] text-muted-foreground">
-            {job.model} ← {job.baseModel} · {dataset?.name ?? "Missing dataset"} ·{" "}
-            {job.stage} · Epoch {job.currentEpoch}/{job.totalEpochs} · ETA{" "}
+            {job.model} ← {job.baseModel} ·{" "}
+            {datasets.length === 1
+              ? datasets[0]?.name
+              : `${datasets.length}/${job.datasetIds.length} datasets`}{" "}
+            · {job.stage} · Epoch {job.currentEpoch}/{job.totalEpochs} · ETA{" "}
             {duration(job.etaSeconds)}
           </p>
         </div>
         <div className="flex flex-wrap gap-1">
           {job.status === "draft" || job.status === "failed" ? (
             <Button
-              disabled={pending || dataset?.remoteDatasetId === null}
+              disabled={
+                pending ||
+                datasets.length !== job.datasetIds.length ||
+                datasets.some((dataset) => dataset.remoteDatasetId === null)
+              }
               onClick={() => onAction("dispatch")}
               size="sm"
             >

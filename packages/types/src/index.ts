@@ -285,6 +285,7 @@ export interface TrainingJobRecord {
   readonly trainingServerId: string | null;
   readonly remoteJobId: string | null;
   readonly datasetId: string;
+  readonly datasetIds: readonly string[];
   readonly model: string;
   readonly baseModel: string;
   readonly backend: string;
@@ -315,7 +316,7 @@ export interface TrainingJobRecord {
 export interface TrainingJobInput {
   readonly id?: string;
   readonly trainingServerId?: string | null;
-  readonly datasetId: string;
+  readonly datasetIds: readonly string[];
   readonly model: string;
   readonly baseModel: string;
   readonly backend: string;
