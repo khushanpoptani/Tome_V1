@@ -244,9 +244,12 @@ pub fn set_active_training_server(state: State<'_, AppState>, id: String) -> Res
 #[tauri::command]
 pub fn delete_training_server(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let database = state.database.lock().map_err(|error| error.to_string())?;
-    database
+    let affected = database
         .execute("DELETE FROM training_servers WHERE id = ?1", [id])
         .map_err(|error| database_error("deleting training server", error))?;
+    if affected == 0 {
+        return Err("The selected training server no longer exists".into());
+    }
     Ok(())
 }
 
@@ -1918,9 +1921,12 @@ pub fn delete_training_job(state: State<'_, AppState>, id: String) -> Result<(),
         return Err("Active jobs must be cancelled before they can be removed".into());
     }
     let database = state.database.lock().map_err(|error| error.to_string())?;
-    database
+    let affected = database
         .execute("DELETE FROM training_jobs WHERE id = ?1", [id])
         .map_err(|error| database_error("deleting training job", error))?;
+    if affected == 0 {
+        return Err("The selected training job no longer exists".into());
+    }
     Ok(())
 }
 

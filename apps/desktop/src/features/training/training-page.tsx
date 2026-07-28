@@ -115,6 +115,20 @@ interface DatasetDeleteConfirmation {
   readonly mode: "all" | "single";
 }
 
+type TrainingDeleteConfirmation =
+  | {
+      readonly id: string;
+      readonly isActive: boolean;
+      readonly kind: "server";
+      readonly name: string;
+    }
+  | {
+      readonly id: string;
+      readonly kind: "job";
+      readonly model: string;
+      readonly status: TrainingJobRecord["status"];
+    };
+
 function percent(value: number | null | undefined): string {
   return `${Math.round(Math.max(0, Math.min(100, value ?? 0)))}%`;
 }
@@ -236,8 +250,15 @@ export function TrainingPage(): React.JSX.Element {
   const [datasetForm, setDatasetForm] = useState<DatasetForm | null>(null);
   const [datasetDeleteConfirmation, setDatasetDeleteConfirmation] =
     useState<DatasetDeleteConfirmation | null>(null);
+  const [trainingDeleteConfirmation, setTrainingDeleteConfirmation] =
+    useState<TrainingDeleteConfirmation | null>(null);
   const [bulkDeleteProgress, setBulkDeleteProgress] = useState<{
     readonly completed: number;
+    readonly total: number;
+  } | null>(null);
+  const [bulkUploadProgress, setBulkUploadProgress] = useState<{
+    readonly completed: number;
+    readonly failed: number;
     readonly total: number;
   } | null>(null);
   const [jobForm, setJobForm] = useState<JobForm | null>(null);
@@ -674,6 +695,9 @@ export function TrainingPage(): React.JSX.Element {
     },
     onError: (error) => toast.error(errorMessage(error)),
     onSuccess: (_, value) => {
+      if (value.action === "delete") {
+        setTrainingDeleteConfirmation(null);
+      }
       refreshAll();
       toast.success(
         value.action === "test"
@@ -715,6 +739,9 @@ export function TrainingPage(): React.JSX.Element {
     },
     onError: (error) => toast.error(errorMessage(error)),
     onSuccess: (_, value) => {
+      if (value.action === "delete") {
+        setTrainingDeleteConfirmation(null);
+      }
       refreshAll();
       toast.success(
         value.action === "dispatch"
@@ -727,6 +754,16 @@ export function TrainingPage(): React.JSX.Element {
   const selectableDatasets = useMemo(
     () => (datasets.data ?? []).filter((dataset) => dataset.validationStatus === "valid"),
     [datasets.data],
+  );
+  const pendingUploadDatasets = useMemo(
+    () =>
+      selectableDatasets.filter(
+        (dataset) =>
+          activeServer !== null &&
+          (dataset.remoteDatasetId === null ||
+            dataset.trainingServerId !== activeServer.id),
+      ),
+    [activeServer, selectableDatasets],
   );
   const compatibleOllamaModels = useMemo(
     () => (ollamaModels.data ?? []).filter(supportsOllamaAdapter),
@@ -769,86 +806,102 @@ export function TrainingPage(): React.JSX.Element {
       .filter((value): value is number => value !== null)
       .sort((left, right) => left - right)[0] ?? null;
 
-  const beginUpload = (dataset: TrainingDatasetRecord): void => {
+  const beginUpload = async (
+    dataset: TrainingDatasetRecord,
+    notify = true,
+  ): Promise<boolean> => {
     if (activeServer === null) {
-      toast.error("Configure and activate an external Training Manager first.");
-      return;
+      if (notify) {
+        toast.error("Configure and activate an external Training Manager first.");
+      }
+      return false;
     }
-    toast.info(`Upload started for ${dataset.name}.`);
+    if (notify) {
+      toast.info(`Upload started for ${dataset.name}.`);
+    }
     let taskId: string | null = null;
     let lastOperationEvent: OperationProgressEvent | null = null;
-    void startDatasetUpload(dataset.id, activeServer.id, (event) => {
-      setUploadProgress((current) => ({ ...current, [dataset.id]: event }));
-      if (event.type === "operationProgress") {
-        taskId = event.operationId;
-        lastOperationEvent = event;
-        persistOperationTask(
-          event.operationId,
-          "dataset-upload",
-          `Upload ${dataset.name}`,
-          event,
-        );
-        if (event.stage === "Server Validation") {
-          toast.info(`Upload complete. Validating ${dataset.name} on the server…`);
-        }
-      } else if (event.type === "uploadProgress") {
-        taskId = event.uploadId;
-        const progressEvent: OperationProgressEvent = {
-          bytesProcessed: event.bytesUploaded,
-          currentFile: dataset.artifactPath ?? dataset.sourcePath,
-          message: `${formatBytes(event.bytesUploaded)} of ${formatBytes(event.totalBytes)}`,
-          operationId: event.uploadId,
-          progress: event.progress,
-          stage: "Uploading",
-          totalBytes: event.totalBytes,
-          type: "operationProgress",
-        };
-        lastOperationEvent = progressEvent;
-        persistOperationTask(
-          event.uploadId,
-          "dataset-upload",
-          `Upload ${dataset.name}`,
-          progressEvent,
-        );
-      } else if (event.type === "complete") {
-        if (taskId !== null && lastOperationEvent !== null) {
+    try {
+      await startDatasetUpload(dataset.id, activeServer.id, (event) => {
+        setUploadProgress((current) => ({ ...current, [dataset.id]: event }));
+        if (event.type === "operationProgress") {
+          taskId = event.operationId;
+          lastOperationEvent = event;
           persistOperationTask(
-            taskId,
+            event.operationId,
             "dataset-upload",
             `Upload ${dataset.name}`,
-            { ...lastOperationEvent, message: event.message, progress: 100 },
-            "completed",
+            event,
           );
-        }
-        toast.success(event.message);
-        refreshAll();
-      } else if (event.type === "error") {
-        if (taskId !== null && lastOperationEvent !== null) {
+          if (notify && event.stage === "Server Validation") {
+            toast.info(`Upload complete. Validating ${dataset.name} on the server…`);
+          }
+        } else if (event.type === "uploadProgress") {
+          taskId = event.uploadId;
+          const progressEvent: OperationProgressEvent = {
+            bytesProcessed: event.bytesUploaded,
+            currentFile: dataset.artifactPath ?? dataset.sourcePath,
+            message: `${formatBytes(event.bytesUploaded)} of ${formatBytes(event.totalBytes)}`,
+            operationId: event.uploadId,
+            progress: event.progress,
+            stage: "Uploading",
+            totalBytes: event.totalBytes,
+            type: "operationProgress",
+          };
+          lastOperationEvent = progressEvent;
           persistOperationTask(
-            taskId,
+            event.uploadId,
             "dataset-upload",
             `Upload ${dataset.name}`,
-            lastOperationEvent,
-            "failed",
-            event.message,
+            progressEvent,
           );
+        } else if (event.type === "complete") {
+          if (taskId !== null && lastOperationEvent !== null) {
+            persistOperationTask(
+              taskId,
+              "dataset-upload",
+              `Upload ${dataset.name}`,
+              { ...lastOperationEvent, message: event.message, progress: 100 },
+              "completed",
+            );
+          }
+          if (notify) {
+            toast.success(event.message);
+          }
+          refreshAll();
+        } else if (event.type === "error") {
+          if (taskId !== null && lastOperationEvent !== null) {
+            persistOperationTask(
+              taskId,
+              "dataset-upload",
+              `Upload ${dataset.name}`,
+              lastOperationEvent,
+              "failed",
+              event.message,
+            );
+          }
+          if (notify) {
+            toast.error(event.message);
+          }
+          refreshAll();
+        } else if (event.type === "cancelled") {
+          if (taskId !== null && lastOperationEvent !== null) {
+            persistOperationTask(
+              taskId,
+              "dataset-upload",
+              `Upload ${dataset.name}`,
+              { ...lastOperationEvent, message: "Upload cancelled" },
+              "cancelled",
+            );
+          }
+          if (notify) {
+            toast.info(`${dataset.name} upload cancelled.`);
+          }
+          refreshAll();
         }
-        toast.error(event.message);
-        refreshAll();
-      } else if (event.type === "cancelled") {
-        if (taskId !== null && lastOperationEvent !== null) {
-          persistOperationTask(
-            taskId,
-            "dataset-upload",
-            `Upload ${dataset.name}`,
-            { ...lastOperationEvent, message: "Upload cancelled" },
-            "cancelled",
-          );
-        }
-        toast.info(`${dataset.name} upload cancelled.`);
-        refreshAll();
-      }
-    }).catch((error: unknown) => {
+      });
+      return true;
+    } catch (error: unknown) {
       const message = errorMessage(error);
       if (taskId !== null && lastOperationEvent !== null) {
         persistOperationTask(
@@ -860,9 +913,54 @@ export function TrainingPage(): React.JSX.Element {
           message,
         );
       }
-      toast.error(`Upload failed: ${message}`);
+      if (notify) {
+        toast.error(`Upload failed: ${message}`);
+      }
       refreshAll();
-    });
+      return false;
+    }
+  };
+
+  const uploadDatasetsSequentially = async (
+    targets: readonly TrainingDatasetRecord[],
+  ): Promise<void> => {
+    if (activeServer === null || activeServer.status !== "connected") {
+      toast.error("Connect and activate the Training Manager before uploading.");
+      return;
+    }
+    if (targets.length === 0) {
+      toast.info("Every valid dataset is already uploaded to the active server.");
+      return;
+    }
+    setBulkUploadProgress({ completed: 0, failed: 0, total: targets.length });
+    toast.info(
+      `Queued ${targets.length} dataset${targets.length === 1 ? "" : "s"} for upload.`,
+    );
+    let failed = 0;
+    for (const dataset of targets) {
+      const uploaded = await beginUpload(dataset, false);
+      if (!uploaded) failed += 1;
+      setBulkUploadProgress((current) =>
+        current === null
+          ? null
+          : {
+              ...current,
+              completed: current.completed + 1,
+              failed,
+            },
+      );
+    }
+    setBulkUploadProgress(null);
+    refreshAll();
+    if (failed === 0) {
+      toast.success(
+        `${targets.length} dataset${targets.length === 1 ? "" : "s"} uploaded and registered.`,
+      );
+    } else {
+      toast.error(
+        `${targets.length - failed} uploads completed; ${failed} failed. Open Datasets to inspect and retry them.`,
+      );
+    }
   };
 
   const removeDataset = (
@@ -1192,18 +1290,25 @@ export function TrainingPage(): React.JSX.Element {
                           </Button>
                           <Button
                             aria-label={`Delete ${server.name}`}
-                            onClick={() => {
-                              if (window.confirm(`Remove "${server.name}"?`)) {
-                                serverAction.mutate({
-                                  action: "delete",
-                                  id: server.id,
-                                });
-                              }
-                            }}
+                            disabled={serverAction.isPending}
+                            onClick={() =>
+                              setTrainingDeleteConfirmation({
+                                id: server.id,
+                                isActive: server.isActive,
+                                kind: "server",
+                                name: server.name,
+                              })
+                            }
                             size="icon"
                             variant="ghost"
                           >
-                            <Trash2 className="size-3.5" />
+                            {serverAction.isPending &&
+                            serverAction.variables?.action === "delete" &&
+                            serverAction.variables.id === server.id ? (
+                              <RefreshCw className="size-3.5 animate-spin" />
+                            ) : (
+                              <Trash2 className="size-3.5" />
+                            )}
                           </Button>
                         </div>
                       </Card>
@@ -1225,6 +1330,36 @@ export function TrainingPage(): React.JSX.Element {
                   </p>
                 </div>
                 <div className="flex items-center gap-2">
+                  <Button
+                    disabled={
+                      activeServer === null ||
+                      activeServer.status !== "connected" ||
+                      pendingUploadDatasets.length === 0 ||
+                      bulkUploadProgress !== null ||
+                      uploads.data?.some((upload) => upload.status === "uploading")
+                    }
+                    onClick={() => {
+                      void uploadDatasetsSequentially(pendingUploadDatasets);
+                    }}
+                    size="sm"
+                    title={
+                      activeServer === null || activeServer.status !== "connected"
+                        ? "Connect the active Training Manager first"
+                        : pendingUploadDatasets.length === 0
+                          ? "All valid datasets are uploaded"
+                          : `Upload ${pendingUploadDatasets.length} dataset${pendingUploadDatasets.length === 1 ? "" : "s"} to ${activeServer.name}`
+                    }
+                    variant="outline"
+                  >
+                    {bulkUploadProgress === null ? (
+                      <UploadCloud className="size-3.5" />
+                    ) : (
+                      <RefreshCw className="size-3.5 animate-spin" />
+                    )}
+                    {bulkUploadProgress === null
+                      ? `Upload pending (${pendingUploadDatasets.length})`
+                      : `Uploading ${bulkUploadProgress.completed}/${bulkUploadProgress.total}`}
+                  </Button>
                   <Button
                     className="text-red-400 hover:border-red-500/40 hover:bg-red-500/10"
                     disabled={
@@ -1692,13 +1827,28 @@ export function TrainingPage(): React.JSX.Element {
                 <div className="grid gap-3">
                   {visibleJobs.map((job) => (
                     <JobCard
+                      activeServerId={activeServer?.id ?? null}
+                      activeServerReady={activeServer?.status === "connected"}
                       datasets={(datasets.data ?? []).filter((dataset) =>
                         job.datasetIds.includes(dataset.id),
                       )}
                       job={job}
                       key={job.id}
                       onAction={(action) => jobAction.mutate({ action, id: job.id })}
-                      pending={jobAction.isPending}
+                      onRequestDelete={() =>
+                        setTrainingDeleteConfirmation({
+                          id: job.id,
+                          kind: "job",
+                          model: job.model,
+                          status: job.status,
+                        })
+                      }
+                      onReviewDatasets={() => setSection("datasets")}
+                      pendingAction={
+                        jobAction.isPending && jobAction.variables?.id === job.id
+                          ? jobAction.variables.action
+                          : null
+                      }
                     />
                   ))}
                 </div>
@@ -1943,6 +2093,84 @@ export function TrainingPage(): React.JSX.Element {
                 {datasetDeleteConfirmation.mode === "all"
                   ? "Delete all datasets"
                   : "Delete dataset"}
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {trainingDeleteConfirmation === null ? null : (
+        <Modal
+          onClose={() => {
+            if (!serverAction.isPending && !jobAction.isPending) {
+              setTrainingDeleteConfirmation(null);
+            }
+          }}
+          title={
+            trainingDeleteConfirmation.kind === "server"
+              ? `Remove ${trainingDeleteConfirmation.name}?`
+              : `Delete ${trainingDeleteConfirmation.model}?`
+          }
+        >
+          <div className="space-y-4 p-5">
+            <div className="rounded-lg border border-red-500/25 bg-red-500/5 p-4">
+              <div className="flex items-start gap-3">
+                <CircleAlert className="mt-0.5 size-5 shrink-0 text-red-400" />
+                <div>
+                  <p className="text-sm font-medium">
+                    {trainingDeleteConfirmation.kind === "server"
+                      ? "Remove this Training Manager connection from Tome?"
+                      : "Delete this training job record from Tome?"}
+                  </p>
+                  <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
+                    {trainingDeleteConfirmation.kind === "server"
+                      ? trainingDeleteConfirmation.isActive
+                        ? "This is the active Training Manager. Dataset uploads and job dispatch will stop until another server is activated. The Windows service itself will not be uninstalled."
+                        : "Only the saved connection and its local connection metadata will be removed. The Windows service itself will not be uninstalled."
+                      : trainingDeleteConfirmation.status === "draft"
+                        ? "This removes the local draft. No remote training job has been started."
+                        : "This removes Tome's local job record and logs. It does not delete exported model files from the Training Manager."}
+                  </p>
+                </div>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2">
+              <Button
+                disabled={serverAction.isPending || jobAction.isPending}
+                onClick={() => setTrainingDeleteConfirmation(null)}
+                type="button"
+                variant="outline"
+              >
+                Cancel
+              </Button>
+              <Button
+                className="bg-red-600 text-white hover:bg-red-500"
+                disabled={serverAction.isPending || jobAction.isPending}
+                onClick={() => {
+                  if (trainingDeleteConfirmation.kind === "server") {
+                    serverAction.mutate({
+                      action: "delete",
+                      id: trainingDeleteConfirmation.id,
+                    });
+                  } else {
+                    jobAction.mutate({
+                      action: "delete",
+                      id: trainingDeleteConfirmation.id,
+                    });
+                  }
+                }}
+                type="button"
+              >
+                {serverAction.isPending || jobAction.isPending ? (
+                  <RefreshCw className="size-3.5 animate-spin" />
+                ) : (
+                  <Trash2 className="size-3.5" />
+                )}
+                {serverAction.isPending || jobAction.isPending
+                  ? "Deleting…"
+                  : trainingDeleteConfirmation.kind === "server"
+                    ? "Remove server"
+                    : "Delete job"}
               </Button>
             </div>
           </div>
@@ -2309,21 +2537,42 @@ export function TrainingPage(): React.JSX.Element {
 }
 
 function JobCard({
+  activeServerId,
+  activeServerReady,
   datasets,
   job,
   onAction,
-  pending,
+  onRequestDelete,
+  onReviewDatasets,
+  pendingAction,
 }: {
+  readonly activeServerId: string | null;
+  readonly activeServerReady: boolean;
   readonly datasets: readonly TrainingDatasetRecord[];
   readonly job: TrainingJobRecord;
   readonly onAction: (
     action: "cancel" | "delete" | "dispatch" | "refresh" | "retry",
   ) => void;
-  readonly pending: boolean;
+  readonly onRequestDelete: () => void;
+  readonly onReviewDatasets: () => void;
+  readonly pendingAction: "cancel" | "delete" | "dispatch" | "refresh" | "retry" | null;
 }): React.JSX.Element {
   const active = ["queued", "running", "paused", "cancelling", "unreachable"].includes(
     job.status,
   );
+  const missingLocalDatasets = Math.max(0, job.datasetIds.length - datasets.length);
+  const missingUploads = datasets.filter(
+    (dataset) =>
+      dataset.remoteDatasetId === null || dataset.trainingServerId !== activeServerId,
+  ).length;
+  const dispatchBlocker =
+    !activeServerReady || activeServerId === null
+      ? "Connect and activate a Training Manager before dispatching."
+      : missingLocalDatasets > 0
+        ? `${missingLocalDatasets} selected dataset${missingLocalDatasets === 1 ? " is" : "s are"} no longer available locally.`
+        : missingUploads > 0
+          ? `${missingUploads} selected dataset${missingUploads === 1 ? " must" : "s must"} be uploaded to the active Training Manager before dispatching.`
+          : null;
   return (
     <Card className="p-4">
       <div className="flex flex-wrap items-start gap-3">
@@ -2348,11 +2597,7 @@ function JobCard({
         <div className="flex flex-wrap gap-1">
           {job.status === "draft" || job.status === "failed" ? (
             <Button
-              disabled={
-                pending ||
-                datasets.length !== job.datasetIds.length ||
-                datasets.some((dataset) => dataset.remoteDatasetId === null)
-              }
+              disabled={pendingAction !== null || dispatchBlocker !== null}
               onClick={() => onAction("dispatch")}
               size="sm"
             >
@@ -2363,7 +2608,7 @@ function JobCard({
           {active && job.remoteJobId !== null ? (
             <>
               <Button
-                disabled={pending}
+                disabled={pendingAction !== null}
                 onClick={() => onAction("refresh")}
                 size="sm"
                 variant="outline"
@@ -2372,7 +2617,7 @@ function JobCard({
                 Refresh
               </Button>
               <Button
-                disabled={pending}
+                disabled={pendingAction !== null}
                 onClick={() => onAction("cancel")}
                 size="sm"
                 variant="ghost"
@@ -2384,7 +2629,7 @@ function JobCard({
           ) : null}
           {["failed", "cancelled"].includes(job.status) && job.remoteJobId !== null ? (
             <Button
-              disabled={pending}
+              disabled={pendingAction !== null}
               onClick={() => onAction("retry")}
               size="sm"
               variant="outline"
@@ -2396,20 +2641,34 @@ function JobCard({
           {!active ? (
             <Button
               aria-label={`Delete ${job.model} job`}
-              disabled={pending}
-              onClick={() => {
-                if (window.confirm(`Delete the ${job.model} training job record?`)) {
-                  onAction("delete");
-                }
-              }}
+              disabled={pendingAction !== null}
+              onClick={onRequestDelete}
               size="icon"
               variant="ghost"
             >
-              <Trash2 className="size-3.5" />
+              {pendingAction === "delete" ? (
+                <RefreshCw className="size-3.5 animate-spin" />
+              ) : (
+                <Trash2 className="size-3.5" />
+              )}
             </Button>
           ) : null}
         </div>
       </div>
+      {["draft", "failed"].includes(job.status) && dispatchBlocker !== null ? (
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-[10px] text-amber-200">
+          <span className="flex items-center gap-2">
+            <CircleAlert className="size-3.5 shrink-0" />
+            {dispatchBlocker}
+          </span>
+          {activeServerReady && missingUploads > 0 ? (
+            <Button onClick={onReviewDatasets} size="sm" variant="outline">
+              <UploadCloud className="size-3" />
+              Open Datasets
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
       <div className="mt-3">
         <div className="mb-1.5 flex justify-between text-[9px] text-muted-foreground">
           <span>{percent(job.progress)}</span>
