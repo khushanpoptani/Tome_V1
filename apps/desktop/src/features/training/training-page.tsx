@@ -1539,13 +1539,7 @@ export function TrainingPage(): React.JSX.Element {
           {section === "datasets" ? (
             <section>
               <div className="mb-4 flex items-center justify-between">
-                <div>
-                  <h2 className="text-sm font-semibold">Datasets</h2>
-                  <p className="mt-1 text-[10px] text-muted-foreground">
-                    Organize related data into groups, validate locally, then upload a
-                    complete group in resumable chunks.
-                  </p>
-                </div>
+                <h2 className="text-sm font-semibold">Datasets</h2>
                 <div className="flex items-center gap-2">
                   <Button
                     disabled={

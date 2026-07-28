@@ -90,7 +90,7 @@ Title Bar
 ├── Sidebar
 ├── Main Workspace
 ├── Resizable Context Panel
-├── Persistent Prompt Area
+├── Chat Prompt Area
 └── Status Bar
 ```
 
@@ -114,10 +114,11 @@ Settings subsections:
 - Logging
 - About
 
-The prompt area provides attachments, voice, model selection, permission mode, and send
-controls. The context panel provides the current agent, running tasks, logs, verification,
-and outputs. Chat rendering must eventually support streaming Markdown, code blocks,
-Mermaid, images, and tables.
+The prompt area is mounted only on the Chat route and provides attachments, voice, model
+selection, permission mode, and send controls. Other workspaces use the full available
+height without a chat composer. The context panel provides the current agent, running
+tasks, logs, verification, and outputs. Chat rendering must eventually support streaming
+Markdown, code blocks, Mermaid, images, and tables.
 
 ## Quality attributes
 

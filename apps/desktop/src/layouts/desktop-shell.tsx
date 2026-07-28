@@ -4,22 +4,30 @@ import { Sidebar } from "@/components/shell/sidebar";
 import { StatusBar } from "@/components/shell/status-bar";
 import { useShellStore } from "@tome/stores";
 import { AnimatePresence, motion } from "framer-motion";
-import { Outlet } from "react-router-dom";
+import { Outlet, useLocation } from "react-router-dom";
 
 export function DesktopShell(): React.JSX.Element {
   const contextPanelOpen = useShellStore((state) => state.contextPanelOpen);
   const sidebarCollapsed = useShellStore((state) => state.sidebarCollapsed);
+  const location = useLocation();
+  const showPromptBar = location.pathname === "/chat";
 
   return (
     <div className="grid h-dvh min-h-[640px] grid-rows-[minmax(0,1fr)_24px] overflow-hidden bg-background text-foreground">
       <div className="flex min-h-0 overflow-hidden">
         <Sidebar collapsed={sidebarCollapsed} />
         <div className="flex min-w-0 flex-1">
-          <main className="grid min-w-0 flex-1 grid-rows-[minmax(0,1fr)_auto] bg-workspace">
+          <main
+            className={`grid min-w-0 flex-1 bg-workspace ${
+              showPromptBar
+                ? "grid-rows-[minmax(0,1fr)_auto]"
+                : "grid-rows-[minmax(0,1fr)]"
+            }`}
+          >
             <div className="min-h-0 overflow-y-auto overflow-x-hidden">
               <Outlet />
             </div>
-            <PromptBar />
+            {showPromptBar ? <PromptBar /> : null}
           </main>
           <AnimatePresence initial={false}>
             {contextPanelOpen ? (

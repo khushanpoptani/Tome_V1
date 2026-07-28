@@ -18,14 +18,25 @@ describe("Tome application shell", () => {
     expect(
       screen.getByRole("navigation", { name: "Primary navigation" }),
     ).toBeInTheDocument();
-    expect(screen.getByLabelText("Ask Tome")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Ask Tome")).not.toBeInTheDocument();
     const collapseSidebar = screen.getByRole("button", { name: "Collapse sidebar" });
     fireEvent.click(collapseSidebar);
     const expandSidebar = screen.getByRole("button", { name: "Expand sidebar" });
     expect(expandSidebar).toBeInTheDocument();
     fireEvent.click(expandSidebar);
     expect(screen.getByRole("button", { name: "Collapse sidebar" })).toBeInTheDocument();
+  });
 
+  it("renders the prompt composer only on the chat route", async () => {
+    render(
+      <AppProviders>
+        <MemoryRouter initialEntries={["/chat"]}>
+          <AppRoutes />
+        </MemoryRouter>
+      </AppProviders>,
+    );
+
+    expect(await screen.findByLabelText("Ask Tome")).toBeInTheDocument();
     const permissionSelector = screen.getByRole("combobox", {
       name: "Permission mode",
     });
@@ -48,6 +59,7 @@ describe("Tome application shell", () => {
     expect(
       screen.getByRole("navigation", { name: "Settings sections" }),
     ).toBeInTheDocument();
+    expect(screen.queryByLabelText("Ask Tome")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Appearance" }));
     fireEvent.click(screen.getByRole("button", { name: /Light/ }));
@@ -75,5 +87,11 @@ describe("Tome application shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Datasets" }));
     expect(screen.getByRole("heading", { name: "Datasets" })).toBeInTheDocument();
     expect(screen.getByText("Drag datasets here")).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "Organize related data into groups, validate locally, then upload a complete group in resumable chunks.",
+      ),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Ask Tome")).not.toBeInTheDocument();
   });
 });
