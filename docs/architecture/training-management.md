@@ -324,6 +324,11 @@ responsive for very large invalid datasets while SQLite retains the complete res
 Delete state is per dataset, disables duplicate actions immediately, and keeps the card
 visible with stage feedback until local and remote cleanup succeeds.
 
+Task persistence is serialized per operation so an earlier progress write cannot arrive
+after and overwrite a terminal state. On startup, the database migration reconciles legacy
+dataset-preparation tasks stranded at 100% with their validated dataset record, marking
+them completed or failed as appropriate.
+
 ## Operational constraints
 
 - No job starts until a valid dataset upload is committed and the requested backend

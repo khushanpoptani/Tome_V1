@@ -428,12 +428,54 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             "#,
         )?;
     }
+
+    let has_v9 = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 9)",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if !has_v9 {
+        connection.execute_batch(
+            r#"
+            BEGIN IMMEDIATE;
+            UPDATE tasks
+            SET status='completed',
+                ended_at=COALESCE(ended_at, updated_at),
+                updated_at=datetime('now')
+            WHERE kind='dataset-preparation'
+              AND status='running'
+              AND progress >= 100
+              AND EXISTS (
+                  SELECT 1
+                  FROM training_datasets
+                  WHERE 'dataset-prepare:' || training_datasets.id = tasks.id
+                    AND training_datasets.validation_status = 'valid'
+              );
+            UPDATE tasks
+            SET status='failed',
+                ended_at=COALESCE(ended_at, updated_at),
+                updated_at=datetime('now')
+            WHERE kind='dataset-preparation'
+              AND status='running'
+              AND progress >= 100
+              AND EXISTS (
+                  SELECT 1
+                  FROM training_datasets
+                  WHERE 'dataset-prepare:' || training_datasets.id = tasks.id
+                    AND training_datasets.validation_status != 'valid'
+              );
+            INSERT INTO schema_migrations(version, applied_at)
+            VALUES (9, datetime('now'));
+            COMMIT;
+            "#,
+        )?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::open_connection;
+    use super::{migrate, open_connection};
     use rusqlite::Connection;
     use std::path::Path;
 
@@ -453,7 +495,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("schema version should be readable");
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         for table in [
             "training_servers",
             "training_dataset_groups",
@@ -476,6 +518,50 @@ mod tests {
         ));
         assert!(has_column(&connection, "training_jobs", "dataset_ids_json"));
         assert!(has_column(&connection, "training_datasets", "group_id"));
+    }
+
+    #[test]
+    fn recovers_completed_dataset_preparation_tasks_from_version_eight() {
+        let connection = open_connection(Path::new(":memory:")).expect("database should open");
+        connection
+            .execute(
+                "INSERT INTO training_datasets(
+                    id, name, source_path, format, size, file_count, compressed,
+                    validation_status, validation_errors_json, created_at, updated_at
+                 ) VALUES (
+                    'dataset', 'Dataset', '/tmp/dataset', 'jsonl', 1024, 1, 1,
+                    'valid', '[]', datetime('now'), datetime('now')
+                 )",
+                [],
+            )
+            .expect("dataset should be inserted");
+        connection
+            .execute(
+                "INSERT INTO tasks(
+                    id, kind, title, status, progress, logs, created_at, updated_at
+                 ) VALUES (
+                    'dataset-prepare:dataset', 'dataset-preparation', 'Prepare Dataset',
+                    'running', 100, 'Ready for Upload: Validation complete',
+                    datetime('now'), datetime('now')
+                 )",
+                [],
+            )
+            .expect("task should be inserted");
+        connection
+            .execute("DELETE FROM schema_migrations WHERE version = 9", [])
+            .expect("version nine should be removed");
+
+        migrate(&connection).expect("version nine should be reapplied");
+
+        let (status, ended_at) = connection
+            .query_row(
+                "SELECT status, ended_at FROM tasks WHERE id='dataset-prepare:dataset'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .expect("task should be readable");
+        assert_eq!(status, "completed");
+        assert!(ended_at.is_some());
     }
 
     fn has_table(connection: &Connection, table: &str) -> bool {

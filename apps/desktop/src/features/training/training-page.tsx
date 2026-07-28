@@ -312,6 +312,7 @@ export function TrainingPage(): React.JSX.Element {
   const jobsRef = useRef<readonly TrainingJobRecord[]>([]);
   const operationStarts = useRef(new Map<string, string>());
   const operationLogs = useRef(new Map<string, string[]>());
+  const operationTaskWrites = useRef(new Map<string, Promise<void>>());
   const prepareDatasetRef = useRef<
     ((input: DatasetPreparationInput) => Promise<TrainingDatasetRecord>) | undefined
   >(undefined);
@@ -395,18 +396,36 @@ export function TrainingPage(): React.JSX.Element {
       if (lines.length > 250) lines.splice(0, lines.length - 250);
       operationLogs.current.set(id, lines);
     }
-    void backend
-      .saveTask({
-        endedAt: status === "running" ? null : new Date().toISOString(),
-        id,
-        kind,
-        logs: lines.join("\n"),
-        progress: event.progress,
-        startedAt,
-        status,
-        title,
+    const input = {
+      endedAt: status === "running" ? null : new Date().toISOString(),
+      id,
+      kind,
+      logs: lines.join("\n"),
+      progress: event.progress,
+      startedAt,
+      status,
+      title,
+    } as const;
+    const previousWrite = operationTaskWrites.current.get(id) ?? Promise.resolve();
+    const nextWrite = previousWrite
+      .catch(() => undefined)
+      .then(async () => {
+        await backend.saveTask(input);
+        await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      });
+    operationTaskWrites.current.set(id, nextWrite);
+    void nextWrite
+      .then(() => {
+        if (status !== "running") {
+          operationStarts.current.delete(id);
+          operationLogs.current.delete(id);
+        }
       })
-      .then(() => queryClient.invalidateQueries({ queryKey: ["tasks"] }))
+      .finally(() => {
+        if (operationTaskWrites.current.get(id) === nextWrite) {
+          operationTaskWrites.current.delete(id);
+        }
+      })
       .catch(() => undefined);
   };
 
