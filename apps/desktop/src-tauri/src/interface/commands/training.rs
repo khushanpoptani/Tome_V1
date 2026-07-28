@@ -49,6 +49,19 @@ fn api_url(base: &str, path: &str) -> String {
     )
 }
 
+fn request_error_details(error: &reqwest::Error) -> String {
+    let mut details = vec![error.to_string()];
+    let mut source = std::error::Error::source(error);
+    while let Some(value) = source {
+        let message = value.to_string();
+        if !details.contains(&message) {
+            details.push(message);
+        }
+        source = value.source();
+    }
+    details.join(": ")
+}
+
 fn map_training_server(row: &Row<'_>) -> rusqlite::Result<TrainingServerRecord> {
     Ok(TrainingServerRecord {
         id: row.get(0)?,
@@ -1258,20 +1271,56 @@ pub async fn start_dataset_upload(
         total_bytes,
         current_file: Some(artifact_path.clone()),
     });
-    let handshake = state
-        .http
-        .post(api_url(&server.url, "/v1/uploads"))
-        .header("Idempotency-Key", &upload_id)
-        .json(&json!({
-            "clientUploadId": upload_id,
-            "datasetId": dataset.id,
-            "name": dataset.name,
-            "format": dataset.format,
-            "size": total_bytes,
-            "sha256": checksum
-        }))
-        .send()
-        .await;
+    let mut handshake = None;
+    let mut handshake_error = None;
+    for attempt in 1..=3 {
+        match state
+            .http
+            .post(api_url(&server.url, "/v1/uploads"))
+            .header("Idempotency-Key", &upload_id)
+            .json(&json!({
+                "clientUploadId": upload_id,
+                "datasetId": dataset.id,
+                "name": dataset.name,
+                "format": dataset.format,
+                "size": total_bytes,
+                "sha256": checksum
+            }))
+            .send()
+            .await
+        {
+            Ok(response) => {
+                handshake = Some(response);
+                break;
+            }
+            Err(error) => {
+                handshake_error = Some(request_error_details(&error));
+                if attempt < 3 {
+                    let _ = on_event.send(TrainingStreamEvent::OperationProgress {
+                        operation_id: upload_id.clone(),
+                        stage: "Reconnecting".into(),
+                        message: format!(
+                            "Upload server connection failed; retrying handshake ({attempt}/3)"
+                        ),
+                        progress: 1.0,
+                        bytes_processed: existing
+                            .as_ref()
+                            .map_or(0, |upload| upload.bytes_uploaded),
+                        total_bytes,
+                        current_file: Some(artifact_path.clone()),
+                    });
+                    tokio::time::sleep(Duration::from_millis(500 * attempt)).await;
+                }
+            }
+        }
+    }
+    let handshake = handshake.ok_or_else(|| {
+        format!(
+            "Could not create a training upload at {} after 3 attempts: {}",
+            server.url,
+            handshake_error.unwrap_or_else(|| "unknown connection error".into())
+        )
+    });
     let handshake = match handshake {
         Ok(response) if response.status().is_success() => response,
         Ok(response) => {
@@ -1302,11 +1351,7 @@ pub async fn start_dataset_upload(
                 .remove(&upload_id);
             return Err(error);
         }
-        Err(error) => {
-            let message = format!(
-                "Could not create a training upload at {}. The external Training Manager must implement tome-training/v1: {error}",
-                server.url
-            );
+        Err(message) => {
             save_upload_progress(
                 &state,
                 UploadProgress {

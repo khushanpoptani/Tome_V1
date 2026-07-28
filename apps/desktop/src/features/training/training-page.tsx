@@ -937,9 +937,17 @@ export function TrainingPage(): React.JSX.Element {
       `Queued ${targets.length} dataset${targets.length === 1 ? "" : "s"} for upload.`,
     );
     let failed = 0;
+    let attempted = 0;
+    let consecutiveFailures = 0;
     for (const dataset of targets) {
       const uploaded = await beginUpload(dataset, false);
-      if (!uploaded) failed += 1;
+      attempted += 1;
+      if (uploaded) {
+        consecutiveFailures = 0;
+      } else {
+        failed += 1;
+        consecutiveFailures += 1;
+      }
       setBulkUploadProgress((current) =>
         current === null
           ? null
@@ -949,10 +957,17 @@ export function TrainingPage(): React.JSX.Element {
               failed,
             },
       );
+      if (consecutiveFailures >= 3) {
+        break;
+      }
     }
     setBulkUploadProgress(null);
     refreshAll();
-    if (failed === 0) {
+    if (attempted < targets.length) {
+      toast.error(
+        `Upload queue paused after ${consecutiveFailures} consecutive connection failures. ${targets.length - attempted} datasets remain pending; reconnect and click Upload pending to resume.`,
+      );
+    } else if (failed === 0) {
       toast.success(
         `${targets.length} dataset${targets.length === 1 ? "" : "s"} uploaded and registered.`,
       );
