@@ -712,17 +712,14 @@ export function TrainingPage(): React.JSX.Element {
     if (activeJobs.length === 0) {
       return;
     }
-    const timer = window.setInterval(
-      () => {
-        void Promise.allSettled(
-          activeJobs.map(async (job) => backend.refreshTrainingJob(job.id)),
-        ).then(() => {
-          void queryClient.invalidateQueries({ queryKey: ["training-jobs"] });
-          void queryClient.invalidateQueries({ queryKey: ["training-logs"] });
-        });
-      },
-      streamStatus === "connected" ? 30_000 : 5_000,
-    );
+    const timer = window.setInterval(() => {
+      void Promise.allSettled(
+        activeJobs.map(async (job) => backend.refreshTrainingJob(job.id)),
+      ).then(() => {
+        void queryClient.invalidateQueries({ queryKey: ["training-jobs"] });
+        void queryClient.invalidateQueries({ queryKey: ["training-logs"] });
+      });
+    }, 5_000);
     return () => window.clearInterval(timer);
   }, [jobs.data, queryClient, streamStatus]);
 

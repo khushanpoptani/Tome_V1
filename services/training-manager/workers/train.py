@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import json
 import math
 import sys
@@ -18,6 +19,42 @@ from typing import Any
 
 def emit(kind: str, **values: Any) -> None:
     print(json.dumps({"type": kind, **values}, ensure_ascii=False), flush=True)
+
+
+def create_training_arguments(
+    training_arguments_type: Any, values: dict[str, Any]
+) -> Any:
+    """Build TrainingArguments across supported Transformers versions.
+
+    Transformers occasionally removes or renames constructor options. The worker
+    only passes options supported by the installed server version and reports
+    ignored compatibility options instead of aborting an otherwise valid job.
+    """
+
+    signature = inspect.signature(training_arguments_type)
+    accepts_arbitrary_keywords = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    supported = (
+        values
+        if accepts_arbitrary_keywords
+        else {
+            name: value
+            for name, value in values.items()
+            if name in signature.parameters
+        }
+    )
+    ignored = sorted(set(values) - set(supported))
+    if ignored:
+        emit(
+            "warning",
+            message=(
+                "The installed Transformers version does not support these "
+                f"TrainingArguments options; continuing without them: {', '.join(ignored)}"
+            ),
+        )
+    return training_arguments_type(**supported)
 
 
 def probe() -> int:
@@ -356,25 +393,32 @@ def run(spec_path: Path) -> int:
             )
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    arguments = TrainingArguments(
-        output_dir=str(checkpoints),
-        overwrite_output_dir=False,
-        per_device_train_batch_size=int(parameters.get("batchSize", 1)),
-        gradient_accumulation_steps=int(parameters.get("gradientAccumulationSteps", 4)),
-        num_train_epochs=epochs,
-        max_steps=int(parameters.get("maxSteps", -1)),
-        learning_rate=float(parameters.get("learningRate", 2e-4)),
-        warmup_ratio=float(parameters.get("warmupRatio", 0.03)),
-        weight_decay=float(parameters.get("weightDecay", 0.0)),
-        logging_steps=max(1, int(parameters.get("loggingSteps", 1))),
-        save_strategy="epoch",
-        save_total_limit=max(1, int(parameters.get("saveTotalLimit", 2))),
-        report_to=[],
-        fp16=torch.cuda.is_available() and not use_bf16,
-        bf16=use_bf16,
-        gradient_checkpointing=bool(parameters.get("gradientCheckpointing", True)),
-        dataloader_num_workers=int(parameters.get("dataloaderWorkers", 0)),
-        seed=int(parameters.get("seed", 42)),
+    arguments = create_training_arguments(
+        TrainingArguments,
+        {
+            "output_dir": str(checkpoints),
+            "overwrite_output_dir": False,
+            "per_device_train_batch_size": int(parameters.get("batchSize", 1)),
+            "gradient_accumulation_steps": int(
+                parameters.get("gradientAccumulationSteps", 4)
+            ),
+            "num_train_epochs": epochs,
+            "max_steps": int(parameters.get("maxSteps", -1)),
+            "learning_rate": float(parameters.get("learningRate", 2e-4)),
+            "warmup_ratio": float(parameters.get("warmupRatio", 0.03)),
+            "weight_decay": float(parameters.get("weightDecay", 0.0)),
+            "logging_steps": max(1, int(parameters.get("loggingSteps", 1))),
+            "save_strategy": "epoch",
+            "save_total_limit": max(1, int(parameters.get("saveTotalLimit", 2))),
+            "report_to": [],
+            "fp16": torch.cuda.is_available() and not use_bf16,
+            "bf16": use_bf16,
+            "gradient_checkpointing": bool(
+                parameters.get("gradientCheckpointing", True)
+            ),
+            "dataloader_num_workers": int(parameters.get("dataloaderWorkers", 0)),
+            "seed": int(parameters.get("seed", 42)),
+        },
     )
     trainer = Trainer(
         model=model,

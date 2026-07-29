@@ -7,10 +7,32 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from train import normalize_record, read_records
+from train import create_training_arguments, normalize_record, read_records
 
 
 class TrainingDatasetNormalizationTests(unittest.TestCase):
+    def test_ignores_unsupported_training_argument_options(self) -> None:
+        class InstalledTrainingArguments:
+            def __init__(self, output_dir: str, max_steps: int) -> None:
+                self.output_dir = output_dir
+                self.max_steps = max_steps
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            arguments = create_training_arguments(
+                InstalledTrainingArguments,
+                {
+                    "output_dir": "checkpoints",
+                    "max_steps": 3,
+                    "overwrite_output_dir": False,
+                },
+            )
+
+        self.assertEqual(arguments.output_dir, "checkpoints")
+        self.assertEqual(arguments.max_steps, 3)
+        event = json.loads(stdout.getvalue())
+        self.assertEqual(event["type"], "warning")
+        self.assertIn("overwrite_output_dir", event["message"])
+
     def test_normalizes_instruction_input_and_output(self) -> None:
         record = normalize_record(
             {
