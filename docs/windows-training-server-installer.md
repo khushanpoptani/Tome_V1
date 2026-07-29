@@ -46,8 +46,29 @@ removed from **Tome → Settings → Security → Database reset**.
 
 ## Producing the executable
 
-The native setup executable must be produced on Windows. The dedicated GitHub Actions
-workflow builds and uploads it on demand and for version tags.
+### macOS cross-build
+
+A configured macOS release machine can cross-compile the native 64-bit Windows service and
+wrap it, the worker, and the pinned Python runtime in one Setup executable:
+
+```bash
+./scripts/build-windows-training-server-package.sh
+```
+
+The delivery ZIP is written to:
+
+```text
+target/release/bundle/windows-training-server
+```
+
+The Windows operator only needs to start Ollama and double-click the Setup executable.
+Cargo, Rust, Python, PowerShell build commands, and Inno Setup are not required on the
+Windows server.
+
+The dedicated GitHub Actions workflow remains available to build and upload the Windows
+artifact on demand and for version tags.
+
+### Windows build
 
 For a local release build, install Rust and Inno Setup 6, then run:
 
@@ -76,9 +97,10 @@ roadmap.
 
 ## Tome Desktop distribution boundary
 
-Tome Desktop does not compile a Windows service or setup executable on macOS. Shipping a
-Windows compiler, SDK, installer compiler, Python runtime, and signing credentials inside
-the desktop client would add a large and unsafe build toolchain to an application whose
+The release process can compile the Windows service and setup executable on macOS, but the
+installed Tome Desktop application does not compile release artifacts. Shipping a Windows
+compiler, SDK, installer compiler, Python runtime, and signing credentials inside the
+desktop client would add a large and unsafe build toolchain to an application whose
 responsibility is server management.
 
 The supported desktop experience is:
