@@ -11,6 +11,7 @@ from train import (
     create_training_arguments,
     is_authentication_error,
     normalize_record,
+    open_source_for_ollama,
     read_records,
 )
 
@@ -27,6 +28,17 @@ class TrainingDatasetNormalizationTests(unittest.TestCase):
         self.assertFalse(
             is_authentication_error("Connection timed out while resolving model files")
         )
+
+    def test_maps_token_free_ollama_bases_to_matching_open_checkpoints(self) -> None:
+        self.assertEqual(
+            open_source_for_ollama("tinyllama:latest"),
+            "TinyLlama/TinyLlama-1.1B-Chat-v0.6",
+        )
+        self.assertEqual(
+            open_source_for_ollama("mistral:7b"),
+            "mistralai/Mistral-7B-Instruct-v0.3",
+        )
+        self.assertIsNone(open_source_for_ollama("llama3.2:3b"))
 
     def test_ignores_unsupported_training_argument_options(self) -> None:
         class InstalledTrainingArguments:

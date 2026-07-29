@@ -141,6 +141,8 @@ async fn training_preflight(
         .arg(&state.config.worker_script)
         .arg("--preflight-source")
         .arg(request.source_model.trim())
+        .arg("--preflight-base")
+        .arg(request.base_model.trim())
         .arg("--preflight-backend")
         .arg(request.backend.trim());
     if let Some(value) = token.as_deref() {

@@ -33,6 +33,25 @@ in the Training Manager database or job files.
 The desktop automatically repeats preflight when the user clicks **Train**. Restarting the
 service clears the session credential.
 
+## Automatic open-base training
+
+Tome's default training recipe does not require an account or token. If no compatible open
+base is installed, the desktop pulls `tinyllama:latest` from the active Ollama server and
+pairs it with the public Apache-2.0 `TinyLlama/TinyLlama-1.1B-Chat-v0.6` Safetensors
+checkpoint. The worker downloads that checkpoint anonymously, trains a LoRA adapter with
+conservative CPU defaults, and registers the adapter as a new Ollama model without
+changing the original base.
+
+The quantized GGUF blobs managed by Ollama are inference artifacts and are not used for
+gradient training. The original trainable checkpoint must match the Ollama base exactly;
+preflight rejects mismatched pairs. `mistral:latest`/`mistral:7b` with
+`mistralai/Mistral-7B-Instruct-v0.3` is also recognized as an open pair, but is not the
+recommended CPU option because it requires substantially more RAM and training time.
+
+On Windows, unsupported GPUs fall back to CPU LoRA. QLoRA remains limited to the supported
+NVIDIA CUDA worker path. In particular, older integrated Radeon Vega hardware is not
+presented as a usable accelerator merely because it is available for display workloads.
+
 Unsloth, Axolotl, merged-model export, and GGUF conversion are explicit future adapters.
 The capability endpoint reports them as unavailable; it never simulates training.
 

@@ -10,6 +10,7 @@ import {
   deleteTrainingDataset,
   isTauriRuntime,
   prepareTrainingDataset,
+  pullModel,
   startDatasetUpload,
 } from "@/lib/backend";
 import { errorMessage, formatBytes, formatDate } from "@/lib/format";
@@ -19,6 +20,7 @@ import type {
   DatasetExclusion,
   DatasetValidationIssue,
   OllamaModel,
+  StreamEvent,
   TrainingDatasetGroupRecord,
   TrainingDatasetRecord,
   TrainingJobRecord,
@@ -144,6 +146,21 @@ interface TrainingReadinessDialog {
   readonly credential: string;
   readonly result: TrainingPreflightResult | null;
 }
+
+interface TrainingBaseProfile {
+  readonly access: "open" | "restricted";
+  readonly architecture: "gemma" | "llama" | "mistral";
+  readonly sourceModel: string;
+}
+
+const recommendedOpenTrainingBase = {
+  ollamaModel: "tinyllama:latest",
+  profile: {
+    access: "open",
+    architecture: "llama",
+    sourceModel: "TinyLlama/TinyLlama-1.1B-Chat-v0.6",
+  } satisfies TrainingBaseProfile,
+} as const;
 
 type StreamStatus = "disabled" | "connecting" | "connected" | "fallback";
 type OperationProgressEvent = Extract<
@@ -371,21 +388,75 @@ function supportsOllamaAdapter(model: OllamaModel): boolean {
   );
 }
 
-function sourceModelForOllama(name: string): string | null {
+function trainingBaseProfileForOllama(name: string): TrainingBaseProfile | null {
   const normalized = name.toLowerCase();
+  if (normalized.startsWith("tinyllama")) {
+    return recommendedOpenTrainingBase.profile;
+  }
+  if (
+    normalized === "mistral" ||
+    normalized.startsWith("mistral:latest") ||
+    normalized.startsWith("mistral:7b") ||
+    normalized.startsWith("mistral:v0.3")
+  ) {
+    return {
+      access: "open",
+      architecture: "mistral",
+      sourceModel: "mistralai/Mistral-7B-Instruct-v0.3",
+    };
+  }
   if (normalized.startsWith("llama3.2:3b")) {
-    return "meta-llama/Llama-3.2-3B-Instruct";
+    return {
+      access: "restricted",
+      architecture: "llama",
+      sourceModel: "meta-llama/Llama-3.2-3B-Instruct",
+    };
   }
   if (normalized.startsWith("llama3.2:1b")) {
-    return "meta-llama/Llama-3.2-1B-Instruct";
+    return {
+      access: "restricted",
+      architecture: "llama",
+      sourceModel: "meta-llama/Llama-3.2-1B-Instruct",
+    };
   }
   if (normalized.startsWith("gemma2:2b")) {
-    return "google/gemma-2-2b-it";
-  }
-  if (normalized.startsWith("tinyllama")) {
-    return "TinyLlama/TinyLlama-1.1B-Chat-v1.0";
+    return {
+      access: "restricted",
+      architecture: "gemma",
+      sourceModel: "google/gemma-2-2b-it",
+    };
   }
   return null;
+}
+
+function createOpenBaseJobForm(
+  datasetIds: readonly string[],
+  baseModel: string,
+): JobForm {
+  const profile =
+    trainingBaseProfileForOllama(baseModel) ?? recommendedOpenTrainingBase.profile;
+  return {
+    backend: "auto",
+    baseModel,
+    datasetIds,
+    model: "",
+    parametersJson: JSON.stringify(
+      {
+        sourceModel: profile.sourceModel,
+        trainingRecipe: "open-base-lora",
+        ollamaAdapterArchitecture: profile.architecture,
+        learningRate: 0.0002,
+        batchSize: 1,
+        gradientAccumulationSteps: 4,
+        maxLength: 512,
+        maxRecords: 500,
+        loraRank: 8,
+      },
+      null,
+      2,
+    ),
+    totalEpochs: 1,
+  };
 }
 
 function readJobParameter(parametersJson: string, key: string): string {
@@ -398,13 +469,20 @@ function readJobParameter(parametersJson: string, key: string): string {
 }
 
 function writeJobParameter(parametersJson: string, key: string, value: string): string {
+  return writeJobParameters(parametersJson, { [key]: value });
+}
+
+function writeJobParameters(
+  parametersJson: string,
+  values: Readonly<Record<string, unknown>>,
+): string {
   let parameters: Record<string, unknown> = {};
   try {
     parameters = JSON.parse(parametersJson) as Record<string, unknown>;
   } catch {
     // Keep the form usable while advanced JSON is temporarily invalid.
   }
-  return JSON.stringify({ ...parameters, [key]: value }, null, 2);
+  return JSON.stringify({ ...parameters, ...values }, null, 2);
 }
 
 export function TrainingPage(): React.JSX.Element {
@@ -435,6 +513,10 @@ export function TrainingPage(): React.JSX.Element {
     readonly total: number;
   } | null>(null);
   const [jobForm, setJobForm] = useState<JobForm | null>(null);
+  const [openBaseInstallProgress, setOpenBaseInstallProgress] = useState<{
+    readonly message: string;
+    readonly percent: number;
+  } | null>(null);
   const [trainingReadiness, setTrainingReadiness] =
     useState<TrainingReadinessDialog | null>(null);
   const [dragActive, setDragActive] = useState(false);
@@ -1051,6 +1133,115 @@ export function TrainingPage(): React.JSX.Element {
       );
     },
   });
+  const installRecommendedOpenBase = useMutation({
+    mutationFn: async ({ datasetIds }: { readonly datasetIds: readonly string[] }) => {
+      const server = ollamaServer.data;
+      if (server === null || server === undefined) {
+        throw new Error("Configure and activate the Windows Ollama server first.");
+      }
+      const taskId = crypto.randomUUID();
+      const startedAt = new Date().toISOString();
+      let logs = `Installing ${recommendedOpenTrainingBase.ollamaModel} for token-free training.\n`;
+      let latestPercent = 0;
+      let lastPersistedAt = 0;
+      let taskWrite: Promise<unknown> = Promise.resolve();
+      setOpenBaseInstallProgress({
+        message: "Starting open base download…",
+        percent: 0,
+      });
+      await backend.saveTask({
+        id: taskId,
+        kind: "model-download",
+        logs,
+        progress: 0,
+        startedAt,
+        status: "running",
+        title: `Install ${recommendedOpenTrainingBase.ollamaModel}`,
+      });
+      const onEvent = (event: StreamEvent): void => {
+        if (event.type !== "progress" && event.type !== "status") return;
+        latestPercent =
+          event.type === "progress"
+            ? Math.max(0, event.percent ?? latestPercent)
+            : latestPercent;
+        logs += `${event.message}${latestPercent > 0 ? ` ${latestPercent.toFixed(1)}%` : ""}\n`;
+        setOpenBaseInstallProgress({
+          message: event.message,
+          percent: latestPercent,
+        });
+        const now = Date.now();
+        if (now - lastPersistedAt >= 750) {
+          lastPersistedAt = now;
+          taskWrite = taskWrite
+            .catch(() => undefined)
+            .then(() =>
+              backend.saveTask({
+                id: taskId,
+                kind: "model-download",
+                logs,
+                progress: latestPercent,
+                startedAt,
+                status: "running",
+                title: `Install ${recommendedOpenTrainingBase.ollamaModel}`,
+              }),
+            )
+            .then(() => queryClient.invalidateQueries({ queryKey: ["tasks"] }));
+        }
+      };
+      try {
+        await pullModel(
+          taskId,
+          server.url,
+          recommendedOpenTrainingBase.ollamaModel,
+          onEvent,
+        );
+        await taskWrite.catch(() => undefined);
+        await backend.saveTask({
+          endedAt: new Date().toISOString(),
+          id: taskId,
+          kind: "model-download",
+          logs: `${logs}Open training base installed.\n`,
+          progress: 100,
+          startedAt,
+          status: "completed",
+          title: `Install ${recommendedOpenTrainingBase.ollamaModel}`,
+        });
+        return datasetIds;
+      } catch (error) {
+        const message = errorMessage(error);
+        await taskWrite.catch(() => undefined);
+        await backend.saveTask({
+          endedAt: new Date().toISOString(),
+          id: taskId,
+          kind: "model-download",
+          logs: `${logs}${message}\n`,
+          progress: latestPercent,
+          startedAt,
+          status: "failed",
+          title: `Install ${recommendedOpenTrainingBase.ollamaModel}`,
+        });
+        throw error;
+      }
+    },
+    onError: (error) => {
+      setOpenBaseInstallProgress(null);
+      toast.error(`Could not install the open training base: ${errorMessage(error)}`);
+    },
+    onSuccess: async (datasetIds) => {
+      setOpenBaseInstallProgress(null);
+      await Promise.all([
+        ollamaModels.refetch(),
+        queryClient.invalidateQueries({ queryKey: ["tasks"] }),
+      ]);
+      setTrainingReadiness(null);
+      setJobForm(
+        createOpenBaseJobForm(datasetIds, recommendedOpenTrainingBase.ollamaModel),
+      );
+      toast.success(
+        "Open TinyLlama base installed. Configure the output name and train.",
+      );
+    },
+  });
   const preflightJob = useMutation({
     mutationFn: ({
       credential,
@@ -1195,10 +1386,40 @@ export function TrainingPage(): React.JSX.Element {
     () => (ollamaModels.data ?? []).filter(supportsOllamaAdapter),
     [ollamaModels.data],
   );
+  const openCompatibleOllamaModels = useMemo(
+    () =>
+      compatibleOllamaModels.filter(
+        (model) => trainingBaseProfileForOllama(model.name)?.access === "open",
+      ),
+    [compatibleOllamaModels],
+  );
+  const restrictedCompatibleOllamaModels = useMemo(
+    () =>
+      compatibleOllamaModels.filter(
+        (model) => trainingBaseProfileForOllama(model.name)?.access !== "open",
+      ),
+    [compatibleOllamaModels],
+  );
   const incompatibleOllamaModels = useMemo(
     () => (ollamaModels.data ?? []).filter((model) => !supportsOllamaAdapter(model)),
     [ollamaModels.data],
   );
+  const startOpenBaseJob = (datasetIds: readonly string[]): void => {
+    const installedOpenBase = openCompatibleOllamaModels[0]?.name;
+    if (installedOpenBase !== undefined) {
+      setTrainingReadiness(null);
+      setJobForm(createOpenBaseJobForm(datasetIds, installedOpenBase));
+      return;
+    }
+    if (ollamaServer.data === null || ollamaServer.data === undefined) {
+      setJobForm(createOpenBaseJobForm(datasetIds, ""));
+      toast.warning("Connect the Windows Ollama server before saving this job.");
+      return;
+    }
+    installRecommendedOpenBase.mutate({ datasetIds });
+  };
+  const selectedJobBaseProfile =
+    jobForm === null ? null : trainingBaseProfileForOllama(jobForm.baseModel);
   const visibleJobs = useMemo(() => {
     const all = jobs.data ?? [];
     if (section === "running") {
@@ -2715,27 +2936,25 @@ export function TrainingPage(): React.JSX.Element {
                 </div>
                 {section === "jobs" ? (
                   <Button
-                    disabled={selectableDatasets.length === 0}
+                    disabled={
+                      selectableDatasets.length === 0 ||
+                      installRecommendedOpenBase.isPending
+                    }
                     onClick={() => {
-                      const defaultBaseModel = compatibleOllamaModels[0]?.name ?? "";
-                      const defaultSourceModel =
-                        sourceModelForOllama(defaultBaseModel) ??
-                        "meta-llama/Llama-3.2-3B-Instruct";
-                      setJobForm({
-                        backend: "auto",
-                        baseModel: defaultBaseModel,
-                        datasetIds: selectableDatasets[0]
-                          ? [selectableDatasets[0].id]
-                          : [],
-                        model: "",
-                        parametersJson: `{\n  "sourceModel": "${defaultSourceModel}",\n  "ollamaAdapterArchitecture": "llama",\n  "learningRate": 0.0002,\n  "batchSize": 2,\n  "maxLength": 2048,\n  "loraRank": 16\n}`,
-                        totalEpochs: 3,
-                      });
+                      startOpenBaseJob(
+                        selectableDatasets[0] ? [selectableDatasets[0].id] : [],
+                      );
                     }}
                     size="sm"
                   >
-                    <Plus className="size-3.5" />
-                    New job
+                    {installRecommendedOpenBase.isPending ? (
+                      <RefreshCw className="size-3.5 animate-spin" />
+                    ) : (
+                      <Plus className="size-3.5" />
+                    )}
+                    {installRecommendedOpenBase.isPending
+                      ? `Installing open base ${Math.round(openBaseInstallProgress?.percent ?? 0)}%`
+                      : "New job"}
                   </Button>
                 ) : null}
               </div>
@@ -3448,7 +3667,39 @@ export function TrainingPage(): React.JSX.Element {
               </div>
             )}
             {trainingReadiness.result?.credentialRequired === true ? (
-              <div className="space-y-2 rounded-lg border border-violet-500/20 bg-violet-500/5 p-3">
+              <div className="space-y-3 rounded-lg border border-violet-500/20 bg-violet-500/5 p-3">
+                <div className="flex items-start justify-between gap-3 rounded-md border border-emerald-500/20 bg-emerald-500/5 p-3">
+                  <div>
+                    <p className="text-[10px] font-medium text-emerald-200">
+                      Train without an account or token
+                    </p>
+                    <p className="mt-1 text-[9px] leading-relaxed text-muted-foreground">
+                      Tome can install the open 1.1B TinyLlama base, keep the selected
+                      datasets, apply CPU-safe LoRA defaults, and create a new Ollama
+                      model on the Windows server.
+                    </p>
+                    {openBaseInstallProgress === null ? null : (
+                      <p className="mt-1 text-[9px] text-emerald-300">
+                        {openBaseInstallProgress.message} ·{" "}
+                        {Math.round(openBaseInstallProgress.percent)}%
+                      </p>
+                    )}
+                  </div>
+                  <Button
+                    disabled={installRecommendedOpenBase.isPending}
+                    onClick={() => startOpenBaseJob(trainingReadiness.job.datasetIds)}
+                    size="sm"
+                    type="button"
+                    variant="outline"
+                  >
+                    {installRecommendedOpenBase.isPending ? (
+                      <RefreshCw className="size-3 animate-spin" />
+                    ) : (
+                      <Play className="size-3" />
+                    )}
+                    Use open base
+                  </Button>
+                </div>
                 <label className="block space-y-1.5 text-xs">
                   <span className="flex items-center gap-2">
                     <KeyRound className="size-3.5 text-violet-400" />
@@ -3533,6 +3784,15 @@ export function TrainingPage(): React.JSX.Element {
               });
             }}
           >
+            <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-3 text-[10px] leading-relaxed">
+              <p className="font-medium text-emerald-200">Automatic open-base training</p>
+              <p className="mt-1 text-muted-foreground">
+                Tome downloads the matching full-precision open checkpoint on the Windows
+                server, trains a LoRA adapter, and registers the output as a new Ollama
+                model. Ollama&apos;s quantized inference file remains the registration
+                base and is not modified.
+              </p>
+            </div>
             <div className="space-y-1.5 text-xs">
               {selectableDatasetGroups.length === 0 ? null : (
                 <div className="mb-3 space-y-1.5">
@@ -3689,18 +3949,21 @@ export function TrainingPage(): React.JSX.Element {
                   className={inputClassName}
                   onChange={(event) => {
                     const baseModel = event.target.value;
-                    const sourceModel = sourceModelForOllama(baseModel);
+                    const profile = trainingBaseProfileForOllama(baseModel);
                     setJobForm({
                       ...jobForm,
                       baseModel,
                       parametersJson:
-                        sourceModel === null
+                        profile === null
                           ? jobForm.parametersJson
-                          : writeJobParameter(
-                              jobForm.parametersJson,
-                              "sourceModel",
-                              sourceModel,
-                            ),
+                          : writeJobParameters(jobForm.parametersJson, {
+                              sourceModel: profile.sourceModel,
+                              trainingRecipe:
+                                profile.access === "open"
+                                  ? "open-base-lora"
+                                  : "restricted-base-lora",
+                              ollamaAdapterArchitecture: profile.architecture,
+                            }),
                     });
                   }}
                   required
@@ -3713,14 +3976,30 @@ export function TrainingPage(): React.JSX.Element {
                         ? "No adapter-compatible models installed"
                         : "Select an installed model"}
                   </option>
-                  {compatibleOllamaModels.map((model) => (
-                    <option key={model.name} value={model.name}>
-                      {model.name}
-                      {model.details?.parameter_size
-                        ? ` · ${model.details.parameter_size}`
-                        : ""}
-                    </option>
-                  ))}
+                  {openCompatibleOllamaModels.length === 0 ? null : (
+                    <optgroup label="Open bases · no account or token">
+                      {openCompatibleOllamaModels.map((model) => (
+                        <option key={model.name} value={model.name}>
+                          {model.name}
+                          {model.details?.parameter_size
+                            ? ` · ${model.details.parameter_size}`
+                            : ""}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
+                  {restrictedCompatibleOllamaModels.length === 0 ? null : (
+                    <optgroup label="Restricted sources · external access required">
+                      {restrictedCompatibleOllamaModels.map((model) => (
+                        <option key={model.name} value={model.name}>
+                          {model.name}
+                          {model.details?.parameter_size
+                            ? ` · ${model.details.parameter_size}`
+                            : ""}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
                   {incompatibleOllamaModels.length === 0 ? null : (
                     <optgroup label="Installed · adapter registration unavailable">
                       {incompatibleOllamaModels.map((model) => (
@@ -3736,13 +4015,17 @@ export function TrainingPage(): React.JSX.Element {
                 </select>
                 <FieldHelp>
                   Refresh all reads the complete installed list directly from the active
-                  Ollama server. Llama, Mistral/Mixtral, and Gemma models can currently be
-                  selected for Safetensors adapter registration; other installed models
-                  remain visible but disabled.
+                  Ollama server. Open bases train without an account or token. Restricted
+                  bases remain available for advanced users but require their original
+                  repository access.
                 </FieldHelp>
               </div>
               <label className="block space-y-1.5 text-xs sm:col-span-2">
-                <span>Original trainable source</span>
+                <span>
+                  {selectedJobBaseProfile?.access === "open"
+                    ? "Automatic open training source"
+                    : "Original trainable source"}
+                </span>
                 <input
                   className={inputClassName}
                   onChange={(event) =>
@@ -3756,13 +4039,14 @@ export function TrainingPage(): React.JSX.Element {
                     })
                   }
                   placeholder="organization/model-name"
+                  readOnly={selectedJobBaseProfile !== null}
                   required
                   value={readJobParameter(jobForm.parametersJson, "sourceModel")}
                 />
                 <FieldHelp>
-                  The full-precision Transformers checkpoint used for training. The
-                  selected Ollama model is retained for final adapter registration; its
-                  quantized inference files are not used for gradient training.
+                  {selectedJobBaseProfile?.access === "open"
+                    ? "Tome selected the matching public checkpoint automatically. It downloads anonymously on the Windows server."
+                    : "The full-precision checkpoint must exactly match the selected Ollama base. Quantized Ollama inference files cannot be used for gradient training."}
                 </FieldHelp>
               </label>
               <label className="block space-y-1.5 text-xs">
@@ -3781,8 +4065,9 @@ export function TrainingPage(): React.JSX.Element {
                   <option value="transformers">Hugging Face Transformers</option>
                 </select>
                 <FieldHelp>
-                  Auto/LoRA trains a small adapter. QLoRA reduces GPU memory with 4-bit
-                  loading. Transformers uses the general worker path.
+                  Auto/LoRA is the supported fallback for your Ryzen CPU. QLoRA requires a
+                  supported NVIDIA CUDA runtime; Radeon Vega 8 is not used by this Windows
+                  worker.
                 </FieldHelp>
               </label>
               <label className="block space-y-1.5 text-xs">

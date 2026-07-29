@@ -2,6 +2,8 @@ import { TrainingPage } from "@/features/training/training-page";
 import { backend } from "@/lib/backend";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type {
+  OllamaModel,
+  ServerRecord,
   TrainingDatasetRecord,
   TrainingDatasetGroupRecord,
   TrainingJobRecord,
@@ -23,6 +25,31 @@ const server: TrainingServerRecord = {
   updatedAt: "2026-07-28T00:00:00Z",
   url: "http://192.168.1.6:11435",
   version: null,
+};
+
+const ollamaServer: ServerRecord = {
+  createdAt: "2026-07-28T00:00:00Z",
+  id: "ollama-server",
+  isActive: true,
+  lastError: null,
+  lastPingMs: 5,
+  lastStatus: "connected",
+  lastTestedAt: "2026-07-28T00:00:00Z",
+  lastVersion: "0.12.0",
+  name: "Windows Ollama",
+  updatedAt: "2026-07-28T00:00:00Z",
+  url: "http://192.168.1.6:11434",
+};
+
+const openOllamaModel: OllamaModel = {
+  details: {
+    families: ["llama"],
+    family: "llama",
+    parameter_size: "1.1B",
+    quantization_level: "Q4_K_M",
+  },
+  name: "tinyllama:latest",
+  size: 638_000_000,
 };
 
 const dataset: TrainingDatasetRecord = {
@@ -100,6 +127,8 @@ function renderTrainingPage(
     defaultOptions: { queries: { retry: false } },
   });
   queryClient.setQueryData(["training-servers"], [server]);
+  queryClient.setQueryData(["active-server"], ollamaServer);
+  queryClient.setQueryData(["models", ollamaServer.url], [openOllamaModel]);
   queryClient.setQueryData(["training-datasets"], trainingDatasets);
   queryClient.setQueryData(["training-dataset-groups"], [datasetGroup]);
   queryClient.setQueryData(["dataset-uploads"], []);
@@ -166,6 +195,23 @@ describe("Training readiness", () => {
     await waitFor(() => expect(preflight).toHaveBeenCalledWith(job.id, undefined));
     expect(await screen.findByText("Trainable source is accessible")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Train now" })).toBeInTheDocument();
+  });
+
+  it("creates token-free jobs from the matching open Ollama base", () => {
+    renderTrainingPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Training Jobs" }));
+    fireEvent.click(screen.getByRole("button", { name: "New job" }));
+
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByLabelText("Installed Ollama base model")).toHaveValue(
+      "tinyllama:latest",
+    );
+    expect(
+      within(dialog).getByDisplayValue("TinyLlama/TinyLlama-1.1B-Chat-v0.6"),
+    ).toHaveAttribute("readonly");
+    expect(within(dialog).getByText("Automatic open-base training")).toBeInTheDocument();
+    expect(within(dialog).getByDisplayValue("1")).toBeInTheDocument();
   });
 });
 

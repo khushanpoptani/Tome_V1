@@ -17,6 +17,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+OPEN_BASE_SOURCES = {
+    "tinyllama": "TinyLlama/TinyLlama-1.1B-Chat-v0.6",
+    "mistral": "mistralai/Mistral-7B-Instruct-v0.3",
+}
+
 
 def emit(kind: str, **values: Any) -> None:
     print(json.dumps({"type": kind, **values}, ensure_ascii=False), flush=True)
@@ -91,7 +96,17 @@ def is_authentication_error(message: str) -> bool:
     )
 
 
-def preflight(source_model: str, backend: str) -> int:
+def open_source_for_ollama(base_model: str) -> str | None:
+    """Return the audited public checkpoint matching a known Ollama base."""
+
+    normalized = base_model.strip().lower()
+    for prefix, source_model in OPEN_BASE_SOURCES.items():
+        if normalized == prefix or normalized.startswith(f"{prefix}:"):
+            return source_model
+    return None
+
+
+def preflight(source_model: str, base_model: str, backend: str) -> int:
     """Verify model access and worker suitability without starting a job."""
 
     checks: list[dict[str, Any]] = []
@@ -146,66 +161,97 @@ def preflight(source_model: str, backend: str) -> int:
         return 0
 
     normalized_backend = backend.lower()
-    if normalized_backend == "qlora" and not torch.cuda.is_available():
+    accelerator_available = torch.cuda.is_available()
+    rocm_version = getattr(torch.version, "hip", None)
+    if normalized_backend == "qlora" and (
+        not accelerator_available or rocm_version is not None
+    ):
         ready = False
         check(
             "accelerator",
             "failed",
-            "QLoRA requires a CUDA-capable NVIDIA GPU, but CUDA was not detected",
-            "Install the NVIDIA driver and CUDA-enabled PyTorch, or select LoRA.",
+            (
+                "QLoRA requires the supported NVIDIA CUDA worker; "
+                "the current accelerator is unavailable or uses ROCm"
+            ),
+            "Select Auto (LoRA). Tome can use CPU training when no supported GPU is available.",
         )
-    elif torch.cuda.is_available():
+    elif accelerator_available:
         device_name = torch.cuda.get_device_name(0)
         memory = torch.cuda.get_device_properties(0).total_memory
+        accelerator_name = "ROCm" if rocm_version is not None else "CUDA"
         check(
             "accelerator",
             "passed",
-            f"CUDA is available on {device_name} with {memory / 1024**3:.1f} GiB VRAM",
+            (
+                f"{accelerator_name} acceleration is available on {device_name} "
+                f"with {memory / 1024**3:.1f} GiB VRAM"
+            ),
         )
     else:
         check(
             "accelerator",
             "warning",
-            "CUDA was not detected; LoRA may run on CPU but will be very slow",
-            "Configure an NVIDIA GPU for production training.",
+            "No supported PyTorch GPU accelerator was detected; LoRA will use the Ryzen CPU",
+            (
+                "CPU training is automatic but slow. Use the open TinyLlama 1.1B recipe "
+                "with one epoch and a small record limit for the first run."
+            ),
         )
 
-    try:
-        configuration = AutoConfig.from_pretrained(
-            source_model,
-            token=credential,
-            trust_remote_code=False,
-        )
-        AutoTokenizer.from_pretrained(
-            source_model,
-            token=credential,
-            trust_remote_code=False,
-        )
-        source_status = "ready"
-        check(
-            "source-model",
-            "passed",
-            (
-                f"Trainable source {source_model} is accessible "
-                f"({getattr(configuration, 'model_type', 'unknown')} architecture)"
-            ),
-        )
-    except Exception as error:
+    expected_open_source = open_source_for_ollama(base_model)
+    if (
+        expected_open_source is not None
+        and source_model.casefold() != expected_open_source.casefold()
+    ):
         ready = False
-        message = str(error)
-        gated = is_authentication_error(message)
-        source_status = "authenticationRequired" if gated else "unreachable"
+        source_status = "mismatch"
         check(
             "source-model",
-            "actionRequired" if gated else "failed",
-            message,
+            "failed",
             (
-                "Approve the model licence, enter a read-only Hugging Face token in Tome, "
-                "and run the check again."
-                if gated
-                else "Confirm the model ID and the Windows server internet connection."
+                f"Ollama base {base_model} must use matching training source "
+                f"{expected_open_source}, not {source_model}"
             ),
+            "Create a new automatic open-base job so Tome can repair the model pairing.",
         )
+    else:
+        try:
+            configuration = AutoConfig.from_pretrained(
+                source_model,
+                token=credential,
+                trust_remote_code=False,
+            )
+            AutoTokenizer.from_pretrained(
+                source_model,
+                token=credential,
+                trust_remote_code=False,
+            )
+            source_status = "ready"
+            check(
+                "source-model",
+                "passed",
+                (
+                    f"Trainable source {source_model} is accessible "
+                    f"({getattr(configuration, 'model_type', 'unknown')} architecture)"
+                ),
+            )
+        except Exception as error:
+            ready = False
+            message = str(error)
+            gated = is_authentication_error(message)
+            source_status = "authenticationRequired" if gated else "unreachable"
+            check(
+                "source-model",
+                "actionRequired" if gated else "failed",
+                message,
+                (
+                    "Approve the model licence, enter a read-only Hugging Face token in Tome, "
+                    "and run the check again."
+                    if gated
+                    else "Confirm the model ID and the Windows server internet connection."
+                ),
+            )
 
     print(
         json.dumps(
@@ -430,6 +476,22 @@ def run(spec_path: Path) -> int:
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
     parameters = dict(spec.get("parameters") or {})
     source_model = str(parameters.get("sourceModel") or spec["baseModel"])
+    if parameters.get("trainingRecipe") == "open-base-lora":
+        expected_open_source = open_source_for_ollama(str(spec["baseModel"]))
+        if expected_open_source is None:
+            raise ValueError(
+                "Automatic open-base training is not available for "
+                f"Ollama base {spec['baseModel']}"
+            )
+        if source_model.casefold() != expected_open_source.casefold():
+            emit(
+                "warning",
+                message=(
+                    f"Replacing mismatched source {source_model} with the audited "
+                    f"checkpoint {expected_open_source}"
+                ),
+            )
+        source_model = expected_open_source
     output_path = Path(spec["outputPath"]).resolve()
     checkpoints = output_path.parent / "checkpoints"
     raw_datasets = spec.get("datasets")
@@ -609,13 +671,18 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--preflight-source")
+    parser.add_argument("--preflight-base", default="")
     parser.add_argument("--preflight-backend", default="auto")
     parser.add_argument("--spec", type=Path)
     arguments = parser.parse_args()
     if arguments.probe:
         return probe()
     if arguments.preflight_source:
-        return preflight(arguments.preflight_source, arguments.preflight_backend)
+        return preflight(
+            arguments.preflight_source,
+            arguments.preflight_base,
+            arguments.preflight_backend,
+        )
     if arguments.spec is None:
         parser.error("--spec is required unless --probe is used")
     try:
