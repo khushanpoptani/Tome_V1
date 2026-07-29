@@ -72,6 +72,36 @@ class TrainingDatasetNormalizationTests(unittest.TestCase):
                 12,
             )
 
+    def test_accepts_common_instruction_and_chat_schemas_without_custom_mapping(
+        self,
+    ) -> None:
+        instruction = normalize_record(
+            {"instruction": "Plan a release", "output": "Create milestones"},
+            {},
+            "Planning",
+            "instructions.jsonl",
+            1,
+            1,
+        )
+        chat = normalize_record(
+            {
+                "messages": [
+                    {"role": "user", "content": "Plan a release"},
+                    {"role": "assistant", "content": "Create milestones"},
+                ]
+            },
+            {},
+            "Planning",
+            "messages.jsonl",
+            1,
+            2,
+        )
+
+        self.assertEqual(instruction["text"], "Plan a release\n\nCreate milestones")
+        self.assertEqual(
+            chat["text"], "user: Plan a release\n\nassistant: Create milestones"
+        )
+
     def test_max_records_creates_a_bounded_smoke_training_dataset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

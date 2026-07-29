@@ -470,6 +470,24 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
             "#,
         )?;
     }
+
+    let has_v10 = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 10)",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if !has_v10 {
+        connection.execute_batch(
+            r#"
+            BEGIN IMMEDIATE;
+            ALTER TABLE training_datasets
+                ADD COLUMN exclusions_json TEXT NOT NULL DEFAULT '[]';
+            INSERT INTO schema_migrations(version, applied_at)
+            VALUES (10, datetime('now'));
+            COMMIT;
+            "#,
+        )?;
+    }
     Ok(())
 }
 
@@ -495,7 +513,7 @@ mod tests {
                 row.get::<_, i64>(0)
             })
             .expect("schema version should be readable");
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         for table in [
             "training_servers",
             "training_dataset_groups",
@@ -518,6 +536,11 @@ mod tests {
         ));
         assert!(has_column(&connection, "training_jobs", "dataset_ids_json"));
         assert!(has_column(&connection, "training_datasets", "group_id"));
+        assert!(has_column(
+            &connection,
+            "training_datasets",
+            "exclusions_json"
+        ));
     }
 
     #[test]

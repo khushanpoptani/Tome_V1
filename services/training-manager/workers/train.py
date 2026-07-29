@@ -127,25 +127,50 @@ def normalize_record(
     direct = record.get(text_field)
     if isinstance(direct, str) and direct.strip():
         return {"text": direct.strip()}
-    prompt = record.get(prompt_field)
-    response = record.get(response_field)
-    if (
-        isinstance(prompt, str)
-        and prompt.strip()
-        and isinstance(response, str)
-        and response.strip()
-    ):
-        input_value = record.get(input_field)
-        prompt_parts = [prompt.strip()]
-        if isinstance(input_value, str) and input_value.strip():
-            prompt_parts.append(input_value.strip())
-        return {
-            "text": f"{separator.join(prompt_parts)}{separator}{response.strip()}"
-        }
+    candidate_pairs = [
+        (prompt_field, response_field),
+        ("prompt", "response"),
+        ("instruction", "output"),
+    ]
+    seen_pairs: set[tuple[str, str]] = set()
+    for candidate_prompt, candidate_response in candidate_pairs:
+        pair = (candidate_prompt, candidate_response)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        prompt = record.get(candidate_prompt)
+        response = record.get(candidate_response)
+        if (
+            isinstance(prompt, str)
+            and prompt.strip()
+            and isinstance(response, str)
+            and response.strip()
+        ):
+            input_value = record.get(input_field)
+            prompt_parts = [prompt.strip()]
+            if isinstance(input_value, str) and input_value.strip():
+                prompt_parts.append(input_value.strip())
+            return {
+                "text": f"{separator.join(prompt_parts)}{separator}{response.strip()}"
+            }
+    messages = record.get("messages")
+    if isinstance(messages, list) and messages:
+        parts: list[str] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                prefix = role.strip() if isinstance(role, str) and role.strip() else "message"
+                parts.append(f"{prefix}: {content.strip()}")
+        if parts:
+            return {"text": separator.join(parts)}
     available = ", ".join(sorted(str(key) for key in record.keys())[:12]) or "none"
     raise ValueError(
-        f"{location} needs non-empty '{text_field}' or "
-        f"'{prompt_field}' + '{response_field}' string fields. "
+        f"{location} needs non-empty '{text_field}', "
+        f"'{prompt_field}' + '{response_field}', instruction + output, "
+        "or messages fields. "
         f"Available fields: {available}"
     )
 

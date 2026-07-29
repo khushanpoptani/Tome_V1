@@ -42,6 +42,7 @@ const dataset: TrainingDatasetRecord = {
   trainingServerId: null,
   updatedAt: "2026-07-28T00:00:00Z",
   validationErrorsJson: "[]",
+  exclusionsJson: "[]",
   validationStatus: "valid",
 };
 
@@ -152,6 +153,44 @@ describe("Training dataset groups", () => {
     expect(screen.getByText("0 datasets")).toBeInTheDocument();
     expect(screen.getByText("0 valid")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Add" })).toBeEnabled();
+  });
+
+  it("shows structured row and file recovery actions for validation issues", () => {
+    const invalidDataset: TrainingDatasetRecord = {
+      ...dataset,
+      validationErrorsJson: JSON.stringify([
+        {
+          canExcludeFile: true,
+          canExcludeRow: true,
+          code: "invalid_json",
+          file: "records.jsonl",
+          id: "error:invalid_json:records.jsonl:2",
+          message: "records.jsonl line 2: invalid JSON record",
+          row: 2,
+          severity: "error",
+        },
+        {
+          canExcludeFile: true,
+          canExcludeRow: false,
+          code: "unrecognized_training_fields",
+          file: "metadata.json",
+          id: "warning:unrecognized_training_fields:metadata.json:1",
+          message: "metadata.json row 1 has no recognized training fields",
+          row: 1,
+          severity: "warning",
+        },
+      ]),
+      validationStatus: "invalid",
+    };
+    renderTrainingPage([invalidDataset]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Datasets" }));
+
+    expect(screen.getByText("1 error")).toBeInTheDocument();
+    expect(screen.getByText("1 warning")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Exclude row" })).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "Exclude file" })).toHaveLength(2);
+    expect(screen.getByText("records.jsonl · row 2")).toBeInTheDocument();
   });
 
   it("provides a labeled group deletion action and deletes an empty group", async () => {

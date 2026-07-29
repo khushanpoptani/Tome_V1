@@ -16,6 +16,8 @@ import { errorMessage, formatBytes, formatDate } from "@/lib/format";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type {
+  DatasetExclusion,
+  DatasetValidationIssue,
   OllamaModel,
   TrainingDatasetGroupRecord,
   TrainingDatasetRecord,
@@ -94,6 +96,7 @@ interface DatasetPreparationInput {
   readonly sourcePath: string;
   readonly compress: boolean;
   readonly supportedFormats: string | readonly string[];
+  readonly exclusions?: readonly DatasetExclusion[];
 }
 
 interface DatasetGroupForm {
@@ -249,14 +252,91 @@ function FieldHelp({
   );
 }
 
-function parseValidationErrors(dataset: TrainingDatasetRecord): readonly string[] {
+function parseValidationIssues(
+  dataset: TrainingDatasetRecord,
+): readonly DatasetValidationIssue[] {
   try {
     const value: unknown = JSON.parse(dataset.validationErrorsJson);
-    return Array.isArray(value)
-      ? value.filter((item): item is string => typeof item === "string")
-      : [];
+    if (!Array.isArray(value)) return [];
+    const items = value as readonly unknown[];
+    return items.flatMap((item, index): readonly DatasetValidationIssue[] => {
+      if (typeof item === "string") {
+        return [
+          {
+            canExcludeFile: false,
+            canExcludeRow: false,
+            code: "legacy_validation_error",
+            file: null,
+            id: `legacy:${index}:${item}`,
+            message: item,
+            row: null,
+            severity: "error",
+          },
+        ];
+      }
+      if (typeof item !== "object" || item === null) {
+        return [];
+      }
+      const candidate = item as Record<string, unknown>;
+      if (typeof candidate.message !== "string") return [];
+      const message = candidate.message;
+      return [
+        {
+          canExcludeFile: candidate.canExcludeFile === true,
+          canExcludeRow: candidate.canExcludeRow === true,
+          code: typeof candidate.code === "string" ? candidate.code : "validation_issue",
+          file: typeof candidate.file === "string" ? candidate.file : null,
+          id:
+            typeof candidate.id === "string"
+              ? candidate.id
+              : `validation:${index}:${message}`,
+          message,
+          row: typeof candidate.row === "number" ? candidate.row : null,
+          severity: candidate.severity === "warning" ? "warning" : "error",
+        },
+      ];
+    });
   } catch {
-    return ["Validation details could not be decoded."];
+    return [
+      {
+        canExcludeFile: false,
+        canExcludeRow: false,
+        code: "validation_decode_failed",
+        file: null,
+        id: "validation-decode-failed",
+        message: "Validation details could not be decoded.",
+        row: null,
+        severity: "error",
+      },
+    ];
+  }
+}
+
+function parseValidationErrors(dataset: TrainingDatasetRecord): readonly string[] {
+  return parseValidationIssues(dataset)
+    .filter((issue) => issue.severity === "error")
+    .map((issue) => issue.message);
+}
+
+function parseDatasetExclusions(
+  dataset: TrainingDatasetRecord,
+): readonly DatasetExclusion[] {
+  try {
+    const value: unknown = JSON.parse(dataset.exclusionsJson);
+    if (!Array.isArray(value)) return [];
+    const items = value as readonly unknown[];
+    return items.flatMap((item): readonly DatasetExclusion[] => {
+      if (typeof item !== "object" || item === null) {
+        return [];
+      }
+      const candidate = item as Record<string, unknown>;
+      if (typeof candidate.file !== "string") return [];
+      const row =
+        typeof candidate.row === "number" && candidate.row > 0 ? candidate.row : null;
+      return [{ file: candidate.file, row }];
+    });
+  } catch {
+    return [];
   }
 }
 
@@ -545,6 +625,48 @@ export function TrainingPage(): React.JSX.Element {
     }
   };
   prepareDatasetRef.current = prepareDataset;
+
+  const excludeDatasetIssue = (
+    dataset: TrainingDatasetRecord,
+    issue: DatasetValidationIssue,
+    mode: "file" | "row",
+  ): void => {
+    if (issue.file === null) {
+      toast.error("This validation issue is not tied to a removable file.");
+      return;
+    }
+    const existing = parseDatasetExclusions(dataset);
+    const nextExclusion: DatasetExclusion = {
+      file: issue.file,
+      row: mode === "row" ? issue.row : null,
+    };
+    const retained =
+      mode === "file" ? existing.filter((value) => value.file !== issue.file) : existing;
+    const exclusions = [
+      ...retained,
+      ...(retained.some(
+        (value) =>
+          value.file === nextExclusion.file &&
+          (value.row ?? null) === (nextExclusion.row ?? null),
+      )
+        ? []
+        : [nextExclusion]),
+    ];
+    toast.info(
+      mode === "row"
+        ? `Excluding row ${String(issue.row)} from ${issue.file}. Your original file will not be changed.`
+        : `Excluding ${issue.file} from the managed upload. Your original file will not be changed.`,
+    );
+    void prepareDataset({
+      compress: true,
+      exclusions,
+      groupId: dataset.groupId,
+      id: dataset.id,
+      name: dataset.name,
+      sourcePath: dataset.sourcePath,
+      supportedFormats: ["jsonl", "json", "csv", "parquet", "txt", "md"],
+    }).catch(() => undefined);
+  };
 
   useEffect(() => {
     if (!isTauriRuntime()) {
@@ -1862,7 +1984,12 @@ export function TrainingPage(): React.JSX.Element {
                       );
                     }
                     const dataset = row.dataset;
+                    const validationIssues = parseValidationIssues(dataset);
                     const validationErrors = parseValidationErrors(dataset);
+                    const validationWarnings = validationIssues.filter(
+                      (issue) => issue.severity === "warning",
+                    );
+                    const appliedExclusions = parseDatasetExclusions(dataset);
                     const latest = uploads.data?.find(
                       (upload) => upload.datasetId === dataset.id,
                     );
@@ -1974,6 +2101,9 @@ export function TrainingPage(): React.JSX.Element {
                               <p className="mt-1 text-[10px] text-muted-foreground">
                                 {formatBytes(dataset.size)} · {dataset.fileCount} files ·{" "}
                                 {dataset.compressed ? "compressed" : "original"}
+                                {appliedExclusions.length === 0
+                                  ? ""
+                                  : ` · ${appliedExclusions.length} exclusion${appliedExclusions.length === 1 ? "" : "s"} applied`}
                               </p>
                             </div>
                             <div className="flex flex-wrap gap-1">
@@ -2198,10 +2328,22 @@ export function TrainingPage(): React.JSX.Element {
                             </div>
                           )}
                           {dataset.preview === null &&
-                          validationErrors.length === 0 ? null : (
+                          validationIssues.length === 0 ? null : (
                             <details className="mt-3 min-w-0 max-w-full overflow-hidden text-[10px]">
-                              <summary className="text-muted-foreground">
-                                Preview and validation
+                              <summary className="flex cursor-pointer items-center gap-2 text-muted-foreground">
+                                <span>Preview and validation</span>
+                                {validationErrors.length > 0 ? (
+                                  <Badge className="border-red-500/25 bg-red-500/10 text-red-300">
+                                    {validationErrors.length} error
+                                    {validationErrors.length === 1 ? "" : "s"}
+                                  </Badge>
+                                ) : null}
+                                {validationWarnings.length > 0 ? (
+                                  <Badge className="border-amber-500/25 bg-amber-500/10 text-amber-300">
+                                    {validationWarnings.length} warning
+                                    {validationWarnings.length === 1 ? "" : "s"}
+                                  </Badge>
+                                ) : null}
                               </summary>
                               <div className="mt-2 max-h-56 max-w-full overflow-auto overscroll-contain rounded-lg border border-border bg-background">
                                 {dataset.preview === null ? null : (
@@ -2209,20 +2351,101 @@ export function TrainingPage(): React.JSX.Element {
                                     {dataset.preview}
                                   </pre>
                                 )}
-                                {validationErrors.length === 0 ? null : (
-                                  <div className="border-t border-border p-3">
-                                    {validationErrors.slice(0, 25).map((message) => (
-                                      <p
-                                        className="mt-1 break-words text-red-400 first:mt-0"
-                                        key={message}
+                                {validationIssues.length === 0 ? null : (
+                                  <div className="space-y-2 border-t border-border p-3">
+                                    {validationIssues.slice(0, 50).map((issue) => (
+                                      <div
+                                        className={cn(
+                                          "rounded-md border p-2",
+                                          issue.severity === "error"
+                                            ? "border-red-500/20 bg-red-500/5"
+                                            : "border-amber-500/20 bg-amber-500/5",
+                                        )}
+                                        key={issue.id}
                                       >
-                                        {message}
-                                      </p>
+                                        <div className="flex flex-wrap items-start justify-between gap-2">
+                                          <div className="min-w-0 flex-1">
+                                            <div className="mb-1 flex items-center gap-1.5">
+                                              {issue.severity === "error" ? (
+                                                <CircleAlert className="size-3.5 shrink-0 text-red-400" />
+                                              ) : (
+                                                <CircleHelp className="size-3.5 shrink-0 text-amber-400" />
+                                              )}
+                                              <span
+                                                className={
+                                                  issue.severity === "error"
+                                                    ? "font-medium text-red-300"
+                                                    : "font-medium text-amber-300"
+                                                }
+                                              >
+                                                {issue.severity === "error"
+                                                  ? "Error"
+                                                  : "Warning"}
+                                              </span>
+                                              {issue.file === null ? null : (
+                                                <span className="truncate font-mono text-[9px] text-muted-foreground">
+                                                  {issue.file}
+                                                  {issue.row === null
+                                                    ? ""
+                                                    : ` · row ${issue.row}`}
+                                                </span>
+                                              )}
+                                            </div>
+                                            <p className="break-words text-muted-foreground">
+                                              {issue.message}
+                                            </p>
+                                          </div>
+                                          <div className="flex shrink-0 flex-wrap gap-1">
+                                            {issue.canExcludeRow && issue.row !== null ? (
+                                              <Button
+                                                disabled={
+                                                  operation?.kind === "prepare" &&
+                                                  operation.error === null
+                                                }
+                                                onClick={() =>
+                                                  excludeDatasetIssue(
+                                                    dataset,
+                                                    issue,
+                                                    "row",
+                                                  )
+                                                }
+                                                size="sm"
+                                                variant="outline"
+                                              >
+                                                <Ban className="size-3" />
+                                                Exclude row
+                                              </Button>
+                                            ) : null}
+                                            {issue.canExcludeFile ? (
+                                              <Button
+                                                disabled={
+                                                  operation?.kind === "prepare" &&
+                                                  operation.error === null
+                                                }
+                                                onClick={() =>
+                                                  excludeDatasetIssue(
+                                                    dataset,
+                                                    issue,
+                                                    "file",
+                                                  )
+                                                }
+                                                size="sm"
+                                                variant="ghost"
+                                              >
+                                                <FileArchive className="size-3" />
+                                                Exclude file
+                                              </Button>
+                                            ) : null}
+                                          </div>
+                                        </div>
+                                      </div>
                                     ))}
-                                    {validationErrors.length <= 25 ? null : (
+                                    {validationIssues.length <= 50 ? null : (
                                       <p className="mt-2 text-muted-foreground">
-                                        {validationErrors.length - 25} additional errors
-                                        hidden to keep this view responsive.
+                                        {validationIssues.length - 50} additional issues
+                                        hidden to keep this view responsive. Exclude the
+                                        affected file to resolve all of its issues at
+                                        once.
                                       </p>
                                     )}
                                   </div>

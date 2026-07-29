@@ -79,7 +79,9 @@ Dependencies: Phase 5 and approved agent schemas.
 - Implemented dataset inspection, configurable formats, preview, validation, compression,
   checksums, reusable dataset groups, group-level upload/delete actions, resumable chunk
   uploads, retries, cancellation, speed, ETA, long-running validation heartbeats, and
-  contextual right-sidebar logs.
+  contextual right-sidebar logs. Structured validation issues identify errors versus
+  warnings and allow safe row/file exclusion through managed artifacts without modifying
+  source data.
 - Implemented the Windows Training Manager runtime, job drafts, dispatch, WebSocket and
   heartbeat monitoring, retry/cancel, resource snapshots, persistent logs, and Ollama
   registry integration.

@@ -235,11 +235,28 @@ export interface TrainingDatasetRecord {
   readonly compressed: boolean;
   readonly validationStatus: "pending" | "valid" | "invalid";
   readonly validationErrorsJson: string;
+  readonly exclusionsJson: string;
   readonly preview: string | null;
   readonly remoteDatasetId: string | null;
   readonly trainingServerId: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
+}
+
+export interface DatasetExclusion {
+  readonly file: string;
+  readonly row?: number | null;
+}
+
+export interface DatasetValidationIssue {
+  readonly id: string;
+  readonly severity: "error" | "warning";
+  readonly code: string;
+  readonly message: string;
+  readonly file: string | null;
+  readonly row: number | null;
+  readonly canExcludeRow: boolean;
+  readonly canExcludeFile: boolean;
 }
 
 export interface TrainingDatasetInput {
@@ -249,6 +266,7 @@ export interface TrainingDatasetInput {
   readonly sourcePath: string;
   readonly compress: boolean;
   readonly supportedFormats?: readonly string[];
+  readonly exclusions?: readonly DatasetExclusion[];
 }
 
 export interface TrainingDatasetGroupRecord {

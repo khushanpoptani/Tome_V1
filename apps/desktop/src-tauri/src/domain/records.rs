@@ -166,11 +166,19 @@ pub struct TrainingDatasetRecord {
     pub compressed: bool,
     pub validation_status: String,
     pub validation_errors_json: String,
+    pub exclusions_json: String,
     pub preview: Option<String>,
     pub remote_dataset_id: Option<String>,
     pub training_server_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetExclusion {
+    pub file: String,
+    pub row: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,6 +191,8 @@ pub struct TrainingDatasetInput {
     #[serde(default)]
     pub compress: bool,
     pub supported_formats: Option<Vec<String>>,
+    #[serde(default)]
+    pub exclusions: Vec<DatasetExclusion>,
 }
 
 #[derive(Debug, Clone, Serialize)]

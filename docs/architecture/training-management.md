@@ -249,12 +249,21 @@ Validation is deterministic:
 - hidden files and known build/cache directories are skipped;
 - at least one supported file is required;
 - JSON and JSONL syntax is checked;
+- JSON training records are classified against the supported `text`, prompt/response,
+  instruction/output, and messages schemas;
 - empty files are rejected;
 - total bytes and file count are recorded;
 - previews are bounded and never execute content;
 - SHA-256 is computed for the upload artifact.
 
-Compression creates an application-managed ZIP artifact without modifying the source.
+Validation results are structured issues with severity, code, relative file, row when
+available, and supported recovery actions. Syntax failures and unusable records are
+errors; records that require custom field mapping are warnings and do not block upload.
+Results are bounded to keep multi-gigabyte datasets responsive.
+
+Users can exclude an offending NDJSON row or a complete file and rerun validation from the
+issue card. Tome persists the exclusion manifest and creates a cleaned application-managed
+ZIP artifact. The original source is never edited or deleted.
 
 ## Persistence
 
@@ -330,11 +339,11 @@ Dataset operations expose a continuous stage model:
 
 Cards report processed and total bytes, current file, transfer speed, remaining bytes,
 percentage, and ETA where available. Every dataset owns independent operation state, so
-parallel preparation and uploads do not overwrite each other. Validation errors retain
-their exact file and parser reason; the card renders a bounded first page to remain
-responsive for very large invalid datasets while SQLite retains the complete result.
-Delete state is per dataset, disables duplicate actions immediately, and keeps the card
-visible with stage feedback until local and remote cleanup succeeds.
+parallel preparation and uploads do not overwrite each other. Validation issues retain
+severity, exact file, row where recoverable, parser/schema reason, and row/file exclusion
+actions. Both collection and rendering are bounded to remain responsive for very large
+invalid datasets. Delete state is per dataset, disables duplicate actions immediately, and
+keeps the card visible with stage feedback until local and remote cleanup succeeds.
 
 Task persistence is serialized per operation so an earlier progress write cannot arrive
 after and overwrite a terminal state. On startup, the database migration reconciles legacy
