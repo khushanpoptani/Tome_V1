@@ -58,8 +58,8 @@ Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -N
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\uninstall-packaged-training-manager.ps1"""; Flags: waituntilterminated runhidden logoutput
 
 [Icons]
-Name: "{group}\Check server status"; Filename: "http://127.0.0.1:11435/v1/health"; Flags: shellexec
-Name: "{group}\Open training data folder"; Filename: "{commonappdata}\Tome\TrainingManager"; Flags: foldershortcut
+Name: "{group}\Check server status"; Filename: "http://127.0.0.1:11435/v1/health"
+Name: "{group}\Open training data folder"; Filename: "{commonappdata}\Tome\TrainingManager"
 Name: "{group}\View installation log"; Filename: "{sys}\notepad.exe"; Parameters: """{commonappdata}\Tome\TrainingManager\installer.log"""
 Name: "{group}\Uninstall Tome Training Server"; Filename: "{uninstallexe}"
 
