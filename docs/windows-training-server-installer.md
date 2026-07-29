@@ -66,6 +66,30 @@ target\release\bundle\windows-training-server
 The Python installer is a build input only. The committed repository does not contain the
 third-party executable.
 
+The build script locates both machine-wide and per-user Inno Setup installations. The
+per-user path is used when `winget` installs Inno Setup without adding it to the current
+PowerShell process's `PATH`.
+
 Development installers are unsigned and Windows SmartScreen may request an additional
 confirmation. Production distribution requires the code-signing milestone described in the
 roadmap.
+
+## Tome Desktop distribution boundary
+
+Tome Desktop does not compile a Windows service or setup executable on macOS. Shipping a
+Windows compiler, SDK, installer compiler, Python runtime, and signing credentials inside
+the desktop client would add a large and unsafe build toolchain to an application whose
+responsibility is server management.
+
+The supported desktop experience is:
+
+1. release automation builds and signs the Windows setup executable;
+2. an HTTPS release manifest publishes its version, URL, size, SHA-256 checksum, and
+   signing identity;
+3. Tome downloads the immutable installer, verifies the checksum and signature metadata,
+   and lets the user save it to a chosen location;
+4. the user transfers the executable to Windows and runs the setup wizard.
+
+The download/export screen must not be enabled until a real artifact host and signing
+identity are configured. GitHub Releases and a Tome-owned HTTPS update service are both
+compatible with this boundary.
