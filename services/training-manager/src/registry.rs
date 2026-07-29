@@ -14,6 +14,7 @@ pub fn validate_adapter_compatibility(
     base_model: &str,
     parameters: &serde_json::Value,
 ) -> ApiResult<()> {
+    validate_training_recipe(base_model, parameters)?;
     let declared = parameters["ollamaAdapterArchitecture"]
         .as_str()
         .map(str::to_ascii_lowercase);
@@ -28,6 +29,38 @@ pub fn validate_adapter_compatibility(
         "Ollama does not document Safetensors adapter import for base model '{base_model}'. \
 Use a Llama, Mistral/Mixtral, or Gemma base, or install a future GGUF export adapter. \
 No training job was queued."
+    )))
+}
+
+fn validate_training_recipe(base_model: &str, parameters: &serde_json::Value) -> ApiResult<()> {
+    if parameters["trainingRecipe"].as_str() != Some("open-base-lora") {
+        return Ok(());
+    }
+    let normalized = base_model.to_ascii_lowercase();
+    let expected_source = if normalized.starts_with("tinyllama") {
+        Some("TinyLlama/TinyLlama-1.1B-Chat-v0.6")
+    } else if normalized == "mistral"
+        || normalized.starts_with("mistral:latest")
+        || normalized.starts_with("mistral:7b")
+        || normalized.starts_with("mistral:v0.3")
+    {
+        Some("mistralai/Mistral-7B-Instruct-v0.3")
+    } else {
+        None
+    };
+    let expected_source = expected_source.ok_or_else(|| {
+        ApiError::invalid(format!(
+            "The open-base recipe cannot use Ollama base '{base_model}'. \
+Choose tinyllama:latest for automatic token-free training. No training job was queued."
+        ))
+    })?;
+    let source_model = parameters["sourceModel"].as_str().unwrap_or_default();
+    if source_model.eq_ignore_ascii_case(expected_source) {
+        return Ok(());
+    }
+    Err(ApiError::invalid(format!(
+        "The open-base recipe requires sourceModel '{expected_source}' for Ollama base \
+'{base_model}', but received '{source_model}'. No training job was queued."
     )))
 }
 
@@ -172,5 +205,37 @@ mod tests {
         )
         .is_ok());
         assert!(validate_adapter_compatibility("qwen2.5:3b", &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn rejects_mismatched_open_base_recipes_before_queueing() {
+        assert!(validate_adapter_compatibility(
+            "tinyllama:latest",
+            &serde_json::json!({
+                "trainingRecipe": "open-base-lora",
+                "sourceModel": "TinyLlama/TinyLlama-1.1B-Chat-v0.6",
+                "ollamaAdapterArchitecture": "llama"
+            })
+        )
+        .is_ok());
+        let unsupported = validate_adapter_compatibility(
+            "llama3.2:3b",
+            &serde_json::json!({
+                "trainingRecipe": "open-base-lora",
+                "sourceModel": "TinyLlama/TinyLlama-1.1B-Chat-v0.6",
+                "ollamaAdapterArchitecture": "llama"
+            }),
+        )
+        .expect_err("restricted Llama must not enter the automatic open workflow");
+        assert!(unsupported.message.contains("tinyllama:latest"));
+        assert!(validate_adapter_compatibility(
+            "tinyllama:latest",
+            &serde_json::json!({
+                "trainingRecipe": "open-base-lora",
+                "sourceModel": "meta-llama/Llama-3.2-3B-Instruct",
+                "ollamaAdapterArchitecture": "llama"
+            })
+        )
+        .is_err());
     }
 }

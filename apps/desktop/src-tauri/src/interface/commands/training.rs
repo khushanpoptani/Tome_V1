@@ -2798,6 +2798,39 @@ pub fn list_training_jobs(state: State<'_, AppState>) -> Result<Vec<TrainingJobR
     Ok(records)
 }
 
+fn validate_open_training_pair(base_model: &str, parameters: &Value) -> Result<(), String> {
+    if parameters["trainingRecipe"].as_str() != Some("open-base-lora") {
+        return Ok(());
+    }
+    let normalized = base_model.to_ascii_lowercase();
+    let expected_source = if normalized.starts_with("tinyllama") {
+        Some("TinyLlama/TinyLlama-1.1B-Chat-v0.6")
+    } else if normalized == "mistral"
+        || normalized.starts_with("mistral:latest")
+        || normalized.starts_with("mistral:7b")
+        || normalized.starts_with("mistral:v0.3")
+    {
+        Some("mistralai/Mistral-7B-Instruct-v0.3")
+    } else {
+        None
+    };
+    let expected_source = expected_source.ok_or_else(|| {
+        format!(
+            "Automatic open-base training cannot use '{base_model}'. Select \
+tinyllama:latest in the Open Ollama training base field."
+        )
+    })?;
+    let source_model = parameters["sourceModel"].as_str().unwrap_or_default();
+    if source_model.eq_ignore_ascii_case(expected_source) {
+        return Ok(());
+    }
+    Err(format!(
+        "The selected Ollama base '{base_model}' requires sourceModel \
+'{expected_source}', but the draft contains '{source_model}'. Create or repair the draft \
+with the automatic open-base workflow."
+    ))
+}
+
 #[tauri::command]
 pub fn save_training_job(
     state: State<'_, AppState>,
@@ -2817,6 +2850,7 @@ pub fn save_training_job(
     {
         return Err("Training parameters must include a non-empty sourceModel".into());
     }
+    validate_open_training_pair(input.base_model.trim(), &parameters)?;
     if input.total_epochs < 1 {
         return Err("Training epochs must be at least 1".into());
     }
@@ -2954,6 +2988,7 @@ async fn run_training_preflight(
     let server = active_training_server(state.clone(), job.training_server_id.as_deref())?;
     let parameters = serde_json::from_str::<Value>(&job.parameters_json)
         .map_err(|error| format!("Stored training parameters are invalid: {error}"))?;
+    validate_open_training_pair(&job.base_model, &parameters)?;
     if parameters.get("huggingFaceToken").is_some() {
         return Err(
             "This draft contains a persisted Hugging Face token. Remove it and use Check readiness to provide the token securely."
@@ -3506,13 +3541,36 @@ pub fn get_training_resources(
 
 #[cfg(test)]
 mod tests {
-    use super::{delete_local_dataset, inspect_dataset, TrainingStreamEvent};
+    use super::{
+        delete_local_dataset, inspect_dataset, validate_open_training_pair, TrainingStreamEvent,
+    };
     use crate::domain::records::DatasetExclusion;
     use crate::infrastructure::state::AppState;
     use rusqlite::params;
     use std::{fs, io::Read};
     use uuid::Uuid;
     use zip::ZipArchive;
+
+    #[test]
+    fn rejects_open_training_with_a_restricted_ollama_base() {
+        assert!(validate_open_training_pair(
+            "tinyllama:latest",
+            &serde_json::json!({
+                "trainingRecipe": "open-base-lora",
+                "sourceModel": "TinyLlama/TinyLlama-1.1B-Chat-v0.6"
+            }),
+        )
+        .is_ok());
+        let error = validate_open_training_pair(
+            "llama3.2:3b",
+            &serde_json::json!({
+                "trainingRecipe": "open-base-lora",
+                "sourceModel": "TinyLlama/TinyLlama-1.1B-Chat-v0.6"
+            }),
+        )
+        .expect_err("restricted Ollama base must be rejected");
+        assert!(error.contains("tinyllama:latest"));
+    }
 
     #[test]
     fn serializes_upload_progress_fields_for_typescript() {

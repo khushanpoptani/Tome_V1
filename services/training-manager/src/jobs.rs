@@ -120,6 +120,9 @@ pub async fn retry_job(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<(StatusCode, Json<JobCreatedResponse>)> {
+    let original = state.database.job_record(&id)?;
+    validate_backend(&original.backend)?;
+    registry::validate_adapter_compatibility(&original.base_model, &original.parameters)?;
     let client_job_id = headers
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())

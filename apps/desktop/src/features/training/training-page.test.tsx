@@ -52,6 +52,17 @@ const openOllamaModel: OllamaModel = {
   size: 638_000_000,
 };
 
+const restrictedOllamaModel: OllamaModel = {
+  details: {
+    families: ["llama"],
+    family: "llama",
+    parameter_size: "3.2B",
+    quantization_level: "Q4_K_M",
+  },
+  name: "llama3.2:3b",
+  size: 2_000_000_000,
+};
+
 const dataset: TrainingDatasetRecord = {
   artifactPath: "/tmp/planning.jsonl",
   checksum: "checksum",
@@ -122,18 +133,20 @@ const job: TrainingJobRecord = {
 
 function renderTrainingPage(
   trainingDatasets: readonly TrainingDatasetRecord[] = [dataset],
+  trainingJobs: readonly TrainingJobRecord[] = [job],
+  models: readonly OllamaModel[] = [openOllamaModel],
 ): void {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   queryClient.setQueryData(["training-servers"], [server]);
   queryClient.setQueryData(["active-server"], ollamaServer);
-  queryClient.setQueryData(["models", ollamaServer.url], [openOllamaModel]);
+  queryClient.setQueryData(["models", ollamaServer.url], models);
   queryClient.setQueryData(["training-datasets"], trainingDatasets);
   queryClient.setQueryData(["training-dataset-groups"], [datasetGroup]);
   queryClient.setQueryData(["dataset-uploads"], []);
   queryClient.setQueryData(["tasks"], []);
-  queryClient.setQueryData(["training-jobs"], [job]);
+  queryClient.setQueryData(["training-jobs"], trainingJobs);
   queryClient.setQueryData(["training-logs"], []);
 
   render(
@@ -204,7 +217,7 @@ describe("Training readiness", () => {
     fireEvent.click(screen.getByRole("button", { name: "New job" }));
 
     const dialog = screen.getByRole("dialog");
-    expect(within(dialog).getByLabelText("Installed Ollama base model")).toHaveValue(
+    expect(within(dialog).getByLabelText("Open Ollama training base")).toHaveValue(
       "tinyllama:latest",
     );
     expect(
@@ -212,6 +225,86 @@ describe("Training readiness", () => {
     ).toHaveAttribute("readonly");
     expect(within(dialog).getByText("Automatic open-base training")).toBeInTheDocument();
     expect(within(dialog).getByDisplayValue("1")).toBeInTheDocument();
+  });
+
+  it("does not offer a restricted Ollama model in the automatic open workflow", () => {
+    renderTrainingPage([dataset], [job], [restrictedOllamaModel, openOllamaModel]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Training Jobs" }));
+    fireEvent.click(screen.getByRole("button", { name: "New job" }));
+
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByLabelText("Open Ollama training base")).toHaveValue(
+      "tinyllama:latest",
+    );
+    expect(
+      within(dialog).queryByRole("option", { name: /llama3\.2:3b/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("repairs an existing mismatched job with the audited open base", () => {
+    const failedJob: TrainingJobRecord = {
+      ...job,
+      error: "Automatic open-base training is not available for Ollama base llama3.2:3b",
+      status: "failed",
+    };
+    renderTrainingPage([dataset], [failedJob]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Training Jobs" }));
+    fireEvent.click(screen.getByRole("button", { name: "Repair with open base" }));
+
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByLabelText("Open Ollama training base")).toHaveValue(
+      "tinyllama:latest",
+    );
+    expect(within(dialog).getByLabelText("Output Ollama model")).toHaveValue(job.model);
+    expect(
+      within(dialog).getByDisplayValue("TinyLlama/TinyLlama-1.1B-Chat-v0.6"),
+    ).toHaveAttribute("readonly");
+  });
+
+  it("restores protected open-base parameters before saving", async () => {
+    const save = vi.spyOn(backend, "saveTrainingJob").mockResolvedValue({
+      ...job,
+      baseModel: "tinyllama:latest",
+      model: "tome-planning:v1",
+      parametersJson: "{}",
+    });
+    vi.spyOn(backend, "preflightTrainingJob").mockResolvedValue({
+      checks: [],
+      credentialAccepted: false,
+      credentialRequired: false,
+      ready: true,
+      sourceModel: "TinyLlama/TinyLlama-1.1B-Chat-v0.6",
+      sourceStatus: "ready",
+    });
+    renderTrainingPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Training Jobs" }));
+    fireEvent.click(screen.getByRole("button", { name: "New job" }));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText("Output Ollama model"), {
+      target: { value: "tome-planning:v1" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("Training parameters (JSON)"), {
+      target: {
+        value: JSON.stringify({
+          sourceModel: "meta-llama/Llama-3.2-3B-Instruct",
+          trainingRecipe: "restricted-base-lora",
+          ollamaAdapterArchitecture: "gemma",
+        }),
+      },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save draft" }));
+
+    await waitFor(() => expect(save).toHaveBeenCalled());
+    const input = save.mock.calls.at(-1)?.[0];
+    expect(input?.baseModel).toBe("tinyllama:latest");
+    expect(JSON.parse(input?.parametersJson ?? "{}")).toMatchObject({
+      ollamaAdapterArchitecture: "llama",
+      sourceModel: "TinyLlama/TinyLlama-1.1B-Chat-v0.6",
+      trainingRecipe: "open-base-lora",
+    });
   });
 });
 

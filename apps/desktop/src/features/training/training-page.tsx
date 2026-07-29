@@ -432,14 +432,22 @@ function trainingBaseProfileForOllama(name: string): TrainingBaseProfile | null 
 function createOpenBaseJobForm(
   datasetIds: readonly string[],
   baseModel: string,
+  model = "",
 ): JobForm {
+  const requestedProfile = trainingBaseProfileForOllama(baseModel);
   const profile =
-    trainingBaseProfileForOllama(baseModel) ?? recommendedOpenTrainingBase.profile;
+    requestedProfile?.access === "open"
+      ? requestedProfile
+      : recommendedOpenTrainingBase.profile;
+  const auditedBaseModel =
+    requestedProfile?.access === "open"
+      ? baseModel
+      : recommendedOpenTrainingBase.ollamaModel;
   return {
     backend: "auto",
-    baseModel,
+    baseModel: auditedBaseModel,
     datasetIds,
-    model: "",
+    model,
     parametersJson: JSON.stringify(
       {
         sourceModel: profile.sourceModel,
@@ -1393,33 +1401,24 @@ export function TrainingPage(): React.JSX.Element {
       ),
     [compatibleOllamaModels],
   );
-  const restrictedCompatibleOllamaModels = useMemo(
-    () =>
-      compatibleOllamaModels.filter(
-        (model) => trainingBaseProfileForOllama(model.name)?.access !== "open",
-      ),
-    [compatibleOllamaModels],
-  );
   const incompatibleOllamaModels = useMemo(
     () => (ollamaModels.data ?? []).filter((model) => !supportsOllamaAdapter(model)),
     [ollamaModels.data],
   );
-  const startOpenBaseJob = (datasetIds: readonly string[]): void => {
+  const startOpenBaseJob = (datasetIds: readonly string[], outputModel = ""): void => {
     const installedOpenBase = openCompatibleOllamaModels[0]?.name;
     if (installedOpenBase !== undefined) {
       setTrainingReadiness(null);
-      setJobForm(createOpenBaseJobForm(datasetIds, installedOpenBase));
+      setJobForm(createOpenBaseJobForm(datasetIds, installedOpenBase, outputModel));
       return;
     }
     if (ollamaServer.data === null || ollamaServer.data === undefined) {
-      setJobForm(createOpenBaseJobForm(datasetIds, ""));
+      setJobForm(createOpenBaseJobForm(datasetIds, "", outputModel));
       toast.warning("Connect the Windows Ollama server before saving this job.");
       return;
     }
     installRecommendedOpenBase.mutate({ datasetIds });
   };
-  const selectedJobBaseProfile =
-    jobForm === null ? null : trainingBaseProfileForOllama(jobForm.baseModel);
   const visibleJobs = useMemo(() => {
     const all = jobs.data ?? [];
     if (section === "running") {
@@ -2994,6 +2993,7 @@ export function TrainingPage(): React.JSX.Element {
                           status: job.status,
                         })
                       }
+                      onUseOpenBase={() => startOpenBaseJob(job.datasetIds, job.model)}
                       onReviewDatasets={() => setSection("datasets")}
                       onViewLogs={showContextLogs}
                       pendingAction={
@@ -3778,8 +3778,20 @@ export function TrainingPage(): React.JSX.Element {
             className="space-y-4 p-5"
             onSubmit={(event) => {
               event.preventDefault();
+              const profile = trainingBaseProfileForOllama(jobForm.baseModel);
+              if (profile?.access !== "open") {
+                toast.error(
+                  "Automatic training requires an audited open base. Select TinyLlama or another model listed under Open training bases.",
+                );
+                return;
+              }
               saveJob.mutate({
                 ...jobForm,
+                parametersJson: writeJobParameters(jobForm.parametersJson, {
+                  sourceModel: profile.sourceModel,
+                  trainingRecipe: "open-base-lora",
+                  ollamaAdapterArchitecture: profile.architecture,
+                }),
                 trainingServerId: activeServer?.id ?? null,
               });
             }}
@@ -3899,6 +3911,7 @@ export function TrainingPage(): React.JSX.Element {
               <label className="block space-y-1.5 text-xs">
                 <span>Output Ollama model</span>
                 <input
+                  aria-label="Output Ollama model"
                   className={inputClassName}
                   onChange={(event) =>
                     setJobForm({ ...jobForm, model: event.target.value })
@@ -3915,7 +3928,7 @@ export function TrainingPage(): React.JSX.Element {
               </label>
               <div className="block space-y-1.5 text-xs">
                 <span className="flex items-center justify-between gap-2">
-                  <span>Installed Ollama base model</span>
+                  <span>Open Ollama training base</span>
                   <button
                     className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground disabled:cursor-wait disabled:opacity-60"
                     disabled={
@@ -3945,11 +3958,12 @@ export function TrainingPage(): React.JSX.Element {
                   </button>
                 </span>
                 <select
-                  aria-label="Installed Ollama base model"
+                  aria-label="Open Ollama training base"
                   className={inputClassName}
                   onChange={(event) => {
                     const baseModel = event.target.value;
                     const profile = trainingBaseProfileForOllama(baseModel);
+                    if (profile?.access !== "open") return;
                     setJobForm({
                       ...jobForm,
                       baseModel,
@@ -3958,10 +3972,7 @@ export function TrainingPage(): React.JSX.Element {
                           ? jobForm.parametersJson
                           : writeJobParameters(jobForm.parametersJson, {
                               sourceModel: profile.sourceModel,
-                              trainingRecipe:
-                                profile.access === "open"
-                                  ? "open-base-lora"
-                                  : "restricted-base-lora",
+                              trainingRecipe: "open-base-lora",
                               ollamaAdapterArchitecture: profile.architecture,
                             }),
                     });
@@ -3988,18 +3999,6 @@ export function TrainingPage(): React.JSX.Element {
                       ))}
                     </optgroup>
                   )}
-                  {restrictedCompatibleOllamaModels.length === 0 ? null : (
-                    <optgroup label="Restricted sources · external access required">
-                      {restrictedCompatibleOllamaModels.map((model) => (
-                        <option key={model.name} value={model.name}>
-                          {model.name}
-                          {model.details?.parameter_size
-                            ? ` · ${model.details.parameter_size}`
-                            : ""}
-                        </option>
-                      ))}
-                    </optgroup>
-                  )}
                   {incompatibleOllamaModels.length === 0 ? null : (
                     <optgroup label="Installed · adapter registration unavailable">
                       {incompatibleOllamaModels.map((model) => (
@@ -4015,17 +4014,13 @@ export function TrainingPage(): React.JSX.Element {
                 </select>
                 <FieldHelp>
                   Refresh all reads the complete installed list directly from the active
-                  Ollama server. Open bases train without an account or token. Restricted
-                  bases remain available for advanced users but require their original
-                  repository access.
+                  Ollama server. Only audited open bases are selectable in this automatic
+                  workflow, so a restricted checkpoint cannot accidentally be paired with
+                  an open-base recipe.
                 </FieldHelp>
               </div>
               <label className="block space-y-1.5 text-xs sm:col-span-2">
-                <span>
-                  {selectedJobBaseProfile?.access === "open"
-                    ? "Automatic open training source"
-                    : "Original trainable source"}
-                </span>
+                <span>Automatic open training source</span>
                 <input
                   className={inputClassName}
                   onChange={(event) =>
@@ -4039,14 +4034,13 @@ export function TrainingPage(): React.JSX.Element {
                     })
                   }
                   placeholder="organization/model-name"
-                  readOnly={selectedJobBaseProfile !== null}
+                  readOnly
                   required
                   value={readJobParameter(jobForm.parametersJson, "sourceModel")}
                 />
                 <FieldHelp>
-                  {selectedJobBaseProfile?.access === "open"
-                    ? "Tome selected the matching public checkpoint automatically. It downloads anonymously on the Windows server."
-                    : "The full-precision checkpoint must exactly match the selected Ollama base. Quantized Ollama inference files cannot be used for gradient training."}
+                  Tome selected the matching public checkpoint automatically. Protected
+                  recipe fields are corrected again when the draft is saved.
                 </FieldHelp>
               </label>
               <label className="block space-y-1.5 text-xs">
@@ -4094,6 +4088,7 @@ export function TrainingPage(): React.JSX.Element {
             <label className="block space-y-1.5 text-xs">
               <span>Training parameters (JSON)</span>
               <textarea
+                aria-label="Training parameters (JSON)"
                 className={`${textAreaClassName} min-h-40 font-mono`}
                 onChange={(event) =>
                   setJobForm({ ...jobForm, parametersJson: event.target.value })
@@ -4169,6 +4164,7 @@ function JobCard({
   onCheckReadiness,
   onRequestDelete,
   onReviewDatasets,
+  onUseOpenBase,
   onViewLogs,
   pendingAction,
 }: {
@@ -4182,6 +4178,7 @@ function JobCard({
   readonly onCheckReadiness: () => void;
   readonly onRequestDelete: () => void;
   readonly onReviewDatasets: () => void;
+  readonly onUseOpenBase: () => void;
   readonly onViewLogs: () => void;
   readonly pendingAction: "cancel" | "delete" | "dispatch" | "refresh" | "retry" | null;
 }): React.JSX.Element {
@@ -4201,6 +4198,9 @@ function JobCard({
         : missingUploads > 0
           ? `${missingUploads} selected dataset${missingUploads === 1 ? " must" : "s must"} be uploaded to the active Training Manager before dispatching.`
           : null;
+  const needsOpenBaseRepair =
+    job.status === "failed" &&
+    job.error?.includes("Automatic open-base training is not available") === true;
   return (
     <Card className="p-4">
       <div className="flex flex-wrap items-start gap-3">
@@ -4339,10 +4339,18 @@ function JobCard({
             <CircleAlert className="mt-0.5 size-3 shrink-0" />
             <span className="break-words">{job.error}</span>
           </p>
-          <Button onClick={onViewLogs} size="sm" variant="ghost">
-            <Logs className="size-3" />
-            View logs
-          </Button>
+          <div className="flex gap-1">
+            {needsOpenBaseRepair ? (
+              <Button onClick={onUseOpenBase} size="sm" variant="outline">
+                <RotateCcw className="size-3" />
+                Repair with open base
+              </Button>
+            ) : null}
+            <Button onClick={onViewLogs} size="sm" variant="ghost">
+              <Logs className="size-3" />
+              View logs
+            </Button>
+          </div>
         </div>
       )}
     </Card>
