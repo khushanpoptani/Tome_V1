@@ -85,7 +85,9 @@ Dependencies: Phase 5 and approved agent schemas.
   Tome database, the remote Training Manager database, or both in server-first order.
 - Implemented the Windows Training Manager runtime, job drafts, dispatch, WebSocket and
   heartbeat monitoring, retry/cancel, resource snapshots, persistent logs, and Ollama
-  registry integration.
+  registry integration. A one-click Windows setup executable bundles the native service
+  and private Python runtime, configures scoped firewall access, preserves server data
+  during upgrades, and verifies both Ollama and Training Manager health.
 - Implemented a real Hugging Face Transformers + PEFT worker for LoRA and QLoRA. Server
   installation is explicit, and Tome never starts training without a user-dispatched job.
 

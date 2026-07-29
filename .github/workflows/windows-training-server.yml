@@ -1,0 +1,57 @@
+name: Windows Training Server installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    name: Build one-click installer
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Inno Setup
+        shell: powershell
+        run: |
+          choco install innosetup --yes --no-progress
+          "C:\Program Files (x86)\Inno Setup 6" |
+            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build installer
+        shell: powershell
+        run: .\scripts\windows\build-training-server-installer.ps1
+
+      - name: Create checksums
+        shell: powershell
+        run: |
+          Get-FileHash `
+            .\target\release\bundle\windows-training-server\*.exe `
+            -Algorithm SHA256 |
+            ForEach-Object {
+              "$($_.Hash.ToLower())  $([IO.Path]::GetFileName($_.Path))"
+            } |
+            Set-Content `
+              .\target\release\bundle\windows-training-server\SHA256SUMS.txt
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tome-Windows-Training-Server
+          path: |
+            target/release/bundle/windows-training-server/*.exe
+            target/release/bundle/windows-training-server/SHA256SUMS.txt
+          if-no-files-found: error

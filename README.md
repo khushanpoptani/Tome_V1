@@ -95,7 +95,9 @@ The architecture summary, open decisions, repository map, and staged delivery pl
 The external training protocol, upload state machine, monitoring behavior, and security
 boundary are documented in
 [`docs/architecture/training-management.md`](docs/architecture/training-management.md).
-Windows installation and diagnostics are documented in
+The one-click Windows Training Server setup executable is documented in
+[`docs/windows-training-server-installer.md`](docs/windows-training-server-installer.md).
+Source installation and diagnostics remain in
 [`services/training-manager/README.md`](services/training-manager/README.md).
 
 ## Supported release targets

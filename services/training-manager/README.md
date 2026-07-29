@@ -27,7 +27,20 @@ The capability endpoint reports them as unavailable; it never simulates training
 
 ## Windows installation
 
-Run PowerShell as Administrator from a Tome checkout:
+For normal installation, double-click:
+
+```text
+Tome-Training-Server-Setup-<version>.exe
+```
+
+The UAC-enabled wizard contains the native service and a private Python runtime. It checks
+Ollama, installs the training dependencies, registers and starts the service, configures a
+LocalSubnet firewall rule, and verifies `/v1/health`. Cargo, Rust, and manual PowerShell
+commands are not required on the server. Detailed failures are written to
+`C:\ProgramData\Tome\TrainingManager\installer.log`.
+
+The source installer remains available for development and diagnostics. Run PowerShell as
+Administrator from a Tome checkout:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
@@ -37,6 +50,9 @@ Set-ExecutionPolicy -Scope Process Bypass
 The installer builds the Rust service on Windows, creates a Python virtual environment,
 installs the worker dependencies, registers `TomeTrainingManager` with the Windows Service
 Manager, opens inbound TCP `11435`, starts the service, and checks `/v1/health`.
+
+See [the Windows installer documentation](../../docs/windows-training-server-installer.md)
+for release packaging, upgrade, firewall, and uninstall behavior.
 
 To upgrade an existing installation without reinstalling the Python environment, replace
 the Tome checkout with the new release, open PowerShell as Administrator, and run:
