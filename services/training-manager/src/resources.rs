@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use axum::{extract::State, Json};
 use chrono::Utc;
-use sysinfo::{Disks, System};
+use sysinfo::{Disks, Pid, ProcessesToUpdate, System};
 use tokio::process::Command;
 
 use crate::{
@@ -10,6 +10,13 @@ use crate::{
     models::{GpuResource, ResourceSnapshot, ServerEvent},
     AppState,
 };
+
+pub struct JobResourceUsage {
+    pub gpu_usage: Option<f64>,
+    pub cpu_usage: Option<f64>,
+    pub ram_usage: Option<i64>,
+    pub disk_io: Option<i64>,
+}
 
 pub async fn resources(State(state): State<Arc<AppState>>) -> ApiResult<Json<ResourceSnapshot>> {
     Ok(Json(snapshot(&state).await?))
@@ -46,6 +53,18 @@ pub async fn snapshot(state: &AppState) -> ApiResult<ResourceSnapshot> {
     })
 }
 
+pub async fn job_usage(state: &AppState, worker_pid: Option<u32>) -> ApiResult<JobResourceUsage> {
+    let (host, worker) = tokio::join!(snapshot(state), worker_process_usage(worker_pid));
+    let host = host?;
+    let (cpu_usage, ram_usage, disk_io) = worker?;
+    Ok(JobResourceUsage {
+        gpu_usage: host.gpus.first().map(|gpu| gpu.utilization),
+        cpu_usage,
+        ram_usage,
+        disk_io,
+    })
+}
+
 pub fn spawn_resource_events(state: Arc<AppState>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
@@ -54,6 +73,66 @@ pub fn spawn_resource_events(state: Arc<AppState>) {
             let _ = state.events.send(ServerEvent::Resources);
         }
     });
+}
+
+async fn worker_process_usage(
+    worker_pid: Option<u32>,
+) -> ApiResult<(Option<f64>, Option<i64>, Option<i64>)> {
+    let Some(worker_pid) = worker_pid else {
+        return Ok((None, None, None));
+    };
+    tokio::task::spawn_blocking(move || {
+        let mut system = System::new_all();
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        system.refresh_processes(ProcessesToUpdate::All, true);
+        let root = Pid::from_u32(worker_pid);
+        let mut cpu_usage = 0.0;
+        let mut ram_usage = 0_u64;
+        let mut disk_io = 0_u64;
+        let mut matched = false;
+        for (pid, process) in system.processes() {
+            if *pid != root && !is_descendant_of(&system, *pid, root) {
+                continue;
+            }
+            matched = true;
+            cpu_usage += f64::from(process.cpu_usage());
+            ram_usage = ram_usage.saturating_add(process.memory());
+            let usage = process.disk_usage();
+            disk_io = disk_io
+                .saturating_add(usage.total_read_bytes)
+                .saturating_add(usage.total_written_bytes);
+        }
+        if matched {
+            (
+                Some(cpu_usage),
+                Some(saturating_i64(ram_usage)),
+                Some(saturating_i64(disk_io)),
+            )
+        } else {
+            (None, None, None)
+        }
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Worker resource sampler failed: {error}")))
+}
+
+fn is_descendant_of(system: &System, mut candidate: Pid, root: Pid) -> bool {
+    for _ in 0..32 {
+        let Some(parent) = system
+            .process(candidate)
+            .and_then(|process| process.parent())
+        else {
+            return false;
+        };
+        if parent == root {
+            return true;
+        }
+        if parent == candidate {
+            return false;
+        }
+        candidate = parent;
+    }
+    false
 }
 
 async fn nvidia_gpus() -> Vec<GpuResource> {

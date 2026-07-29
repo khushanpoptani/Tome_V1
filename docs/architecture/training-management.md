@@ -270,6 +270,15 @@ SQLite stores:
   for the global Task Queue and Context Panel.
 - the latest persisted training activity and error details in the right context panel;
   dataset-card “View logs” actions focus this panel without leaving the workflow.
+- worker preprocessing emits scanning and record-validation progress before model loading,
+  so ETA is available during preparation instead of remaining at zero until the first
+  optimizer step.
+- per-job telemetry samples the Python worker process tree every two seconds. Job cards
+  distinguish worker CPU/RAM and disk I/O from server-wide resource snapshots; an absent
+  NVIDIA probe is displayed as “Not detected” rather than `0%`.
+- worker failures preserve dataset name, file, record number, available fields, and the
+  underlying process status. The right context panel merges these remote job logs with
+  dataset upload and server activity logs.
 
 Secrets belong in the platform credential store when authenticated adapters are added.
 SQLite stores only a credential reference.
@@ -341,3 +350,6 @@ them completed or failed as appropriate.
 - The bundled worker is real, but installation and health checks never start training.
 - Framework installation, CUDA compatibility, model licenses, and Hugging Face access are
   operator responsibilities and are reported through capabilities and diagnostics.
+- `maxRecords` and `maxSteps` are optional smoke-run controls. They intentionally bound
+  dataset records and optimizer steps for end-to-end validation; production training
+  should omit them or set values based on a reviewed experiment plan.

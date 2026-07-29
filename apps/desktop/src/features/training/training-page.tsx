@@ -2311,6 +2311,7 @@ export function TrainingPage(): React.JSX.Element {
                         })
                       }
                       onReviewDatasets={() => setSection("datasets")}
+                      onViewLogs={showContextLogs}
                       pendingAction={
                         jobAction.isPending && jobAction.variables?.id === job.id
                           ? jobAction.variables.action
@@ -3254,6 +3255,7 @@ function JobCard({
   onAction,
   onRequestDelete,
   onReviewDatasets,
+  onViewLogs,
   pendingAction,
 }: {
   readonly activeServerId: string | null;
@@ -3265,6 +3267,7 @@ function JobCard({
   ) => void;
   readonly onRequestDelete: () => void;
   readonly onReviewDatasets: () => void;
+  readonly onViewLogs: () => void;
   readonly pendingAction: "cancel" | "delete" | "dispatch" | "refresh" | "retry" | null;
 }): React.JSX.Element {
   const active = ["queued", "running", "paused", "cancelling", "unreachable"].includes(
@@ -3393,10 +3396,10 @@ function JobCard({
         <ProgressBar value={job.progress} />
       </div>
       <div className="mt-3 grid grid-cols-2 gap-2 text-[9px] text-muted-foreground sm:grid-cols-4">
-        <span>GPU {percent(job.gpuUsage)}</span>
-        <span>CPU {percent(job.cpuUsage)}</span>
-        <span>RAM {job.ramUsage === null ? "—" : formatBytes(job.ramUsage)}</span>
-        <span>Disk {job.diskUsage === null ? "—" : formatBytes(job.diskUsage)}</span>
+        <span>GPU {job.gpuUsage === null ? "Not detected" : percent(job.gpuUsage)}</span>
+        <span>Worker CPU {job.cpuUsage === null ? "—" : percent(job.cpuUsage)}</span>
+        <span>Worker RAM {job.ramUsage === null ? "—" : formatBytes(job.ramUsage)}</span>
+        <span>Disk I/O {job.diskUsage === null ? "—" : formatBytes(job.diskUsage)}</span>
       </div>
       {job.warning === null ? null : (
         <p className="mt-3 flex items-start gap-2 rounded-md bg-amber-500/10 p-2 text-[10px] text-amber-400">
@@ -3405,10 +3408,16 @@ function JobCard({
         </p>
       )}
       {job.error === null ? null : (
-        <p className="mt-3 flex items-start gap-2 rounded-md bg-red-500/10 p-2 text-[10px] text-red-400">
-          <CircleAlert className="mt-0.5 size-3 shrink-0" />
-          {job.error}
-        </p>
+        <div className="mt-3 flex flex-wrap items-start justify-between gap-2 rounded-md bg-red-500/10 p-2 text-[10px] text-red-400">
+          <p className="flex min-w-0 flex-1 items-start gap-2">
+            <CircleAlert className="mt-0.5 size-3 shrink-0" />
+            <span className="break-words">{job.error}</span>
+          </p>
+          <Button onClick={onViewLogs} size="sm" variant="ghost">
+            <Logs className="size-3" />
+            View logs
+          </Button>
+        </div>
       )}
     </Card>
   );

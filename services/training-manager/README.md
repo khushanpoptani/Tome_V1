@@ -16,6 +16,8 @@ with it over `tome-training/v1`; the desktop never computes gradients.
 - multi-dataset job specifications that combine every selected dataset in one worker run
 - bounded job concurrency and process cancellation
 - NVIDIA, CPU, RAM, disk, and queue telemetry
+- two-second per-job Python worker CPU, RAM, disk-I/O, preprocessing progress, and ETA
+- dataset/file/record diagnostics for incompatible training schemas
 - a real Hugging Face Transformers + PEFT worker for LoRA and QLoRA
 - post-training PEFT adapter validation and registration through the local Ollama CLI
 - console mode for diagnostics and Windows Service mode for production
@@ -87,6 +89,10 @@ Invoke-RestMethod http://127.0.0.1:11435/v1/capabilities
 Invoke-RestMethod http://127.0.0.1:11435/v1/resources
 Get-Service TomeTrainingManager
 ```
+
+For a bounded end-to-end smoke run, training parameters may include `maxRecords` and
+`maxSteps`. For example, `"maxRecords": 8` and `"maxSteps": 1` validate registration and
+inference without treating the resulting adapter as a production-quality fine-tune.
 
 Run interactively when troubleshooting:
 

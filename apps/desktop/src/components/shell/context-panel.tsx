@@ -33,17 +33,40 @@ export function ContextPanel(): React.JSX.Element {
     queryKey: ["logs", "context"],
     refetchInterval: 2_000,
   });
+  const trainingLogs = useQuery({
+    enabled: isTauriRuntime() && location.pathname === "/training",
+    queryFn: () => backend.listTrainingLogs(undefined, 100),
+    queryKey: ["training-logs"],
+    refetchInterval: 2_000,
+  });
   const logsSection = useRef<HTMLElement>(null);
   const running = (tasks.data ?? []).filter((task) => task.status === "running");
   const failed = (tasks.data ?? []).filter((task) => task.status === "failed");
   const visibleLogs = useMemo(() => {
-    const records = logs.data ?? [];
-    return (
-      location.pathname === "/training"
-        ? records.filter((record) => record.category.startsWith("training"))
-        : records
-    ).slice(0, 20);
-  }, [location.pathname, logs.data]);
+    if (location.pathname === "/training") {
+      return [
+        ...(trainingLogs.data ?? []).map((record) => ({
+          category: "training-job",
+          createdAt: record.createdAt,
+          details:
+            record.trainingJobId === null
+              ? null
+              : `Job ${record.trainingJobId.slice(0, 8)}`,
+          id: `training-${record.id}`,
+          level: record.level,
+          message: record.message,
+        })),
+        ...(logs.data ?? []).filter((record) => record.category.startsWith("training")),
+      ]
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+        .slice(0, 20);
+    }
+    return (logs.data ?? []).slice(0, 20);
+  }, [location.pathname, logs.data, trainingLogs.data]);
+  const visibleLogsLoading =
+    location.pathname === "/training"
+      ? trainingLogs.isLoading || logs.isLoading
+      : logs.isLoading;
 
   useEffect(() => {
     const showLogs = (): void => {
@@ -139,7 +162,7 @@ export function ContextPanel(): React.JSX.Element {
             <Badge>{visibleLogs.length}</Badge>
           </div>
           <div className="max-h-80 divide-y divide-border/60 overflow-y-auto">
-            {logs.isLoading ? (
+            {visibleLogsLoading ? (
               <p className="p-3 text-[10px] text-muted-foreground">Loading logs…</p>
             ) : visibleLogs.length === 0 ? (
               <p className="p-3 text-[10px] text-muted-foreground">

@@ -239,10 +239,21 @@ async fn run_job(state: Arc<AppState>, id: &str) -> ApiResult<()> {
         .iter()
         .map(|dataset| dataset.content_path.clone())
         .collect::<Vec<_>>();
+    let dataset_sources = datasets
+        .iter()
+        .map(|dataset| {
+            serde_json::json!({
+                "id": dataset.id,
+                "name": dataset.name,
+                "path": dataset.content_path,
+            })
+        })
+        .collect::<Vec<_>>();
     let specification = serde_json::json!({
         "jobId": job.id,
         "datasetPath": dataset_paths[0],
         "datasetPaths": dataset_paths,
+        "datasets": dataset_sources,
         "outputPath": output_dir,
         "model": job.model,
         "baseModel": job.base_model,
@@ -283,7 +294,16 @@ async fn run_job(state: Arc<AppState>, id: &str) -> ApiResult<()> {
             let _ = append_log(&state_for_stderr, &id_for_stderr, "warning", &line);
         }
     });
-    let adapter_path = consume_worker(&state, id, &mut child, cancellation, Instant::now()).await?;
+    let worker_pid = child.id();
+    let adapter_path = consume_worker(
+        &state,
+        id,
+        &mut child,
+        cancellation,
+        Instant::now(),
+        worker_pid,
+    )
+    .await?;
     let _ = stderr_task.await;
 
     state.database.update_job(
@@ -341,6 +361,7 @@ async fn consume_worker(
     child: &mut Child,
     cancellation: Arc<AtomicBool>,
     started: Instant,
+    worker_pid: Option<u32>,
 ) -> ApiResult<PathBuf> {
     let stdout = child
         .stdout
@@ -348,6 +369,11 @@ async fn consume_worker(
         .ok_or_else(|| ApiError::internal("Worker stdout was unavailable"))?;
     let mut lines = BufReader::new(stdout).lines();
     let mut adapter_path = None;
+    let mut last_worker_error = None;
+    let resource_interval = Duration::from_secs(2);
+    let mut last_resource_sample = Instant::now()
+        .checked_sub(resource_interval)
+        .unwrap_or_else(Instant::now);
     loop {
         if cancellation.load(Ordering::Relaxed) {
             let _ = child.start_kill();
@@ -372,6 +398,9 @@ async fn consume_worker(
         match tokio::time::timeout(Duration::from_millis(300), lines.next_line()).await {
             Ok(Ok(Some(line))) => {
                 if let Ok(event) = serde_json::from_str::<WorkerEvent>(&line) {
+                    if event.kind == "log" && event.level.as_deref() == Some("error") {
+                        last_worker_error = event.message.clone();
+                    }
                     if let Some(path) = process_worker_event(state, id, event, started)? {
                         adapter_path = Some(path);
                     }
@@ -388,34 +417,44 @@ async fn consume_worker(
             Err(_) => {
                 if let Some(status) = child.try_wait()? {
                     if !status.success() {
-                        return Err(ApiError::internal(format!(
-                            "Training worker exited with {status}"
-                        )));
+                        return Err(worker_failure(status, last_worker_error.as_deref()));
                     }
                     break;
                 }
-                if let Ok(snapshot) = resources::snapshot(state).await {
-                    let gpu = snapshot.gpus.first().map(|gpu| gpu.utilization);
-                    state.database.update_job_resources(
-                        id,
-                        gpu,
-                        Some(snapshot.cpu_usage),
-                        Some(snapshot.ram_used),
-                        Some(snapshot.disk_used),
-                    )?;
+                if last_resource_sample.elapsed() >= resource_interval {
+                    last_resource_sample = Instant::now();
+                    if let Ok(snapshot) = resources::job_usage(state, worker_pid).await {
+                        state.database.update_job_resources(
+                            id,
+                            snapshot.gpu_usage,
+                            snapshot.cpu_usage,
+                            snapshot.ram_usage,
+                            snapshot.disk_io,
+                        )?;
+                        emit_job(state, id)?;
+                    }
                 }
             }
         }
     }
     let status = child.wait().await?;
     if !status.success() {
-        return Err(ApiError::internal(format!(
-            "Training worker exited with {status}"
-        )));
+        return Err(worker_failure(status, last_worker_error.as_deref()));
     }
     adapter_path.ok_or_else(|| {
         ApiError::internal("Training worker completed without reporting an adapterPath")
     })
+}
+
+fn worker_failure(status: std::process::ExitStatus, last_worker_error: Option<&str>) -> ApiError {
+    let status_detail = format!("worker {status}");
+    match last_worker_error
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+    {
+        Some(message) => ApiError::internal(format!("{message} ({status_detail})")),
+        None => ApiError::internal(format!("Training worker exited with {status}")),
+    }
 }
 
 fn process_worker_event(
@@ -537,4 +576,24 @@ fn emit_job(state: &AppState, id: &str) -> ApiResult<()> {
 
 pub fn cancellations() -> Mutex<HashMap<String, Arc<AtomicBool>>> {
     Mutex::new(HashMap::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::worker_failure;
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_the_actionable_worker_error_when_the_process_fails() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let error = worker_failure(
+            std::process::ExitStatus::from_raw(1 << 8),
+            Some("Dataset 'planning', file 'records.json', record 4 needs output"),
+        );
+
+        assert!(error.message.contains("Dataset 'planning'"));
+        assert!(error.message.contains("record 4"));
+        assert!(error.message.contains("exit status: 1"));
+    }
 }

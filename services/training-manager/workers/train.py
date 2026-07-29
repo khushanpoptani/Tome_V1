@@ -68,64 +68,146 @@ def read_json_records(path: Path) -> list[Any]:
             raise ValueError(f"{path} contains no JSON records") from document_error
 
 
-def read_records(
-    dataset_paths: list[Path], parameters: dict[str, Any]
-) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    files = sorted(
-        {
-            path.resolve()
-            for dataset_path in dataset_paths
-            for path in dataset_path.rglob("*")
-            if path.is_file()
-        }
+def normalize_record(
+    record: Any,
+    parameters: dict[str, Any],
+    dataset_name: str,
+    relative_path: str,
+    record_number: int,
+    global_record_number: int,
+) -> dict[str, str]:
+    text_field = str(parameters.get("textField", "text"))
+    prompt_field = str(parameters.get("promptField", "prompt"))
+    response_field = str(parameters.get("responseField", "response"))
+    input_field = str(parameters.get("inputField", "input"))
+    separator = str(parameters.get("separator", "\n\n"))
+    location = (
+        f"Dataset '{dataset_name}', file '{relative_path}', record {record_number} "
+        f"(combined record {global_record_number})"
     )
+    if not isinstance(record, dict):
+        raise ValueError(f"{location} is not an object")
+    direct = record.get(text_field)
+    if isinstance(direct, str) and direct.strip():
+        return {"text": direct.strip()}
+    prompt = record.get(prompt_field)
+    response = record.get(response_field)
+    if (
+        isinstance(prompt, str)
+        and prompt.strip()
+        and isinstance(response, str)
+        and response.strip()
+    ):
+        input_value = record.get(input_field)
+        prompt_parts = [prompt.strip()]
+        if isinstance(input_value, str) and input_value.strip():
+            prompt_parts.append(input_value.strip())
+        return {
+            "text": f"{separator.join(prompt_parts)}{separator}{response.strip()}"
+        }
+    available = ", ".join(sorted(str(key) for key in record.keys())[:12]) or "none"
+    raise ValueError(
+        f"{location} needs non-empty '{text_field}' or "
+        f"'{prompt_field}' + '{response_field}' string fields. "
+        f"Available fields: {available}"
+    )
+
+
+def read_records(
+    dataset_sources: list[tuple[Path, str]], parameters: dict[str, Any]
+) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    file_sources: dict[Path, tuple[str, Path]] = {}
+    for dataset_path, dataset_name in dataset_sources:
+        candidates = (
+            [dataset_path] if dataset_path.is_file() else dataset_path.rglob("*")
+        )
+        for candidate in candidates:
+            if candidate.is_file():
+                file_sources.setdefault(
+                    candidate.resolve(), (dataset_name, dataset_path.resolve())
+                )
+    files = sorted(file_sources)
     if not files:
         raise ValueError("No dataset files found under the selected datasets")
-    for path in files:
-        suffix = path.suffix.lower()
+    max_records = int(parameters.get("maxRecords", 0))
+    if max_records < 0:
+        raise ValueError("maxRecords must be zero or greater")
+    emit(
+        "progress",
+        stage="Scanning datasets",
+        progress=1.0,
+        epoch=0,
+        message=f"Found {len(files)} supported and auxiliary files to inspect",
+    )
+    for file_index, dataset_file in enumerate(files, start=1):
+        dataset_name, dataset_root = file_sources[dataset_file]
+        try:
+            relative_path = str(dataset_file.relative_to(dataset_root))
+        except ValueError:
+            relative_path = dataset_file.name
+        suffix = dataset_file.suffix.lower()
+        file_records: list[Any] = []
         if suffix == ".jsonl":
-            with path.open("r", encoding="utf-8") as handle:
-                records.extend(json.loads(line) for line in handle if line.strip())
+            with dataset_file.open("r", encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    if not line.strip():
+                        continue
+                    try:
+                        file_records.append(json.loads(line))
+                    except json.JSONDecodeError as error:
+                        raise ValueError(
+                            f"Dataset '{dataset_name}', file '{relative_path}', "
+                            f"line {line_number} is invalid JSON: {error}"
+                        ) from error
         elif suffix == ".json":
-            records.extend(read_json_records(path))
+            file_records = read_json_records(dataset_file)
         elif suffix == ".csv":
-            with path.open("r", encoding="utf-8", newline="") as handle:
-                records.extend(dict(row) for row in csv.DictReader(handle))
+            with dataset_file.open("r", encoding="utf-8", newline="") as handle:
+                file_records = [dict(row) for row in csv.DictReader(handle)]
         elif suffix in {".txt", ".md"}:
-            text = path.read_text(encoding="utf-8").strip()
+            text = dataset_file.read_text(encoding="utf-8").strip()
             if text:
-                records.append({"text": text})
+                file_records = [{"text": text}]
         elif suffix == ".parquet":
             try:
                 import pyarrow.parquet as parquet
             except ImportError as error:
                 raise RuntimeError("pyarrow is required for Parquet datasets") from error
-            records.extend(parquet.read_table(path).to_pylist())
-    if not records:
-        raise ValueError("Dataset contains no training records")
-
-    text_field = str(parameters.get("textField", "text"))
-    prompt_field = str(parameters.get("promptField", "prompt"))
-    response_field = str(parameters.get("responseField", "response"))
-    separator = str(parameters.get("separator", "\n\n"))
-    normalized: list[dict[str, str]] = []
-    for index, record in enumerate(records):
-        if not isinstance(record, dict):
-            raise ValueError(f"Dataset record {index + 1} is not an object")
-        direct = record.get(text_field)
-        if isinstance(direct, str) and direct.strip():
-            normalized.append({"text": direct.strip()})
-            continue
-        prompt = record.get(prompt_field)
-        response = record.get(response_field)
-        if isinstance(prompt, str) and isinstance(response, str):
-            normalized.append({"text": f"{prompt.strip()}{separator}{response.strip()}"})
-            continue
-        raise ValueError(
-            f"Dataset record {index + 1} needs '{text_field}' or "
-            f"'{prompt_field}' + '{response_field}' string fields"
+            file_records = parquet.read_table(dataset_file).to_pylist()
+        for record_number, record in enumerate(file_records, start=1):
+            normalized.append(
+                normalize_record(
+                    record,
+                    parameters,
+                    dataset_name,
+                    relative_path,
+                    record_number,
+                    len(normalized) + 1,
+                )
+            )
+            if max_records > 0 and len(normalized) >= max_records:
+                break
+        progress = 1.0 + (file_index / len(files)) * 5.0
+        emit(
+            "progress",
+            stage="Validating records",
+            progress=progress,
+            epoch=0,
+            message=(
+                f"Validated {len(normalized)} records through "
+                f"{dataset_name}/{relative_path}"
+            ),
         )
+        if max_records > 0 and len(normalized) >= max_records:
+            emit(
+                "log",
+                level="info",
+                message=f"Limited this run to {max_records} records",
+            )
+            break
+    if not normalized:
+        raise ValueError("Dataset contains no supported training records")
     return normalized
 
 
@@ -148,8 +230,20 @@ def run(spec_path: Path) -> int:
     source_model = str(parameters.get("sourceModel") or spec["baseModel"])
     output_path = Path(spec["outputPath"]).resolve()
     checkpoints = output_path.parent / "checkpoints"
-    raw_dataset_paths = spec.get("datasetPaths") or [spec["datasetPath"]]
-    dataset_paths = [Path(value).resolve() for value in raw_dataset_paths]
+    raw_datasets = spec.get("datasets")
+    if isinstance(raw_datasets, list) and raw_datasets:
+        dataset_sources = [
+            (
+                Path(value["path"]).resolve(),
+                str(value.get("name") or Path(value["path"]).name),
+            )
+            for value in raw_datasets
+        ]
+    else:
+        raw_dataset_paths = spec.get("datasetPaths") or [spec["datasetPath"]]
+        dataset_sources = [
+            (Path(value).resolve(), Path(value).name) for value in raw_dataset_paths
+        ]
     epochs = int(spec["epochs"])
     backend = str(spec.get("backend", "lora")).lower()
     if epochs < 1:
@@ -160,13 +254,14 @@ def run(spec_path: Path) -> int:
     emit(
         "log",
         level="info",
-        message=f"Loading {len(dataset_paths)} selected dataset(s)",
+        message=f"Loading {len(dataset_sources)} selected dataset(s)",
     )
-    records = read_records(dataset_paths, parameters)
+    records = read_records(dataset_sources, parameters)
     emit("log", level="info", message=f"Validated {len(records)} training records")
     dataset = Dataset.from_list(records)
 
     max_length = int(parameters.get("maxLength", 2048))
+    emit("progress", stage="Loading tokenizer", progress=7.0, epoch=0)
     tokenizer = AutoTokenizer.from_pretrained(
         source_model,
         trust_remote_code=bool(parameters.get("trustRemoteCode", False)),
@@ -185,12 +280,14 @@ def run(spec_path: Path) -> int:
             padding=False,
         )
 
+    emit("progress", stage="Tokenizing", progress=9.0, epoch=0)
     tokenized = dataset.map(
         tokenize,
         batched=True,
         remove_columns=dataset.column_names,
         desc="Tokenizing",
     )
+    emit("progress", stage="Tokenization complete", progress=12.0, epoch=0)
     model_kwargs: dict[str, Any] = {
         "trust_remote_code": bool(parameters.get("trustRemoteCode", False)),
         "token": str(parameters["huggingFaceToken"])
@@ -215,7 +312,7 @@ def run(spec_path: Path) -> int:
         )
         model_kwargs["device_map"] = "auto"
 
-    emit("progress", stage="Loading base model", progress=2.0, epoch=0)
+    emit("progress", stage="Loading base model", progress=15.0, epoch=0)
     model = AutoModelForCausalLM.from_pretrained(source_model, **model_kwargs)
     if backend == "qlora":
         model = prepare_model_for_kbit_training(model)
@@ -244,7 +341,7 @@ def run(spec_path: Path) -> int:
         ) -> None:
             logs = logs or {}
             max_steps = max(1, int(state.max_steps))
-            progress = min(97.0, 3.0 + (state.global_step / max_steps) * 94.0)
+            progress = min(95.0, 20.0 + (state.global_step / max_steps) * 75.0)
             elapsed = max(0.001, time.monotonic() - self.started)
             emit(
                 "progress",
@@ -265,6 +362,7 @@ def run(spec_path: Path) -> int:
         per_device_train_batch_size=int(parameters.get("batchSize", 1)),
         gradient_accumulation_steps=int(parameters.get("gradientAccumulationSteps", 4)),
         num_train_epochs=epochs,
+        max_steps=int(parameters.get("maxSteps", -1)),
         learning_rate=float(parameters.get("learningRate", 2e-4)),
         warmup_ratio=float(parameters.get("warmupRatio", 0.03)),
         weight_decay=float(parameters.get("weightDecay", 0.0)),
@@ -285,7 +383,7 @@ def run(spec_path: Path) -> int:
         data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
         callbacks=[ProgressCallback()],
     )
-    emit("progress", stage="Fine-tuning", progress=3.0, epoch=0, totalEpochs=epochs)
+    emit("progress", stage="Fine-tuning", progress=20.0, epoch=0, totalEpochs=epochs)
     trainer.train(resume_from_checkpoint=parameters.get("resumeFromCheckpoint"))
     output_path.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(output_path, safe_serialization=True)
