@@ -37,6 +37,11 @@ pub async fn create_job(
     Json(request): Json<JobRequest>,
 ) -> ApiResult<(StatusCode, Json<JobCreatedResponse>)> {
     validate_backend(&request.backend)?;
+    if request.parameters.get("huggingFaceToken").is_some() {
+        return Err(ApiError::invalid(
+            "huggingFaceToken is a secret and must be supplied through the training preflight endpoint",
+        ));
+    }
     registry::validate_adapter_compatibility(&request.base_model, &request.parameters)?;
     let (job, inserted) = state.database.create_job(&request)?;
     if inserted {
@@ -268,20 +273,28 @@ async fn run_job(state: Arc<AppState>, id: &str) -> ApiResult<()> {
     )
     .await?;
     ensure_worker_available(&state).await?;
-    let mut child = Command::new(&state.config.python_executable)
+    let mut worker_command = Command::new(&state.config.python_executable);
+    worker_command
         .arg(&state.config.worker_script)
         .arg("--spec")
         .arg(&specification_path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|error| {
-            ApiError::internal(format!(
-                "Could not start Python worker {}: {error}",
-                state.config.python_executable.display()
-            ))
-        })?;
+        .kill_on_drop(true);
+    if let Some(token) = state
+        .huggingface_token
+        .lock()
+        .map_err(|error| ApiError::internal(format!("Credential lock failed: {error}")))?
+        .clone()
+    {
+        worker_command.env("HF_TOKEN", token);
+    }
+    let mut child = worker_command.spawn().map_err(|error| {
+        ApiError::internal(format!(
+            "Could not start Python worker {}: {error}",
+            state.config.python_executable.display()
+        ))
+    })?;
     let stderr = child
         .stderr
         .take()

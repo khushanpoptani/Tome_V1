@@ -77,6 +77,7 @@ pub fn run() {
             interface::commands::training::list_training_jobs,
             interface::commands::training::save_training_job,
             interface::commands::training::delete_training_job,
+            interface::commands::training::preflight_training_job,
             interface::commands::training::dispatch_training_job,
             interface::commands::training::refresh_training_job,
             interface::commands::training::cancel_training_job,

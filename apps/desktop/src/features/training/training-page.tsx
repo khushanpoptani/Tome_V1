@@ -22,6 +22,7 @@ import type {
   TrainingDatasetGroupRecord,
   TrainingDatasetRecord,
   TrainingJobRecord,
+  TrainingPreflightResult,
   TrainingStreamEvent,
 } from "@tome/types";
 import { useShellStore } from "@tome/stores";
@@ -49,6 +50,7 @@ import {
   Pencil,
   Play,
   Plus,
+  KeyRound,
   RefreshCw,
   RotateCcw,
   Server,
@@ -135,6 +137,12 @@ interface JobForm {
   readonly backend: string;
   readonly totalEpochs: number;
   readonly parametersJson: string;
+}
+
+interface TrainingReadinessDialog {
+  readonly job: TrainingJobRecord;
+  readonly credential: string;
+  readonly result: TrainingPreflightResult | null;
 }
 
 type StreamStatus = "disabled" | "connecting" | "connected" | "fallback";
@@ -363,6 +371,42 @@ function supportsOllamaAdapter(model: OllamaModel): boolean {
   );
 }
 
+function sourceModelForOllama(name: string): string | null {
+  const normalized = name.toLowerCase();
+  if (normalized.startsWith("llama3.2:3b")) {
+    return "meta-llama/Llama-3.2-3B-Instruct";
+  }
+  if (normalized.startsWith("llama3.2:1b")) {
+    return "meta-llama/Llama-3.2-1B-Instruct";
+  }
+  if (normalized.startsWith("gemma2:2b")) {
+    return "google/gemma-2-2b-it";
+  }
+  if (normalized.startsWith("tinyllama")) {
+    return "TinyLlama/TinyLlama-1.1B-Chat-v1.0";
+  }
+  return null;
+}
+
+function readJobParameter(parametersJson: string, key: string): string {
+  try {
+    const value = (JSON.parse(parametersJson) as Record<string, unknown>)[key];
+    return typeof value === "string" ? value : "";
+  } catch {
+    return "";
+  }
+}
+
+function writeJobParameter(parametersJson: string, key: string, value: string): string {
+  let parameters: Record<string, unknown> = {};
+  try {
+    parameters = JSON.parse(parametersJson) as Record<string, unknown>;
+  } catch {
+    // Keep the form usable while advanced JSON is temporarily invalid.
+  }
+  return JSON.stringify({ ...parameters, [key]: value }, null, 2);
+}
+
 export function TrainingPage(): React.JSX.Element {
   const setContextPanelOpen = useShellStore((state) => state.setContextPanelOpen);
   const queryClient = useQueryClient();
@@ -391,6 +435,8 @@ export function TrainingPage(): React.JSX.Element {
     readonly total: number;
   } | null>(null);
   const [jobForm, setJobForm] = useState<JobForm | null>(null);
+  const [trainingReadiness, setTrainingReadiness] =
+    useState<TrainingReadinessDialog | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [datasetDropGroupId, setDatasetDropGroupId] = useState<string | null>(null);
   const [streamStatus, setStreamStatus] = useState<StreamStatus>("disabled");
@@ -1005,13 +1051,37 @@ export function TrainingPage(): React.JSX.Element {
       );
     },
   });
+  const preflightJob = useMutation({
+    mutationFn: ({
+      credential,
+      id,
+    }: {
+      readonly credential?: string;
+      readonly id: string;
+    }) => backend.preflightTrainingJob(id, credential),
+    onError: (error) => toast.error(errorMessage(error)),
+    onSuccess: (result) => {
+      setTrainingReadiness((current) =>
+        current === null ? null : { ...current, credential: "", result },
+      );
+      if (result.ready) {
+        toast.success("Training requirements are ready.");
+      } else if (result.credentialRequired) {
+        toast.warning("Model access requires a read-only Hugging Face token.");
+      } else {
+        toast.error("Training preflight found requirements that need attention.");
+      }
+    },
+  });
   const saveJob = useMutation({
     mutationFn: backend.saveTrainingJob,
     onError: (error) => toast.error(errorMessage(error)),
-    onSuccess: () => {
+    onSuccess: (job) => {
       setJobForm(null);
+      setTrainingReadiness({ credential: "", job, result: null });
+      preflightJob.mutate({ id: job.id });
       refreshAll();
-      toast.success("Training job draft saved. No training has started.");
+      toast.success("Draft saved. Tome is checking training requirements.");
     },
   });
   const jobAction = useMutation({
@@ -1028,10 +1098,22 @@ export function TrainingPage(): React.JSX.Element {
       if (action === "refresh") return backend.refreshTrainingJob(id);
       return backend.retryTrainingJob(id);
     },
-    onError: (error) => toast.error(errorMessage(error)),
+    onError: (error, value) => {
+      toast.error(errorMessage(error));
+      if (value.action === "dispatch") {
+        const job = jobsRef.current.find((candidate) => candidate.id === value.id);
+        if (job !== undefined) {
+          setTrainingReadiness({ credential: "", job, result: null });
+          preflightJob.mutate({ id: job.id });
+        }
+      }
+    },
     onSuccess: (_, value) => {
       if (value.action === "delete") {
         setTrainingDeleteConfirmation(null);
+      }
+      if (value.action === "dispatch") {
+        setTrainingReadiness(null);
       }
       refreshAll();
       toast.success(
@@ -2636,6 +2718,9 @@ export function TrainingPage(): React.JSX.Element {
                     disabled={selectableDatasets.length === 0}
                     onClick={() => {
                       const defaultBaseModel = compatibleOllamaModels[0]?.name ?? "";
+                      const defaultSourceModel =
+                        sourceModelForOllama(defaultBaseModel) ??
+                        "meta-llama/Llama-3.2-3B-Instruct";
                       setJobForm({
                         backend: "auto",
                         baseModel: defaultBaseModel,
@@ -2643,8 +2728,7 @@ export function TrainingPage(): React.JSX.Element {
                           ? [selectableDatasets[0].id]
                           : [],
                         model: "",
-                        parametersJson:
-                          '{\n  "sourceModel": "meta-llama/Llama-3.2-3B",\n  "ollamaAdapterArchitecture": "llama",\n  "learningRate": 0.0002,\n  "batchSize": 2,\n  "maxLength": 2048,\n  "loraRank": 16\n}',
+                        parametersJson: `{\n  "sourceModel": "${defaultSourceModel}",\n  "ollamaAdapterArchitecture": "llama",\n  "learningRate": 0.0002,\n  "batchSize": 2,\n  "maxLength": 2048,\n  "loraRank": 16\n}`,
                         totalEpochs: 3,
                       });
                     }}
@@ -2679,6 +2763,10 @@ export function TrainingPage(): React.JSX.Element {
                       job={job}
                       key={job.id}
                       onAction={(action) => jobAction.mutate({ action, id: job.id })}
+                      onCheckReadiness={() => {
+                        setTrainingReadiness({ credential: "", job, result: null });
+                        preflightJob.mutate({ id: job.id });
+                      }}
                       onRequestDelete={() =>
                         setTrainingDeleteConfirmation({
                           id: job.id,
@@ -3303,6 +3391,132 @@ export function TrainingPage(): React.JSX.Element {
         </Modal>
       )}
 
+      {trainingReadiness === null ? null : (
+        <Modal
+          onClose={() => setTrainingReadiness(null)}
+          title="Training readiness"
+          width="max-w-xl"
+        >
+          <form
+            className="space-y-4 p-5"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const credential = trainingReadiness.credential.trim();
+              preflightJob.mutate(
+                credential
+                  ? { credential, id: trainingReadiness.job.id }
+                  : { id: trainingReadiness.job.id },
+              );
+            }}
+          >
+            <div>
+              <p className="text-xs font-semibold">{trainingReadiness.job.model}</p>
+              <p className="mt-1 text-[10px] text-muted-foreground">
+                Tome checks the Windows worker, accelerator and original trainable source
+                before any job enters the queue.
+              </p>
+            </div>
+            {trainingReadiness.result === null ? (
+              <div className="flex items-center gap-2 rounded-lg border border-border bg-background p-3 text-[10px] text-muted-foreground">
+                <RefreshCw
+                  className={cn("size-3.5", preflightJob.isPending && "animate-spin")}
+                />
+                {preflightJob.isPending
+                  ? "Checking model access and server requirements…"
+                  : "Run the readiness check to continue."}
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {trainingReadiness.result.checks.map((check) => (
+                  <div
+                    className={cn(
+                      "rounded-lg border p-3 text-[10px]",
+                      check.status === "passed"
+                        ? "border-emerald-500/20 bg-emerald-500/5"
+                        : check.status === "warning"
+                          ? "border-amber-500/20 bg-amber-500/5"
+                          : "border-red-500/20 bg-red-500/5",
+                    )}
+                    key={check.id}
+                  >
+                    <p className="font-medium">{check.message}</p>
+                    {check.resolution === null ? null : (
+                      <p className="mt-1 text-muted-foreground">{check.resolution}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+            {trainingReadiness.result?.credentialRequired === true ? (
+              <div className="space-y-2 rounded-lg border border-violet-500/20 bg-violet-500/5 p-3">
+                <label className="block space-y-1.5 text-xs">
+                  <span className="flex items-center gap-2">
+                    <KeyRound className="size-3.5 text-violet-400" />
+                    Hugging Face read-only token
+                  </span>
+                  <input
+                    autoComplete="off"
+                    className={inputClassName}
+                    onChange={(event) =>
+                      setTrainingReadiness({
+                        ...trainingReadiness,
+                        credential: event.target.value,
+                      })
+                    }
+                    placeholder="hf_…"
+                    type="password"
+                    value={trainingReadiness.credential}
+                  />
+                </label>
+                <p className="text-[9px] leading-relaxed text-muted-foreground">
+                  The token is sent only to the active Training Manager and kept in server
+                  memory for this session. Tome does not save it in SQLite, job JSON,
+                  files, or logs.
+                </p>
+                <a
+                  className="inline-flex text-[9px] text-violet-400 hover:underline"
+                  href={`https://huggingface.co/${trainingReadiness.result.sourceModel}`}
+                  rel="noreferrer"
+                  target="_blank"
+                >
+                  Review model access and licence
+                </a>
+              </div>
+            ) : null}
+            <div className="flex justify-end gap-2">
+              <Button
+                onClick={() => setTrainingReadiness(null)}
+                type="button"
+                variant="outline"
+              >
+                Close
+              </Button>
+              <Button disabled={preflightJob.isPending} type="submit" variant="outline">
+                <RefreshCw
+                  className={cn("size-3", preflightJob.isPending && "animate-spin")}
+                />
+                {trainingReadiness.result === null ? "Check" : "Check again"}
+              </Button>
+              {trainingReadiness.result?.ready === true ? (
+                <Button
+                  disabled={jobAction.isPending}
+                  onClick={() =>
+                    jobAction.mutate({
+                      action: "dispatch",
+                      id: trainingReadiness.job.id,
+                    })
+                  }
+                  type="button"
+                >
+                  <Play className="size-3" />
+                  Train now
+                </Button>
+              ) : null}
+            </div>
+          </form>
+        </Modal>
+      )}
+
       {jobForm === null ? null : (
         <Modal
           onClose={() => setJobForm(null)}
@@ -3473,9 +3687,22 @@ export function TrainingPage(): React.JSX.Element {
                 <select
                   aria-label="Installed Ollama base model"
                   className={inputClassName}
-                  onChange={(event) =>
-                    setJobForm({ ...jobForm, baseModel: event.target.value })
-                  }
+                  onChange={(event) => {
+                    const baseModel = event.target.value;
+                    const sourceModel = sourceModelForOllama(baseModel);
+                    setJobForm({
+                      ...jobForm,
+                      baseModel,
+                      parametersJson:
+                        sourceModel === null
+                          ? jobForm.parametersJson
+                          : writeJobParameter(
+                              jobForm.parametersJson,
+                              "sourceModel",
+                              sourceModel,
+                            ),
+                    });
+                  }}
                   required
                   value={jobForm.baseModel}
                 >
@@ -3514,6 +3741,30 @@ export function TrainingPage(): React.JSX.Element {
                   remain visible but disabled.
                 </FieldHelp>
               </div>
+              <label className="block space-y-1.5 text-xs sm:col-span-2">
+                <span>Original trainable source</span>
+                <input
+                  className={inputClassName}
+                  onChange={(event) =>
+                    setJobForm({
+                      ...jobForm,
+                      parametersJson: writeJobParameter(
+                        jobForm.parametersJson,
+                        "sourceModel",
+                        event.target.value,
+                      ),
+                    })
+                  }
+                  placeholder="organization/model-name"
+                  required
+                  value={readJobParameter(jobForm.parametersJson, "sourceModel")}
+                />
+                <FieldHelp>
+                  The full-precision Transformers checkpoint used for training. The
+                  selected Ollama model is retained for final adapter registration; its
+                  quantized inference files are not used for gradient training.
+                </FieldHelp>
+              </label>
               <label className="block space-y-1.5 text-xs">
                 <span>Backend adapter</span>
                 <select
@@ -3630,6 +3881,7 @@ function JobCard({
   datasets,
   job,
   onAction,
+  onCheckReadiness,
   onRequestDelete,
   onReviewDatasets,
   onViewLogs,
@@ -3642,6 +3894,7 @@ function JobCard({
   readonly onAction: (
     action: "cancel" | "delete" | "dispatch" | "refresh" | "retry",
   ) => void;
+  readonly onCheckReadiness: () => void;
   readonly onRequestDelete: () => void;
   readonly onReviewDatasets: () => void;
   readonly onViewLogs: () => void;
@@ -3686,14 +3939,25 @@ function JobCard({
         </div>
         <div className="flex flex-wrap gap-1">
           {job.status === "draft" || job.status === "failed" ? (
-            <Button
-              disabled={pendingAction !== null || dispatchBlocker !== null}
-              onClick={() => onAction("dispatch")}
-              size="sm"
-            >
-              <Play className="size-3" />
-              Dispatch
-            </Button>
+            <>
+              <Button
+                disabled={pendingAction !== null}
+                onClick={onCheckReadiness}
+                size="sm"
+                variant="outline"
+              >
+                <ListChecks className="size-3" />
+                Check readiness
+              </Button>
+              <Button
+                disabled={pendingAction !== null || dispatchBlocker !== null}
+                onClick={() => onAction("dispatch")}
+                size="sm"
+              >
+                <Play className="size-3" />
+                Train
+              </Button>
+            </>
           ) : null}
           {active && job.remoteJobId !== null ? (
             <>

@@ -28,6 +28,7 @@ import type {
   TrainingJobInput,
   TrainingJobRecord,
   TrainingLogRecord,
+  TrainingPreflightResult,
   TrainingResourceRecord,
   TrainingServerInput,
   TrainingServerRecord,
@@ -159,6 +160,11 @@ export const backend = {
   deleteTrainingJob: (id: string) => command<void>("delete_training_job", { id }),
   dispatchTrainingJob: (id: string) =>
     command<TrainingJobRecord>("dispatch_training_job", { id }),
+  preflightTrainingJob: (id: string, credential?: string) =>
+    command<TrainingPreflightResult>("preflight_training_job", {
+      id,
+      credential,
+    }),
   refreshTrainingJob: (id: string) =>
     command<TrainingJobRecord>("refresh_training_job", { id }),
   cancelTrainingJob: (id: string) =>

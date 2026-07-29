@@ -16,7 +16,9 @@ use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 
 use crate::{
     error::{ApiError, ApiResult},
-    jobs, resources, uploads, AppState,
+    jobs,
+    models::{TrainingPreflightRequest, TrainingPreflightResponse},
+    resources, uploads, AppState,
 };
 
 #[derive(Serialize)]
@@ -82,6 +84,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/resources", get(resources::resources))
+        .route("/v1/training/preflight", post(training_preflight))
         .route("/v1/events/ws", get(websocket))
         .route("/v1/uploads", post(uploads::create_upload))
         .route(
@@ -107,6 +110,67 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(RequestBodyLimitLayer::new(chunk_limit))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn training_preflight(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<TrainingPreflightRequest>,
+) -> ApiResult<Json<TrainingPreflightResponse>> {
+    if request.source_model.trim().is_empty() {
+        return Err(ApiError::invalid("sourceModel is required"));
+    }
+    if request.base_model.trim().is_empty() {
+        return Err(ApiError::invalid("baseModel is required"));
+    }
+    if request
+        .credential
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(ApiError::invalid("credential cannot be empty"));
+    }
+
+    let session_token = state
+        .huggingface_token
+        .lock()
+        .map_err(|error| ApiError::internal(format!("Credential lock failed: {error}")))?
+        .clone();
+    let token = request.credential.clone().or(session_token);
+    let mut command = Command::new(&state.config.python_executable);
+    command
+        .arg(&state.config.worker_script)
+        .arg("--preflight-source")
+        .arg(request.source_model.trim())
+        .arg("--preflight-backend")
+        .arg(request.backend.trim());
+    if let Some(value) = token.as_deref() {
+        // Child-process environment avoids leaking the token into process arguments,
+        // job JSON, logs, or persisted metadata.
+        command.env("HF_TOKEN", value);
+    }
+    let output = tokio::time::timeout(std::time::Duration::from_secs(180), command.output())
+        .await
+        .map_err(|_| ApiError::conflict("Model preflight timed out after 3 minutes"))?
+        .map_err(|error| ApiError::conflict(format!("Could not run model preflight: {error}")))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let response = stdout
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<TrainingPreflightResponse>(line).ok())
+        .ok_or_else(|| {
+            ApiError::internal(format!(
+                "Training worker returned an invalid preflight response: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        })?;
+    if response.ready && request.credential.is_some() {
+        *state
+            .huggingface_token
+            .lock()
+            .map_err(|error| ApiError::internal(format!("Credential lock failed: {error}")))? =
+            request.credential;
+    }
+    Ok(Json(response))
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {

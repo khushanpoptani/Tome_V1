@@ -3,6 +3,36 @@ use serde_json::Value;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TrainingPreflightRequest {
+    pub base_model: String,
+    pub source_model: String,
+    pub backend: String,
+    #[serde(default)]
+    pub credential: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingPreflightCheck {
+    pub id: String,
+    pub status: String,
+    pub message: String,
+    pub resolution: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingPreflightResponse {
+    pub ready: bool,
+    pub source_status: String,
+    pub source_model: String,
+    pub credential_required: bool,
+    pub credential_accepted: bool,
+    pub checks: Vec<TrainingPreflightCheck>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UploadRequest {
     pub client_upload_id: String,
     pub dataset_id: String,

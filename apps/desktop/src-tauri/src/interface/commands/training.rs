@@ -25,8 +25,8 @@ use crate::{
     domain::records::{
         DatabaseResetResult, DatasetExclusion, DatasetUploadRecord, TrainingDatasetGroupInput,
         TrainingDatasetGroupRecord, TrainingDatasetInput, TrainingDatasetRecord, TrainingJobInput,
-        TrainingJobRecord, TrainingLogRecord, TrainingResourceRecord, TrainingServerInput,
-        TrainingServerRecord,
+        TrainingJobRecord, TrainingLogRecord, TrainingPreflightResult, TrainingResourceRecord,
+        TrainingServerInput, TrainingServerRecord,
     },
     infrastructure::state::AppState,
     interface::commands::data::add_log,
@@ -2803,8 +2803,20 @@ pub fn save_training_job(
     state: State<'_, AppState>,
     input: TrainingJobInput,
 ) -> Result<TrainingJobRecord, String> {
-    serde_json::from_str::<Value>(&input.parameters_json)
+    let parameters = serde_json::from_str::<Value>(&input.parameters_json)
         .map_err(|error| format!("Training parameters must be valid JSON: {error}"))?;
+    if parameters.get("huggingFaceToken").is_some() {
+        return Err(
+            "Remove huggingFaceToken from Training parameters. Credentials must be entered through Check readiness so they are never saved in the job or logs."
+                .into(),
+        );
+    }
+    if parameters["sourceModel"]
+        .as_str()
+        .map_or(true, |value| value.trim().is_empty())
+    {
+        return Err("Training parameters must include a non-empty sourceModel".into());
+    }
     if input.total_epochs < 1 {
         return Err("Training epochs must be at least 1".into());
     }
@@ -2934,6 +2946,66 @@ fn record_training_heartbeat_failure(
     Ok(())
 }
 
+async fn run_training_preflight(
+    state: &State<'_, AppState>,
+    job: &TrainingJobRecord,
+    credential: Option<String>,
+) -> Result<TrainingPreflightResult, String> {
+    let server = active_training_server(state.clone(), job.training_server_id.as_deref())?;
+    let parameters = serde_json::from_str::<Value>(&job.parameters_json)
+        .map_err(|error| format!("Stored training parameters are invalid: {error}"))?;
+    if parameters.get("huggingFaceToken").is_some() {
+        return Err(
+            "This draft contains a persisted Hugging Face token. Remove it and use Check readiness to provide the token securely."
+                .into(),
+        );
+    }
+    let source_model = parameters["sourceModel"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Training parameters do not contain sourceModel".to_string())?;
+    let response = state
+        .http
+        .post(api_url(&server.url, "/v1/training/preflight"))
+        .timeout(Duration::from_secs(200))
+        .json(&json!({
+            "baseModel": job.base_model,
+            "sourceModel": source_model,
+            "backend": job.backend,
+            "credential": credential
+        }))
+        .send()
+        .await
+        .map_err(|error| {
+            format!(
+                "Could not run training preflight on {}: {}",
+                server.url,
+                request_error_details(&error)
+            )
+        })?;
+    if !response.status().is_success() {
+        return Err(response_failure(response, "Checking training readiness").await);
+    }
+    response
+        .json::<TrainingPreflightResult>()
+        .await
+        .map_err(|error| format!("Training Manager returned invalid preflight JSON: {error}"))
+}
+
+#[tauri::command]
+pub async fn preflight_training_job(
+    state: State<'_, AppState>,
+    id: String,
+    credential: Option<String>,
+) -> Result<TrainingPreflightResult, String> {
+    let job = list_training_jobs(state.clone())?
+        .into_iter()
+        .find(|job| job.id == id)
+        .ok_or_else(|| "The selected training job no longer exists".to_string())?;
+    run_training_preflight(&state, &job, credential).await
+}
+
 #[tauri::command]
 pub async fn dispatch_training_job(
     state: State<'_, AppState>,
@@ -2945,6 +3017,25 @@ pub async fn dispatch_training_job(
         .ok_or_else(|| "The selected training job no longer exists".to_string())?;
     if job.status != "draft" && job.status != "failed" {
         return Err("Only draft or failed jobs can be dispatched".into());
+    }
+    let preflight = run_training_preflight(&state, &job, None).await?;
+    if !preflight.ready {
+        let details = preflight
+            .checks
+            .iter()
+            .filter(|check| check.status != "passed")
+            .map(|check| {
+                check
+                    .resolution
+                    .as_ref()
+                    .map(|resolution| format!("{} {}", check.message, resolution))
+                    .unwrap_or_else(|| check.message.clone())
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Err(format!(
+            "Training requires attention before dispatch. {details}"
+        ));
     }
     let server = active_training_server(state.clone(), job.training_server_id.as_deref())?;
     let datasets = list_training_datasets(state.clone())?;

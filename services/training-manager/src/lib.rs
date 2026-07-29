@@ -31,6 +31,9 @@ pub struct AppState {
     pub events: broadcast::Sender<ServerEvent>,
     pub queue: mpsc::Sender<String>,
     pub cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Session-only model registry credential. It is never written to SQLite,
+    /// job specifications, logs, or the filesystem.
+    pub huggingface_token: Mutex<Option<String>>,
 }
 
 pub async fn build(config: Config) -> ApiResult<(Router, Arc<AppState>)> {
@@ -51,6 +54,7 @@ pub async fn build(config: Config) -> ApiResult<(Router, Arc<AppState>)> {
         events,
         queue,
         cancellations: jobs::cancellations(),
+        huggingface_token: Mutex::new(None),
     });
     jobs::spawn_queue(state.clone(), receiver, concurrency);
     jobs::recover_queue(&state).await?;

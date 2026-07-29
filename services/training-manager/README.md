@@ -22,6 +22,17 @@ with it over `tome-training/v1`; the desktop never computes gradients.
 - post-training PEFT adapter validation and registration through the local Ollama CLI
 - console mode for diagnostics and Windows Service mode for production
 
+## Reliable training preflight
+
+`POST /v1/training/preflight` checks the Python worker, accelerator requirements and
+access to the original trainable source before a job is queued. Gated Hugging Face models
+accept an optional read-only credential in this request. An accepted credential is held
+only in service memory and passed to the Python worker as `HF_TOKEN`; it is not persisted
+in the Training Manager database or job files.
+
+The desktop automatically repeats preflight when the user clicks **Train**. Restarting the
+service clears the session credential.
+
 Unsloth, Axolotl, merged-model export, and GGUF conversion are explicit future adapters.
 The capability endpoint reports them as unavailable; it never simulates training.
 

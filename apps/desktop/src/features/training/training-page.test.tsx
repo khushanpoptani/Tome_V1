@@ -141,6 +141,34 @@ describe("Training deletion confirmations", () => {
   });
 });
 
+describe("Training readiness", () => {
+  it("checks the worker and source model before training is dispatched", async () => {
+    const preflight = vi.spyOn(backend, "preflightTrainingJob").mockResolvedValue({
+      checks: [
+        {
+          id: "source-model",
+          message: "Trainable source is accessible",
+          resolution: null,
+          status: "passed",
+        },
+      ],
+      credentialAccepted: false,
+      credentialRequired: false,
+      ready: true,
+      sourceModel: "meta-llama/Llama-3.2-3B-Instruct",
+      sourceStatus: "ready",
+    });
+    renderTrainingPage();
+
+    fireEvent.click(screen.getByRole("button", { name: "Training Jobs" }));
+    fireEvent.click(screen.getByRole("button", { name: "Check readiness" }));
+
+    await waitFor(() => expect(preflight).toHaveBeenCalledWith(job.id, undefined));
+    expect(await screen.findByText("Trainable source is accessible")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Train now" })).toBeInTheDocument();
+  });
+});
+
 describe("Training dataset groups", () => {
   it("keeps an empty group visible so data can be added to it", () => {
     renderTrainingPage([]);

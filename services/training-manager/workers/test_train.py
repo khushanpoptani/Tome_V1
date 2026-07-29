@@ -7,10 +7,27 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from train import create_training_arguments, normalize_record, read_records
+from train import (
+    create_training_arguments,
+    is_authentication_error,
+    normalize_record,
+    read_records,
+)
 
 
 class TrainingDatasetNormalizationTests(unittest.TestCase):
+    def test_identifies_gated_registry_errors_without_matching_network_failures(
+        self,
+    ) -> None:
+        self.assertTrue(
+            is_authentication_error(
+                "401 Client Error: Cannot access gated repo; model is restricted"
+            )
+        )
+        self.assertFalse(
+            is_authentication_error("Connection timed out while resolving model files")
+        )
+
     def test_ignores_unsupported_training_argument_options(self) -> None:
         class InstalledTrainingArguments:
             def __init__(self, output_dir: str, max_steps: int) -> None:

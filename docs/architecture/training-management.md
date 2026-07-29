@@ -145,6 +145,7 @@ primary-key constraint.
 
 | Method | Path                                | Purpose                                |
 | ------ | ----------------------------------- | -------------------------------------- |
+| `POST` | `/v1/training/preflight`            | Verify worker, GPU, and source access  |
 | `POST` | `/v1/jobs`                          | Dispatch a validated job specification |
 | `GET`  | `/v1/jobs`                          | Reconcile active and historical jobs   |
 | `GET`  | `/v1/jobs/{id}`                     | Heartbeat/status snapshot              |
@@ -152,6 +153,39 @@ primary-key constraint.
 | `POST` | `/v1/jobs/{id}/retry`               | Retry with the immutable specification |
 | `GET`  | `/v1/jobs/{id}/logs?after={cursor}` | Incremental logs                       |
 | `GET`  | `/v1/events/ws`                     | Preferred WebSocket event stream       |
+
+### Source-model readiness and credentials
+
+An Ollama installation is the inference and final registry target; it is not assumed to
+contain a trainable checkpoint. Every fine-tuning draft therefore identifies both:
+
+- `baseModel`: the exact Ollama model used when the exported adapter is registered;
+- `parameters.sourceModel`: the original Transformers checkpoint used for gradient
+  training.
+
+Tome runs `/v1/training/preflight` before dispatch. The Training Manager verifies the
+Python environment, CUDA requirements for QLoRA, tokenizer/config access, and registry
+authentication. A failed preflight leaves the draft in an actionable local state and does
+not consume a queue slot.
+
+Gated registries may require a read-only Hugging Face token. The desktop sends that token
+only in the preflight request. The Training Manager holds an accepted token in process
+memory and injects it into the worker through `HF_TOKEN`; it is never placed in command
+arguments, SQLite, job specifications, files, or logs. Restarting the Windows service
+clears the token and requires the user to provide it again. Production deployments should
+protect the Training Manager endpoint with its bearer-token middleware and TLS or a
+trusted encrypted network tunnel because application-level secret storage does not encrypt
+plain HTTP transport.
+
+The worker rejects a `huggingFaceToken` field in job parameters to prevent old clients or
+manual requests from persisting a secret. Readiness proves model metadata/tokenizer
+access; downloading large weight shards remains a visible worker stage and can still fail
+for external conditions such as loss of network connectivity or insufficient disk.
+
+True from-scratch pretraining is a separate future backend. It will create a tokenizer and
+randomly initialized checkpoint and will not treat an Ollama inference model as a base.
+The current production path is adapter fine-tuning from an original, locally cached
+Transformers checkpoint followed by Ollama registration.
 
 ### Administrative recovery
 

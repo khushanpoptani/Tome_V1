@@ -11,6 +11,7 @@ import csv
 import inspect
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -80,6 +81,145 @@ def probe() -> int:
     except Exception as error:  # pragma: no cover - depends on server environment
         print(f"Training dependency probe failed: {error}", file=sys.stderr)
         return 1
+
+
+def is_authentication_error(message: str) -> bool:
+    lowered = message.lower()
+    return any(
+        marker in lowered
+        for marker in ("gated repo", "401 client error", "restricted", "unauthorized")
+    )
+
+
+def preflight(source_model: str, backend: str) -> int:
+    """Verify model access and worker suitability without starting a job."""
+
+    checks: list[dict[str, Any]] = []
+    ready = True
+    source_status = "unreachable"
+    credential = os.environ.get("HF_TOKEN")
+
+    def check(
+        identifier: str,
+        status: str,
+        message: str,
+        resolution: str | None = None,
+    ) -> None:
+        checks.append(
+            {
+                "id": identifier,
+                "status": status,
+                "message": message,
+                "resolution": resolution,
+            }
+        )
+
+    try:
+        import accelerate  # noqa: F401
+        import datasets  # noqa: F401
+        import peft  # noqa: F401
+        import safetensors  # noqa: F401
+        import torch
+        from transformers import AutoConfig, AutoTokenizer
+
+        check("worker", "passed", "Python training dependencies are available")
+    except Exception as error:
+        ready = False
+        check(
+            "worker",
+            "failed",
+            f"Python training dependencies are unavailable: {error}",
+            "Repair the Training Manager installation before training.",
+        )
+        print(
+            json.dumps(
+                {
+                    "ready": ready,
+                    "sourceStatus": source_status,
+                    "sourceModel": source_model,
+                    "credentialRequired": False,
+                    "credentialAccepted": False,
+                    "checks": checks,
+                }
+            )
+        )
+        return 0
+
+    normalized_backend = backend.lower()
+    if normalized_backend == "qlora" and not torch.cuda.is_available():
+        ready = False
+        check(
+            "accelerator",
+            "failed",
+            "QLoRA requires a CUDA-capable NVIDIA GPU, but CUDA was not detected",
+            "Install the NVIDIA driver and CUDA-enabled PyTorch, or select LoRA.",
+        )
+    elif torch.cuda.is_available():
+        device_name = torch.cuda.get_device_name(0)
+        memory = torch.cuda.get_device_properties(0).total_memory
+        check(
+            "accelerator",
+            "passed",
+            f"CUDA is available on {device_name} with {memory / 1024**3:.1f} GiB VRAM",
+        )
+    else:
+        check(
+            "accelerator",
+            "warning",
+            "CUDA was not detected; LoRA may run on CPU but will be very slow",
+            "Configure an NVIDIA GPU for production training.",
+        )
+
+    try:
+        configuration = AutoConfig.from_pretrained(
+            source_model,
+            token=credential,
+            trust_remote_code=False,
+        )
+        AutoTokenizer.from_pretrained(
+            source_model,
+            token=credential,
+            trust_remote_code=False,
+        )
+        source_status = "ready"
+        check(
+            "source-model",
+            "passed",
+            (
+                f"Trainable source {source_model} is accessible "
+                f"({getattr(configuration, 'model_type', 'unknown')} architecture)"
+            ),
+        )
+    except Exception as error:
+        ready = False
+        message = str(error)
+        gated = is_authentication_error(message)
+        source_status = "authenticationRequired" if gated else "unreachable"
+        check(
+            "source-model",
+            "actionRequired" if gated else "failed",
+            message,
+            (
+                "Approve the model licence, enter a read-only Hugging Face token in Tome, "
+                "and run the check again."
+                if gated
+                else "Confirm the model ID and the Windows server internet connection."
+            ),
+        )
+
+    print(
+        json.dumps(
+            {
+                "ready": ready,
+                "sourceStatus": source_status,
+                "sourceModel": source_model,
+                "credentialRequired": source_status == "authenticationRequired",
+                "credentialAccepted": bool(credential) and source_status == "ready",
+                "checks": checks,
+            }
+        )
+    )
+    return 0
 
 
 def read_json_records(path: Path) -> list[Any]:
@@ -324,12 +464,11 @@ def run(spec_path: Path) -> int:
 
     max_length = int(parameters.get("maxLength", 2048))
     emit("progress", stage="Loading tokenizer", progress=7.0, epoch=0)
+    credential = os.environ.get("HF_TOKEN")
     tokenizer = AutoTokenizer.from_pretrained(
         source_model,
         trust_remote_code=bool(parameters.get("trustRemoteCode", False)),
-        token=str(parameters["huggingFaceToken"])
-        if parameters.get("huggingFaceToken")
-        else None,
+        token=credential,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -352,9 +491,7 @@ def run(spec_path: Path) -> int:
     emit("progress", stage="Tokenization complete", progress=12.0, epoch=0)
     model_kwargs: dict[str, Any] = {
         "trust_remote_code": bool(parameters.get("trustRemoteCode", False)),
-        "token": str(parameters["huggingFaceToken"])
-        if parameters.get("huggingFaceToken")
-        else None,
+        "token": credential,
     }
     if backend == "qlora":
         if not torch.cuda.is_available():
@@ -471,10 +608,14 @@ def run(spec_path: Path) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--probe", action="store_true")
+    parser.add_argument("--preflight-source")
+    parser.add_argument("--preflight-backend", default="auto")
     parser.add_argument("--spec", type=Path)
     arguments = parser.parse_args()
     if arguments.probe:
         return probe()
+    if arguments.preflight_source:
+        return preflight(arguments.preflight_source, arguments.preflight_backend)
     if arguments.spec is None:
         parser.error("--spec is required unless --probe is used")
     try:

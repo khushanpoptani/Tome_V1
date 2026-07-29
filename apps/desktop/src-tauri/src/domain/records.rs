@@ -283,6 +283,26 @@ pub struct TrainingJobInput {
     pub total_epochs: i64,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingPreflightCheck {
+    pub id: String,
+    pub status: String,
+    pub message: String,
+    pub resolution: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrainingPreflightResult {
+    pub ready: bool,
+    pub source_status: String,
+    pub source_model: String,
+    pub credential_required: bool,
+    pub credential_accepted: bool,
+    pub checks: Vec<TrainingPreflightCheck>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrainingResourceRecord {

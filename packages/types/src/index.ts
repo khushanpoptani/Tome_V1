@@ -367,6 +367,27 @@ export interface TrainingJobInput {
   readonly totalEpochs: number;
 }
 
+export interface TrainingPreflightCheck {
+  readonly id: string;
+  readonly status: "passed" | "warning" | "actionRequired" | "failed";
+  readonly message: string;
+  readonly resolution: string | null;
+}
+
+export interface TrainingPreflightResult {
+  readonly ready: boolean;
+  readonly sourceStatus:
+    | "ready"
+    | "authenticationRequired"
+    | "downloadRequired"
+    | "unreachable"
+    | "incompatible";
+  readonly sourceModel: string;
+  readonly credentialRequired: boolean;
+  readonly credentialAccepted: boolean;
+  readonly checks: readonly TrainingPreflightCheck[];
+}
+
 export interface TrainingResourceRecord {
   readonly trainingServerId: string;
   readonly gpuJson: string;
