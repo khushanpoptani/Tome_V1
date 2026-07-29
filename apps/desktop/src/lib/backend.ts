@@ -4,6 +4,7 @@ import type {
   ConnectionHistoryRecord,
   ConversationInput,
   ConversationRecord,
+  DatabaseResetResult,
   FileTreeNode,
   LogRecord,
   MessageInput,
@@ -60,6 +61,8 @@ async function command<T>(
 }
 
 export const backend = {
+  resetLocalDatabase: (confirmation: string) =>
+    command<DatabaseResetResult>("reset_local_database", { confirmation }),
   cancelOperation: (requestId: string) =>
     command<boolean>("cancel_operation", { requestId }),
   clearFinishedTasks: () => command<void>("clear_finished_tasks"),
@@ -132,6 +135,11 @@ export const backend = {
   deleteTrainingServer: (id: string) => command<void>("delete_training_server", { id }),
   testTrainingServer: (id: string) =>
     command<TrainingServerRecord>("test_training_server", { id }),
+  resetTrainingManagerDatabase: (trainingServerId: string, confirmation: string) =>
+    command<DatabaseResetResult>("reset_training_manager_database", {
+      trainingServerId,
+      confirmation,
+    }),
   listTrainingDatasetGroups: () =>
     command<TrainingDatasetGroupRecord[]>("list_training_dataset_groups"),
   saveTrainingDatasetGroup: (input: TrainingDatasetGroupInput) =>

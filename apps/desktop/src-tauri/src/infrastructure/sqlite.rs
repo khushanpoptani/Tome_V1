@@ -2,6 +2,11 @@ use std::{fs, path::Path, time::Duration};
 
 use rusqlite::Connection;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalDatabaseResetCounts {
+    pub deleted_records: usize,
+}
+
 pub fn open_connection(path: &Path) -> rusqlite::Result<Connection> {
     if let Some(parent) = path
         .parent()
@@ -17,6 +22,102 @@ pub fn open_connection(path: &Path) -> rusqlite::Result<Connection> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
     migrate(&connection)?;
     Ok(connection)
+}
+
+pub fn reset_user_data(connection: &mut Connection) -> Result<LocalDatabaseResetCounts, String> {
+    let active_jobs = connection
+        .query_row(
+            "SELECT COUNT(*) FROM training_jobs
+             WHERE status IN ('queued', 'running', 'cancelling')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("Could not check active training jobs: {error}"))?;
+    let active_uploads = connection
+        .query_row(
+            "SELECT COUNT(*) FROM dataset_uploads WHERE status='uploading'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("Could not check active dataset uploads: {error}"))?;
+    let active_tasks = connection
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE status='running'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("Could not check active local tasks: {error}"))?;
+    if active_jobs > 0 || active_uploads > 0 || active_tasks > 0 {
+        return Err(format!(
+            "Cannot reset while {active_jobs} training job(s), {active_uploads} upload(s), and {active_tasks} local task(s) are active. Cancel them and wait for completion first."
+        ));
+    }
+    let tables = [
+        "settings",
+        "servers",
+        "connection_history",
+        "workspaces",
+        "projects",
+        "conversations",
+        "messages",
+        "tasks",
+        "installed_models",
+        "model_tests",
+        "logs",
+        "training_servers",
+        "training_dataset_groups",
+        "training_datasets",
+        "dataset_uploads",
+        "training_jobs",
+        "training_resources",
+        "training_logs",
+    ];
+    let mut deleted_records = 0_usize;
+    for table in tables {
+        let statement = format!("SELECT COUNT(*) FROM {table}");
+        deleted_records = deleted_records.saturating_add(
+            connection
+                .query_row(&statement, [], |row| row.get::<_, i64>(0))
+                .map_err(|error| format!("Could not count {table}: {error}"))? as usize,
+        );
+    }
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("Could not start local database reset: {error}"))?;
+    for table in [
+        "training_logs",
+        "training_jobs",
+        "dataset_uploads",
+        "training_datasets",
+        "training_dataset_groups",
+        "training_resources",
+        "training_servers",
+        "messages",
+        "conversations",
+        "projects",
+        "workspaces",
+        "connection_history",
+        "model_tests",
+        "installed_models",
+        "servers",
+        "tasks",
+        "logs",
+        "settings",
+    ] {
+        transaction
+            .execute(&format!("DELETE FROM {table}"), [])
+            .map_err(|error| format!("Could not clear {table}: {error}"))?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM sqlite_sequence WHERE name IN ('logs', 'training_logs')",
+            [],
+        )
+        .map_err(|error| format!("Could not reset local log counters: {error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("Could not commit local database reset: {error}"))?;
+    Ok(LocalDatabaseResetCounts { deleted_records })
 }
 
 fn migrate(connection: &Connection) -> rusqlite::Result<()> {
@@ -493,7 +594,7 @@ fn migrate(connection: &Connection) -> rusqlite::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{migrate, open_connection};
+    use super::{migrate, open_connection, reset_user_data};
     use rusqlite::Connection;
     use std::path::Path;
 
@@ -502,6 +603,64 @@ mod tests {
         let connection = open_connection(Path::new(":memory:"));
 
         assert!(connection.is_ok());
+    }
+
+    #[test]
+    fn resets_user_data_without_removing_the_schema() {
+        let mut connection = open_connection(Path::new(":memory:")).expect("database should open");
+        connection
+            .execute(
+                "INSERT INTO settings(key, value, updated_at)
+                 VALUES ('theme', 'dark', datetime('now'))",
+                [],
+            )
+            .expect("setting should be inserted");
+        connection
+            .execute(
+                "INSERT INTO logs(category, level, message, created_at)
+                 VALUES ('test', 'info', 'message', datetime('now'))",
+                [],
+            )
+            .expect("log should be inserted");
+
+        let counts = reset_user_data(&mut connection).expect("reset should succeed");
+
+        assert_eq!(counts.deleted_records, 2);
+        for table in ["settings", "logs"] {
+            let count = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("table should remain queryable");
+            assert_eq!(count, 0);
+        }
+        let migrations = connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("schema migrations should remain");
+        assert!(migrations > 0);
+    }
+
+    #[test]
+    fn refuses_to_reset_local_data_while_a_task_is_running() {
+        let mut connection = open_connection(Path::new(":memory:")).expect("database should open");
+        connection
+            .execute(
+                "INSERT INTO tasks(
+                    id, kind, title, status, progress, logs, created_at, updated_at
+                 ) VALUES (
+                    'task', 'dataset-upload', 'Upload', 'running', 10, '',
+                    datetime('now'), datetime('now')
+                 )",
+                [],
+            )
+            .expect("running task should be inserted");
+
+        let error = reset_user_data(&mut connection)
+            .expect_err("running task should prevent a database reset");
+
+        assert!(error.contains("1 local task(s)"));
     }
 
     #[test]

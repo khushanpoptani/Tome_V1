@@ -68,6 +68,19 @@ describe("Tome application shell", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Security" }));
     expect(screen.getByRole("heading", { name: "Execution mode" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Database reset" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Reset local" }));
+    const resetDialog = screen.getByRole("dialog");
+    const resetButton = within(resetDialog).getByRole("button", {
+      name: "Permanently reset",
+    });
+    expect(resetButton).toBeDisabled();
+    fireEvent.change(
+      within(resetDialog).getByLabelText(/Type RESET LOCAL DATABASE to continue/),
+      { target: { value: "RESET LOCAL DATABASE" } },
+    );
+    expect(resetButton).toBeEnabled();
+    fireEvent.click(within(resetDialog).getByRole("button", { name: "Cancel" }));
   });
 
   it("renders the separated training management workspace", async () => {

@@ -222,6 +222,16 @@ export interface TrainingServerInput {
   readonly isActive: boolean;
 }
 
+export interface DatabaseResetResult {
+  readonly machine: "local" | "training-manager";
+  readonly deletedRecords: number;
+  readonly datasets?: number;
+  readonly jobs?: number;
+  readonly logs?: number;
+  readonly uploads?: number;
+  readonly warnings: readonly string[];
+}
+
 export interface TrainingDatasetRecord {
   readonly id: string;
   readonly groupId: string | null;

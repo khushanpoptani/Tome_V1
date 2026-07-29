@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fs, path::Path, sync::Arc};
 
 use axum::{
     extract::{ws::Message, DefaultBodyLimit, Query, State, WebSocketUpgrade},
@@ -50,11 +50,30 @@ struct CapabilitiesResponse {
     adapter_registration_architectures: &'static [&'static str],
     max_upload_bytes: u64,
     chunk_size: u64,
+    database_reset: bool,
 }
 
 #[derive(Deserialize)]
 struct WebSocketQuery {
     token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DatabaseResetRequest {
+    confirmation: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DatabaseResetResponse {
+    machine: &'static str,
+    deleted_records: usize,
+    datasets: usize,
+    jobs: usize,
+    logs: usize,
+    uploads: usize,
+    warnings: Vec<String>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -80,6 +99,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/jobs/{id}/cancel", post(jobs::cancel_job))
         .route("/v1/jobs/{id}/retry", post(jobs::retry_job))
         .route("/v1/jobs/{id}/logs", get(jobs::get_logs))
+        .route("/v1/admin/database/reset", post(reset_database))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         // `Bytes` extractors otherwise retain Axum's 2 MiB default even though
         // the protocol advertises a larger resumable chunk size.
@@ -176,7 +196,66 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> ApiResult<Json<Capa
         adapter_registration_architectures: &["llama", "mistral", "mixtral", "gemma"],
         max_upload_bytes: state.config.max_upload_bytes,
         chunk_size: state.config.chunk_size,
+        database_reset: true,
     }))
+}
+
+async fn reset_database(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<DatabaseResetRequest>,
+) -> ApiResult<Json<DatabaseResetResponse>> {
+    if !matches!(
+        request.confirmation.as_str(),
+        "RESET SERVER DATABASE" | "RESET BOTH DATABASES"
+    ) {
+        return Err(ApiError::invalid(
+            "Type RESET SERVER DATABASE or RESET BOTH DATABASES exactly to confirm this reset",
+        ));
+    }
+    if !state
+        .cancellations
+        .lock()
+        .map_err(|error| ApiError::internal(format!("Cancellation lock was poisoned: {error}")))?
+        .is_empty()
+    {
+        return Err(ApiError::conflict(
+            "Cannot reset while a training worker is active. Cancel it and wait for completion first.",
+        ));
+    }
+    let counts = state.database.reset()?;
+    let data_dir = state.config.data_dir.clone();
+    let warnings = tokio::task::spawn_blocking(move || clean_managed_data(&data_dir))
+        .await
+        .map_err(|error| ApiError::internal(format!("Data cleanup worker failed: {error}")))?;
+    Ok(Json(DatabaseResetResponse {
+        machine: "training-manager",
+        deleted_records: counts.datasets + counts.jobs + counts.logs + counts.uploads,
+        datasets: counts.datasets,
+        jobs: counts.jobs,
+        logs: counts.logs,
+        uploads: counts.uploads,
+        warnings,
+    }))
+}
+
+fn clean_managed_data(data_dir: &Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for name in ["uploads", "datasets", "jobs"] {
+        let path = data_dir.join(name);
+        if path.exists() {
+            if let Err(error) = fs::remove_dir_all(&path) {
+                warnings.push(format!(
+                    "Could not fully remove {}: {error}",
+                    path.display()
+                ));
+                continue;
+            }
+        }
+        if let Err(error) = fs::create_dir_all(&path) {
+            warnings.push(format!("Could not recreate {}: {error}", path.display()));
+        }
+    }
+    warnings
 }
 
 async fn websocket(

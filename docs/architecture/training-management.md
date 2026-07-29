@@ -153,6 +153,19 @@ primary-key constraint.
 | `GET`  | `/v1/jobs/{id}/logs?after={cursor}` | Incremental logs                       |
 | `GET`  | `/v1/events/ws`                     | Preferred WebSocket event stream       |
 
+### Administrative recovery
+
+| Method | Path                       | Purpose                                     |
+| ------ | -------------------------- | ------------------------------------------- |
+| `POST` | `/v1/admin/database/reset` | Reset Training Manager metadata and storage |
+
+The reset endpoint uses the same bearer-token middleware as every Training Manager
+mutation and additionally requires an exact typed confirmation phrase. It rejects the
+operation while an upload or training worker is active. A successful reset clears uploads,
+datasets, jobs, job logs, and server-managed upload/dataset/job directories.
+Configuration, the Python worker, original source data, and registered Ollama models are
+preserved.
+
 Tome prefers WebSocket server events and immediately reconciles the corresponding
 persisted job after an event. When WebSocket streaming is unavailable, active jobs poll
 every five seconds. A job becomes `unreachable` after three missed heartbeats but is not
@@ -296,6 +309,12 @@ SQLite stores only a credential reference.
 
 - Upload, remote deletion, job dispatch, cancellation, and model import pass through the
   existing Ask/Smart/Full Access policy.
+- Database reset always requires typed confirmation, including in Full Access mode. “Reset
+  both” contacts the Training Manager first and only clears the desktop database after the
+  server succeeds. Cross-machine reset is deliberately not presented as transactional;
+  Tome reports a partial-success error if the server succeeds and the subsequent local
+  reset fails.
+- Resets are refused while relevant uploads, local tasks, or training jobs are active.
 - Local dataset removal deletes Tome metadata and managed compressed artifacts only; it
   never deletes the user's source dataset.
 - Remote requests use explicit timeouts and detailed errors.

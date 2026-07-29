@@ -905,9 +905,121 @@ const permissionDescriptions: Record<PermissionMode, string> = {
   full: "Permit scoped actions without prompts. Intended for trusted environments only.",
 };
 
+type DatabaseResetTarget = "both" | "local" | "server";
+
+const databaseResetPhrases: Readonly<Record<DatabaseResetTarget, string>> = {
+  both: "RESET BOTH DATABASES",
+  local: "RESET LOCAL DATABASE",
+  server: "RESET SERVER DATABASE",
+};
+
+function trainingServerSupportsDatabaseReset(capabilitiesJson: string): boolean {
+  try {
+    const value: unknown = JSON.parse(capabilitiesJson);
+    if (typeof value !== "object" || value === null) return false;
+    return (value as Record<string, unknown>).databaseReset === true;
+  } catch {
+    return false;
+  }
+}
+
 export function SecuritySettings(): React.JSX.Element {
   const permissionMode = useShellStore((state) => state.permissionMode);
   const setPermissionMode = useShellStore((state) => state.setPermissionMode);
+  const setActiveConversation = useShellStore((state) => state.setActiveConversation);
+  const setActiveProject = useShellStore((state) => state.setActiveProject);
+  const setActiveServer = useShellStore((state) => state.setActiveServer);
+  const setActiveWorkspace = useShellStore((state) => state.setActiveWorkspace);
+  const setDiagnostics = useShellStore((state) => state.setDiagnostics);
+  const setSelectedModel = useShellStore((state) => state.setSelectedModel);
+  const queryClient = useQueryClient();
+  const trainingServers = useQuery({
+    enabled: isTauriRuntime(),
+    queryFn: backend.listTrainingServers,
+    queryKey: ["training-servers"],
+  });
+  const [resetTarget, setResetTarget] = useState<DatabaseResetTarget | null>(null);
+  const [resetConfirmation, setResetConfirmation] = useState("");
+  const [resetting, setResetting] = useState(false);
+  const activeTrainingServer =
+    trainingServers.data?.find((server) => server.isActive) ??
+    trainingServers.data?.[0] ??
+    null;
+  const remoteResetAvailable =
+    activeTrainingServer !== null &&
+    trainingServerSupportsDatabaseReset(activeTrainingServer.capabilitiesJson);
+
+  const closeReset = (): void => {
+    if (resetting) return;
+    setResetTarget(null);
+    setResetConfirmation("");
+  };
+
+  const performReset = async (): Promise<void> => {
+    if (resetTarget === null || resetConfirmation !== databaseResetPhrases[resetTarget]) {
+      return;
+    }
+    if (resetTarget !== "local" && !remoteResetAvailable) {
+      toast.error(
+        "Install Training Manager 0.1.12 or later and test the connection before resetting its database.",
+      );
+      return;
+    }
+    setResetting(true);
+    let serverWasReset = false;
+    try {
+      if (resetTarget === "server" || resetTarget === "both") {
+        const result = await backend.resetTrainingManagerDatabase(
+          activeTrainingServer?.id ?? "",
+          resetConfirmation,
+        );
+        serverWasReset = true;
+        if (result.warnings.length > 0) {
+          toast.warning(
+            `Training Manager database reset with cleanup warnings: ${result.warnings.join("; ")}`,
+          );
+        }
+      }
+      if (resetTarget === "local" || resetTarget === "both") {
+        const result = await backend.resetLocalDatabase(resetConfirmation);
+        if (result.warnings.length > 0) {
+          toast.warning(
+            `Local database reset with cleanup warnings: ${result.warnings.join("; ")}`,
+          );
+        }
+        setActiveConversation(null);
+        setActiveProject(null);
+        setActiveServer(null);
+        setActiveWorkspace(null);
+        setDiagnostics(null);
+        setSelectedModel(null);
+        setPermissionMode("ask");
+        queryClient.clear();
+        toast.success(
+          resetTarget === "both"
+            ? "Both databases were reset. Tome will restart with a clean local workspace."
+            : "The local Tome database was reset. Tome will restart with a clean workspace.",
+        );
+        window.setTimeout(() => window.location.reload(), 700);
+        return;
+      }
+      await queryClient.invalidateQueries();
+      toast.success(
+        "The Training Manager database and managed training data were reset.",
+      );
+      setResetTarget(null);
+      setResetConfirmation("");
+    } catch (error) {
+      const message = errorMessage(error);
+      toast.error(
+        resetTarget === "both" && serverWasReset
+          ? `The server reset succeeded, but the local reset failed: ${message}`
+          : message,
+      );
+    } finally {
+      setResetting(false);
+    }
+  };
 
   return (
     <div className="space-y-4">
@@ -953,6 +1065,134 @@ export function SecuritySettings(): React.JSX.Element {
           </p>
         </div>
       ) : null}
+      <SettingsPanel
+        description="Permanently clear persisted Tome or Training Manager data. Every reset requires typed confirmation, even in Full Access mode."
+        title="Database reset"
+      >
+        <SettingRow
+          control={
+            <Button
+              onClick={() => {
+                setResetConfirmation("");
+                setResetTarget("local");
+              }}
+              size="sm"
+              variant="outline"
+            >
+              <Database className="size-3.5" />
+              Reset local
+            </Button>
+          }
+          description="Clears chats, projects, workspaces, settings, tasks, local training metadata, logs, and Tome-managed training artifacts. Source folders are preserved."
+          title="Local Tome database"
+        />
+        <SettingRow
+          control={
+            <Button
+              disabled={!remoteResetAvailable}
+              onClick={() => {
+                setResetConfirmation("");
+                setResetTarget("server");
+              }}
+              size="sm"
+              variant="outline"
+            >
+              <Server className="size-3.5" />
+              Reset server
+            </Button>
+          }
+          description={
+            activeTrainingServer === null
+              ? "Configure a Training Manager to enable remote reset."
+              : !remoteResetAvailable
+                ? "Upgrade this server to Training Manager 0.1.12 or later, then run Test to enable remote reset."
+                : `Clears datasets, uploads, jobs, job logs, and managed training outputs on ${activeTrainingServer.name}. Ollama models are preserved.`
+          }
+          title="Windows Training Manager database"
+        />
+        <SettingRow
+          control={
+            <Button
+              disabled={!remoteResetAvailable}
+              onClick={() => {
+                setResetConfirmation("");
+                setResetTarget("both");
+              }}
+              size="sm"
+              variant="outline"
+            >
+              <Trash2 className="size-3.5" />
+              Reset both
+            </Button>
+          }
+          description="Resets the Windows server first, then the local Tome database. If the server cannot be reached, local data is not removed."
+          title="Both databases"
+        />
+      </SettingsPanel>
+
+      {resetTarget === null ? null : (
+        <Modal
+          onClose={closeReset}
+          title={
+            resetTarget === "local"
+              ? "Reset local Tome database?"
+              : resetTarget === "server"
+                ? "Reset Training Manager database?"
+                : "Reset both databases?"
+          }
+          width="max-w-xl"
+        >
+          <div className="space-y-4 p-5">
+            <div className="flex gap-3 rounded-lg border border-red-500/25 bg-red-500/8 p-4">
+              <CircleAlert className="size-4 shrink-0 text-red-400" />
+              <div>
+                <p className="text-xs font-medium text-red-300">
+                  This action cannot be undone.
+                </p>
+                <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
+                  Active uploads or training jobs will block the reset. Original source
+                  datasets, project folders, and Ollama models are not deleted.
+                </p>
+              </div>
+            </div>
+            <label className="block text-[11px] font-medium">
+              Type{" "}
+              <span className="font-mono text-red-300">
+                {databaseResetPhrases[resetTarget]}
+              </span>{" "}
+              to continue
+              <input
+                autoComplete="off"
+                autoFocus
+                className={`${inputClassName} mt-2 font-mono`}
+                disabled={resetting}
+                onChange={(event) => setResetConfirmation(event.target.value)}
+                placeholder={databaseResetPhrases[resetTarget]}
+                value={resetConfirmation}
+              />
+            </label>
+            <div className="flex justify-end gap-2">
+              <Button disabled={resetting} onClick={closeReset} variant="outline">
+                Cancel
+              </Button>
+              <Button
+                className="bg-red-600 text-white hover:bg-red-500"
+                disabled={
+                  resetting || resetConfirmation !== databaseResetPhrases[resetTarget]
+                }
+                onClick={() => void performReset()}
+              >
+                {resetting ? (
+                  <LoaderCircle className="size-3.5 animate-spin" />
+                ) : (
+                  <Trash2 className="size-3.5" />
+                )}
+                {resetting ? "Resetting…" : "Permanently reset"}
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }

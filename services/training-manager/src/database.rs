@@ -63,6 +63,14 @@ pub struct Database {
     connection: Mutex<Connection>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatabaseResetCounts {
+    pub datasets: usize,
+    pub jobs: usize,
+    pub logs: usize,
+    pub uploads: usize,
+}
+
 impl Database {
     pub fn open(path: &Path) -> ApiResult<Self> {
         let connection = Connection::open(path)?;
@@ -266,6 +274,52 @@ impl Database {
             ));
         }
         Ok(upload)
+    }
+
+    pub fn reset(&self) -> ApiResult<DatabaseResetCounts> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|error| ApiError::internal(format!("Database lock was poisoned: {error}")))?;
+        let active_jobs = connection.query_row(
+            "SELECT COUNT(*) FROM jobs
+             WHERE status IN ('queued', 'running', 'cancelling')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let active_uploads = connection.query_row(
+            "SELECT COUNT(*) FROM uploads
+             WHERE status IN ('pending', 'uploading', 'validating')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if active_jobs > 0 || active_uploads > 0 {
+            return Err(ApiError::conflict(format!(
+                "Cannot reset while {active_jobs} training job(s) and {active_uploads} upload(s) are active. Cancel them and wait for completion first."
+            )));
+        }
+        let counts = DatabaseResetCounts {
+            datasets: connection.query_row("SELECT COUNT(*) FROM datasets", [], |row| {
+                row.get::<_, i64>(0)
+            })? as usize,
+            jobs: connection
+                .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get::<_, i64>(0))?
+                as usize,
+            logs: connection.query_row("SELECT COUNT(*) FROM job_logs", [], |row| {
+                row.get::<_, i64>(0)
+            })? as usize,
+            uploads: connection.query_row("SELECT COUNT(*) FROM uploads", [], |row| {
+                row.get::<_, i64>(0)
+            })? as usize,
+        };
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM job_logs", [])?;
+        transaction.execute("DELETE FROM jobs", [])?;
+        transaction.execute("DELETE FROM datasets", [])?;
+        transaction.execute("DELETE FROM uploads", [])?;
+        transaction.execute("DELETE FROM sqlite_sequence WHERE name IN ('job_logs')", [])?;
+        transaction.commit()?;
+        Ok(counts)
     }
 
     pub fn upload(&self, id: &str) -> ApiResult<UploadRecord> {
@@ -1069,6 +1123,109 @@ mod tests {
             .job_snapshot(&job.id)
             .expect("snapshot should load");
         assert_eq!(snapshot.dataset_ids, ["one", "two"]);
+        drop(database);
+        fs::remove_dir_all(root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn resets_completed_training_metadata_but_preserves_the_schema() {
+        let root = std::env::temp_dir().join(format!("tome-training-reset-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("test directory should be created");
+        let database =
+            Database::open(&root.join("training.sqlite3")).expect("training database should open");
+        {
+            let connection = database
+                .connection
+                .lock()
+                .expect("test database should lock");
+            connection
+                .execute_batch(
+                    r#"
+                    INSERT INTO uploads(
+                        id, client_upload_id, dataset_id, name, format, expected_size,
+                        expected_sha256, uploaded_bytes, chunk_size, status, partial_path,
+                        created_at, updated_at
+                    ) VALUES (
+                        'upload', 'client-upload', 'dataset', 'Dataset', 'jsonl', 10,
+                        'sha', 10, 4, 'completed', 'dataset.part',
+                        datetime('now'), datetime('now')
+                    );
+                    INSERT INTO datasets(
+                        id, source_upload_id, name, format, size, sha256, artifact_path,
+                        content_path, file_count, validation_status, created_at, updated_at
+                    ) VALUES (
+                        'dataset', 'upload', 'Dataset', 'jsonl', 10, 'sha', 'dataset.zip',
+                        'dataset', 1, 'valid', datetime('now'), datetime('now')
+                    );
+                    INSERT INTO jobs(
+                        id, client_job_id, dataset_id, dataset_ids_json, model, base_model,
+                        backend, parameters_json, status, stage, total_epochs, created_at,
+                        updated_at
+                    ) VALUES (
+                        'job', 'client-job', 'dataset', '["dataset"]', 'tome:test',
+                        'llama3.2:3b', 'lora', '{}', 'completed', 'Completed', 1,
+                        datetime('now'), datetime('now')
+                    );
+                    INSERT INTO job_logs(job_id, cursor, level, message, created_at)
+                    VALUES ('job', '1', 'info', 'Completed', datetime('now'));
+                    "#,
+                )
+                .expect("reset fixtures should be inserted");
+        }
+
+        let counts = database.reset().expect("database reset should succeed");
+
+        assert_eq!(counts.uploads, 1);
+        assert_eq!(counts.datasets, 1);
+        assert_eq!(counts.jobs, 1);
+        assert_eq!(counts.logs, 1);
+        let connection = database
+            .connection
+            .lock()
+            .expect("test database should lock");
+        for table in ["uploads", "datasets", "jobs", "job_logs"] {
+            let count = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("table should remain queryable");
+            assert_eq!(count, 0, "{table} should be empty");
+        }
+        let migrations = connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("schema migrations should remain");
+        assert!(migrations > 0);
+        drop(connection);
+        drop(database);
+        fs::remove_dir_all(root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn refuses_to_reset_while_an_upload_is_active() {
+        let root = std::env::temp_dir().join(format!("tome-training-reset-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("test directory should be created");
+        let database =
+            Database::open(&root.join("training.sqlite3")).expect("training database should open");
+        let request = UploadRequest {
+            client_upload_id: "client-upload".into(),
+            dataset_id: "dataset".into(),
+            name: "Dataset".into(),
+            format: "jsonl".into(),
+            size: 10,
+            sha256: "sha".into(),
+        };
+        database
+            .create_or_resume_upload(&request, &root.join("dataset.part"), 4 * 1024 * 1024)
+            .expect("active upload should be created");
+
+        let error = database
+            .reset()
+            .expect_err("active upload must block reset");
+
+        assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+        assert!(error.message.contains("1 upload(s)"));
         drop(database);
         fs::remove_dir_all(root).expect("test directory should be removed");
     }

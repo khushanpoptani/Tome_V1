@@ -7,11 +7,12 @@ use uuid::Uuid;
 
 use crate::{
     domain::records::{
-        ConnectionHistoryRecord, ConversationInput, ConversationRecord, FileTreeNode, LogRecord,
-        MessageInput, MessageRecord, ModelTestRecord, ProjectInput, ProjectRecord, ServerInput,
-        ServerRecord, TaskInput, TaskRecord, WorkspaceInput, WorkspaceRecord,
+        ConnectionHistoryRecord, ConversationInput, ConversationRecord, DatabaseResetResult,
+        FileTreeNode, LogRecord, MessageInput, MessageRecord, ModelTestRecord, ProjectInput,
+        ProjectRecord, ServerInput, ServerRecord, TaskInput, TaskRecord, WorkspaceInput,
+        WorkspaceRecord,
     },
-    infrastructure::state::AppState,
+    infrastructure::{sqlite::reset_user_data, state::AppState},
 };
 
 fn now() -> String {
@@ -35,6 +36,45 @@ fn map_server(row: &Row<'_>) -> rusqlite::Result<ServerRecord> {
         last_tested_at: row.get(8)?,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
+    })
+}
+
+#[tauri::command]
+pub fn reset_local_database(
+    state: State<'_, AppState>,
+    confirmation: String,
+) -> Result<DatabaseResetResult, String> {
+    if !matches!(
+        confirmation.as_str(),
+        "RESET LOCAL DATABASE" | "RESET BOTH DATABASES"
+    ) {
+        return Err(
+            "Type RESET LOCAL DATABASE or RESET BOTH DATABASES exactly to confirm this reset"
+                .into(),
+        );
+    }
+    let counts = {
+        let mut database = state.database.lock().map_err(|error| error.to_string())?;
+        reset_user_data(&mut database)?
+    };
+    let mut warnings = Vec::new();
+    let managed_training_data = state.data_dir.join("training");
+    if managed_training_data.exists() {
+        if let Err(error) = fs::remove_dir_all(&managed_training_data) {
+            warnings.push(format!(
+                "The database was reset, but Tome could not fully remove {}: {error}",
+                managed_training_data.display()
+            ));
+        }
+    }
+    Ok(DatabaseResetResult {
+        machine: "local".into(),
+        deleted_records: counts.deleted_records,
+        datasets: None,
+        jobs: None,
+        logs: None,
+        uploads: None,
+        warnings,
     })
 }
 

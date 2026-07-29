@@ -135,6 +135,23 @@ pub struct TrainingServerInput {
     pub is_active: bool,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseResetResult {
+    pub machine: String,
+    pub deleted_records: usize,
+    #[serde(default)]
+    pub datasets: Option<usize>,
+    #[serde(default)]
+    pub jobs: Option<usize>,
+    #[serde(default)]
+    pub logs: Option<usize>,
+    #[serde(default)]
+    pub uploads: Option<usize>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrainingDatasetGroupRecord {

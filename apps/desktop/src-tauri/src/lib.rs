@@ -19,6 +19,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             interface::commands::health::health,
+            interface::commands::data::reset_local_database,
             interface::commands::data::get_settings,
             interface::commands::data::set_setting,
             interface::commands::data::list_servers,
@@ -62,6 +63,7 @@ pub fn run() {
             interface::commands::training::set_active_training_server,
             interface::commands::training::delete_training_server,
             interface::commands::training::test_training_server,
+            interface::commands::training::reset_training_manager_database,
             interface::commands::training::list_training_dataset_groups,
             interface::commands::training::save_training_dataset_group,
             interface::commands::training::delete_training_dataset_group,

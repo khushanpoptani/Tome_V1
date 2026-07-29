@@ -81,7 +81,8 @@ Dependencies: Phase 5 and approved agent schemas.
   uploads, retries, cancellation, speed, ETA, long-running validation heartbeats, and
   contextual right-sidebar logs. Structured validation issues identify errors versus
   warnings and allow safe row/file exclusion through managed artifacts without modifying
-  source data.
+  source data. Security settings provide typed-confirmation reset controls for the local
+  Tome database, the remote Training Manager database, or both in server-first order.
 - Implemented the Windows Training Manager runtime, job drafts, dispatch, WebSocket and
   heartbeat monitoring, retry/cancel, resource snapshots, persistent logs, and Ollama
   registry integration.

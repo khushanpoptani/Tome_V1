@@ -23,7 +23,7 @@ use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 use crate::{
     domain::records::{
-        DatasetExclusion, DatasetUploadRecord, TrainingDatasetGroupInput,
+        DatabaseResetResult, DatasetExclusion, DatasetUploadRecord, TrainingDatasetGroupInput,
         TrainingDatasetGroupRecord, TrainingDatasetInput, TrainingDatasetRecord, TrainingJobInput,
         TrainingJobRecord, TrainingLogRecord, TrainingResourceRecord, TrainingServerInput,
         TrainingServerRecord,
@@ -377,6 +377,59 @@ pub async fn test_training_server(
         .into_iter()
         .find(|value| value.id == id)
         .ok_or_else(|| "Tested training server could not be reloaded".into())
+}
+
+#[tauri::command]
+pub async fn reset_training_manager_database(
+    state: State<'_, AppState>,
+    training_server_id: String,
+    confirmation: String,
+) -> Result<DatabaseResetResult, String> {
+    if !matches!(
+        confirmation.as_str(),
+        "RESET SERVER DATABASE" | "RESET BOTH DATABASES"
+    ) {
+        return Err(
+            "Type RESET SERVER DATABASE or RESET BOTH DATABASES exactly to confirm this reset"
+                .into(),
+        );
+    }
+    let server = list_training_servers(state.clone())?
+        .into_iter()
+        .find(|server| server.id == training_server_id)
+        .ok_or_else(|| "The selected training server no longer exists".to_string())?;
+    let response = state
+        .http
+        .post(api_url(&server.url, "/v1/admin/database/reset"))
+        .timeout(Duration::from_secs(600))
+        .json(&json!({ "confirmation": confirmation }))
+        .send()
+        .await
+        .map_err(|error| {
+            format!(
+                "Could not reset the Training Manager at {}: {}",
+                server.url,
+                request_error_details(&error)
+            )
+        })?;
+    if !response.status().is_success() {
+        return Err(response_failure(response, "Resetting the Training Manager database").await);
+    }
+    let result = response
+        .json::<DatabaseResetResult>()
+        .await
+        .map_err(|error| format!("Training Manager returned an invalid reset response: {error}"))?;
+    add_log(
+        &state,
+        "training-server",
+        "warning",
+        "Training Manager database reset",
+        Some(&format!(
+            "{} record(s) removed from {}",
+            result.deleted_records, server.name
+        )),
+    );
+    Ok(result)
 }
 
 #[derive(Debug)]
