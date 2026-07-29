@@ -256,6 +256,7 @@ export interface TrainingDatasetRecord {
 export interface DatasetExclusion {
   readonly file: string;
   readonly row?: number | null;
+  readonly issueCode?: string | null;
 }
 
 export interface DatasetValidationIssue {

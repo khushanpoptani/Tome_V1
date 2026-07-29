@@ -333,7 +333,11 @@ function parseDatasetExclusions(
       if (typeof candidate.file !== "string") return [];
       const row =
         typeof candidate.row === "number" && candidate.row > 0 ? candidate.row : null;
-      return [{ file: candidate.file, row }];
+      const issueCode =
+        typeof candidate.issueCode === "string" && candidate.issueCode.length > 0
+          ? candidate.issueCode
+          : null;
+      return [{ file: candidate.file, issueCode, row }];
     });
   } catch {
     return [];
@@ -638,6 +642,7 @@ export function TrainingPage(): React.JSX.Element {
     const existing = parseDatasetExclusions(dataset);
     const nextExclusion: DatasetExclusion = {
       file: issue.file,
+      issueCode: null,
       row: mode === "row" ? issue.row : null,
     };
     const retained =
@@ -647,7 +652,8 @@ export function TrainingPage(): React.JSX.Element {
       ...(retained.some(
         (value) =>
           value.file === nextExclusion.file &&
-          (value.row ?? null) === (nextExclusion.row ?? null),
+          (value.row ?? null) === (nextExclusion.row ?? null) &&
+          (value.issueCode ?? null) === (nextExclusion.issueCode ?? null),
       )
         ? []
         : [nextExclusion]),
@@ -660,6 +666,72 @@ export function TrainingPage(): React.JSX.Element {
     void prepareDataset({
       compress: true,
       exclusions,
+      groupId: dataset.groupId,
+      id: dataset.id,
+      name: dataset.name,
+      sourcePath: dataset.sourcePath,
+      supportedFormats: ["jsonl", "json", "csv", "parquet", "txt", "md"],
+    }).catch(() => undefined);
+  };
+
+  const applyBulkDatasetIssueExclusions = (
+    dataset: TrainingDatasetRecord,
+    issues: readonly DatasetValidationIssue[],
+    severity: DatasetValidationIssue["severity"],
+  ): void => {
+    const issueCodes = [
+      ...new Set(
+        issues
+          .filter(
+            (issue) =>
+              issue.severity === severity && issue.canExcludeRow && issue.row !== null,
+          )
+          .map((issue) => issue.code),
+      ),
+    ];
+    if (issueCodes.length === 0) {
+      toast.error(`There are no removable ${severity} rows in this dataset.`);
+      return;
+    }
+    const existing = parseDatasetExclusions(dataset);
+    const additions = issueCodes
+      .filter(
+        (code) =>
+          !existing.some(
+            (value) =>
+              value.file === "*" && value.issueCode === code && value.row == null,
+          ),
+      )
+      .map((issueCode): DatasetExclusion => ({
+        file: "*",
+        issueCode,
+        row: null,
+      }));
+    if (additions.length === 0) {
+      toast.info(`All matching ${severity} rows are already excluded.`);
+      return;
+    }
+    toast.info(
+      `Excluding every row matching ${issueCodes.join(", ")}. Hidden issues beyond the display limit are included; source files will not be changed.`,
+    );
+    void prepareDataset({
+      compress: true,
+      exclusions: [...existing, ...additions],
+      groupId: dataset.groupId,
+      id: dataset.id,
+      name: dataset.name,
+      sourcePath: dataset.sourcePath,
+      supportedFormats: ["jsonl", "json", "csv", "parquet", "txt", "md"],
+    }).catch(() => undefined);
+  };
+
+  const clearDatasetExclusions = (dataset: TrainingDatasetRecord): void => {
+    toast.info(
+      `Clearing managed exclusions for ${dataset.name}. Source files were never changed.`,
+    );
+    void prepareDataset({
+      compress: true,
+      exclusions: [],
       groupId: dataset.groupId,
       id: dataset.id,
       name: dataset.name,
@@ -1990,6 +2062,18 @@ export function TrainingPage(): React.JSX.Element {
                       (issue) => issue.severity === "warning",
                     );
                     const appliedExclusions = parseDatasetExclusions(dataset);
+                    const removableErrorRows = validationIssues.filter(
+                      (issue) =>
+                        issue.severity === "error" &&
+                        issue.canExcludeRow &&
+                        issue.row !== null,
+                    );
+                    const removableWarningRows = validationIssues.filter(
+                      (issue) =>
+                        issue.severity === "warning" &&
+                        issue.canExcludeRow &&
+                        issue.row !== null,
+                    );
                     const latest = uploads.data?.find(
                       (upload) => upload.datasetId === dataset.id,
                     );
@@ -2340,7 +2424,8 @@ export function TrainingPage(): React.JSX.Element {
                                 ) : null}
                                 {validationWarnings.length > 0 ? (
                                   <Badge className="border-amber-500/25 bg-amber-500/10 text-amber-300">
-                                    {validationWarnings.length} warning
+                                    {validationWarnings.length}
+                                    {validationWarnings.length === 200 ? "+" : ""} warning
                                     {validationWarnings.length === 1 ? "" : "s"}
                                   </Badge>
                                 ) : null}
@@ -2353,6 +2438,78 @@ export function TrainingPage(): React.JSX.Element {
                                 )}
                                 {validationIssues.length === 0 ? null : (
                                   <div className="space-y-2 border-t border-border p-3">
+                                    {removableErrorRows.length === 0 &&
+                                    removableWarningRows.length === 0 &&
+                                    appliedExclusions.length === 0 ? null : (
+                                      <div className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-muted/20 p-2">
+                                        <div className="mr-auto min-w-48">
+                                          <p className="font-medium text-foreground">
+                                            Bulk cleanup
+                                          </p>
+                                          <p className="text-[9px] text-muted-foreground">
+                                            Applies to every matching record, including
+                                            issues hidden by the display limit. Original
+                                            files remain unchanged.
+                                          </p>
+                                        </div>
+                                        {removableErrorRows.length > 0 ? (
+                                          <Button
+                                            disabled={
+                                              operation?.kind === "prepare" &&
+                                              operation.error === null
+                                            }
+                                            onClick={() =>
+                                              applyBulkDatasetIssueExclusions(
+                                                dataset,
+                                                validationIssues,
+                                                "error",
+                                              )
+                                            }
+                                            size="sm"
+                                            variant="outline"
+                                          >
+                                            <Ban className="size-3" />
+                                            Exclude all error rows
+                                          </Button>
+                                        ) : null}
+                                        {removableWarningRows.length > 0 ? (
+                                          <Button
+                                            disabled={
+                                              operation?.kind === "prepare" &&
+                                              operation.error === null
+                                            }
+                                            onClick={() =>
+                                              applyBulkDatasetIssueExclusions(
+                                                dataset,
+                                                validationIssues,
+                                                "warning",
+                                              )
+                                            }
+                                            size="sm"
+                                            variant="outline"
+                                          >
+                                            <Ban className="size-3" />
+                                            Exclude all warning rows
+                                          </Button>
+                                        ) : null}
+                                        {appliedExclusions.length > 0 ? (
+                                          <Button
+                                            disabled={
+                                              operation?.kind === "prepare" &&
+                                              operation.error === null
+                                            }
+                                            onClick={() =>
+                                              clearDatasetExclusions(dataset)
+                                            }
+                                            size="sm"
+                                            variant="ghost"
+                                          >
+                                            <RotateCcw className="size-3" />
+                                            Clear exclusions
+                                          </Button>
+                                        ) : null}
+                                      </div>
+                                    )}
                                     {validationIssues.slice(0, 50).map((issue) => (
                                       <div
                                         className={cn(
@@ -2443,9 +2600,9 @@ export function TrainingPage(): React.JSX.Element {
                                     {validationIssues.length <= 50 ? null : (
                                       <p className="mt-2 text-muted-foreground">
                                         {validationIssues.length - 50} additional issues
-                                        hidden to keep this view responsive. Exclude the
-                                        affected file to resolve all of its issues at
-                                        once.
+                                        shown by validation but hidden to keep this view
+                                        responsive. Bulk cleanup also applies to matching
+                                        issues beyond Tome&apos;s stored display limit.
                                       </p>
                                     )}
                                   </div>

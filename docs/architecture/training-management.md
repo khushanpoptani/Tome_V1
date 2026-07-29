@@ -1,6 +1,6 @@
 # Tome Training Management Architecture
 
-Status: Windows Training Manager implementation baseline Last reviewed: 2026-07-28
+Status: Windows Training Manager implementation baseline Last reviewed: 2026-07-29
 
 ## Decision
 
@@ -270,13 +270,19 @@ Validation is deterministic:
 - SHA-256 is computed for the upload artifact.
 
 Validation results are structured issues with severity, code, relative file, row when
-available, and supported recovery actions. Syntax failures and unusable records are
-errors; records that require custom field mapping are warnings and do not block upload.
-Results are bounded to keep multi-gigabyte datasets responsive.
+available, and supported recovery actions. Syntax failures are errors. Records that need
+custom field mapping retain warning presentation so the reason remains understandable, but
+they block upload because the current training worker cannot normalize them safely.
+Results shown in the interface are bounded to keep multi-gigabyte datasets responsive.
 
-Users can exclude an offending NDJSON row or a complete file and rerun validation from the
-issue card. Tome persists the exclusion manifest and creates a cleaned application-managed
-ZIP artifact. The original source is never edited or deleted.
+Users can exclude an offending row or a complete file and rerun validation from the issue
+card. Bulk cleanup persists an issue-code rule rather than thousands of row numbers, so
+one action covers matching records beyond the display limit. For JSONL and NDJSON this
+removes physical lines; for JSON arrays it removes logical array records and serializes a
+valid cleaned array. If cleanup leaves no recognized structured training records, Tome
+rejects the dataset instead of producing an empty training run. Tome persists the
+exclusion manifest and creates a cleaned application-managed ZIP artifact. Exclusions are
+reversible, and the original source is never edited or deleted.
 
 ## Persistence
 

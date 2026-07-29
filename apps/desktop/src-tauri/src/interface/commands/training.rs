@@ -468,6 +468,13 @@ struct InspectionProgress {
     current_file: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct DatasetRecordStats {
+    source_records: usize,
+    usable_records: usize,
+    excluded_records: usize,
+}
+
 fn collect_dataset_files(
     root: &Path,
     path: &Path,
@@ -553,26 +560,9 @@ fn push_validation_issue(issues: &mut Vec<DatasetValidationIssue>, value: Datase
     }
 }
 
-fn validate_training_record(
-    value: &Value,
-    relative: &str,
-    row: usize,
-    can_exclude_row: bool,
-    issues: &mut Vec<DatasetValidationIssue>,
-) {
+fn training_record_issue_code(value: &Value) -> Option<&'static str> {
     let Some(record) = value.as_object() else {
-        push_validation_issue(
-            issues,
-            issue(
-                "error",
-                "record_not_object",
-                format!("{relative} row {row}: training record must be a JSON object"),
-                Some(relative),
-                Some(row),
-                can_exclude_row,
-            ),
-        );
-        return;
+        return Some("record_not_object");
     };
     let non_empty_string = |key: &str| {
         record
@@ -596,8 +586,44 @@ fn validate_training_record(
             })
         });
     if has_direct_text || has_pair || has_messages {
+        None
+    } else {
+        Some("unrecognized_training_fields")
+    }
+}
+
+fn validate_training_record(
+    value: &Value,
+    relative: &str,
+    row: usize,
+    can_exclude_row: bool,
+    excluded_issue_codes: &HashSet<String>,
+    issues: &mut Vec<DatasetValidationIssue>,
+    stats: &mut DatasetRecordStats,
+) {
+    stats.source_records += 1;
+    let Some(code) = training_record_issue_code(value) else {
+        stats.usable_records += 1;
+        return;
+    };
+    if excluded_issue_codes.contains(code) {
+        stats.excluded_records += 1;
         return;
     }
+    let Some(record) = value.as_object() else {
+        push_validation_issue(
+            issues,
+            issue(
+                "error",
+                "record_not_object",
+                format!("{relative} row {row}: training record must be a JSON object"),
+                Some(relative),
+                Some(row),
+                can_exclude_row,
+            ),
+        );
+        return;
+    };
     let fields = record
         .keys()
         .take(10)
@@ -622,7 +648,9 @@ fn validate_structured_file(
     relative: &str,
     extension: &str,
     excluded_rows: &HashSet<usize>,
+    excluded_issue_codes: &HashSet<String>,
     issues: &mut Vec<DatasetValidationIssue>,
+    stats: &mut DatasetRecordStats,
 ) -> String {
     if !matches!(extension, "json" | "jsonl") {
         return extension.to_string();
@@ -644,13 +672,43 @@ fn validate_structured_file(
             return extension.to_string();
         }
     };
-    if extension == "jsonl" || (extension == "json" && !excluded_rows.is_empty()) {
+    let line_oriented_json = if extension == "jsonl" {
+        true
+    } else {
+        let mut non_empty_lines = BufReader::new(&file)
+            .lines()
+            .map_while(Result::ok)
+            .filter(|line| !line.trim().is_empty());
+        let first = non_empty_lines.next();
+        let second_exists = non_empty_lines.next().is_some();
+        first.is_some_and(|line| {
+            !line.trim_start().starts_with('[')
+                && serde_json::from_str::<Value>(&line).is_ok()
+                && second_exists
+        })
+    };
+    drop(file);
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            push_validation_issue(
+                issues,
+                issue(
+                    "error",
+                    "file_unreadable",
+                    format!("{relative}: could not be read ({error})"),
+                    Some(relative),
+                    None,
+                    false,
+                ),
+            );
+            return extension.to_string();
+        }
+    };
+    if line_oriented_json {
         let mut record_count = 0_usize;
         for (index, line) in BufReader::new(file).lines().enumerate() {
             let line_number = index + 1;
-            if excluded_rows.contains(&line_number) {
-                continue;
-            }
             let line = match line {
                 Ok(line) => line,
                 Err(error) => {
@@ -671,22 +729,44 @@ fn validate_structured_file(
             if line.trim().is_empty() {
                 continue;
             }
+            if excluded_rows.contains(&line_number) {
+                stats.source_records += 1;
+                stats.excluded_records += 1;
+                continue;
+            }
             match serde_json::from_str::<Value>(&line) {
                 Ok(value) => {
                     record_count += 1;
-                    validate_training_record(&value, relative, line_number, true, issues);
-                }
-                Err(error) => push_validation_issue(
-                    issues,
-                    issue(
-                        "error",
-                        "invalid_json",
-                        format!("{relative} line {line_number}: invalid JSON record ({error})"),
-                        Some(relative),
-                        Some(line_number),
+                    validate_training_record(
+                        &value,
+                        relative,
+                        line_number,
                         true,
-                    ),
-                ),
+                        excluded_issue_codes,
+                        issues,
+                        stats,
+                    );
+                }
+                Err(error) => {
+                    stats.source_records += 1;
+                    if excluded_issue_codes.contains("invalid_json") {
+                        stats.excluded_records += 1;
+                    } else {
+                        push_validation_issue(
+                            issues,
+                            issue(
+                                "error",
+                                "invalid_json",
+                                format!(
+                                    "{relative} line {line_number}: invalid JSON record ({error})"
+                                ),
+                                Some(relative),
+                                Some(line_number),
+                                true,
+                            ),
+                        );
+                    }
+                }
             }
         }
         if record_count == 0
@@ -720,15 +800,38 @@ fn validate_structured_file(
                 for (index, record) in records.iter().enumerate() {
                     let row = index + 1;
                     if excluded_rows.contains(&row) {
+                        stats.source_records += 1;
+                        stats.excluded_records += 1;
                         continue;
                     }
                     record_count += 1;
-                    validate_training_record(record, relative, row, false, issues);
+                    validate_training_record(
+                        record,
+                        relative,
+                        row,
+                        true,
+                        excluded_issue_codes,
+                        issues,
+                        stats,
+                    );
                 }
             }
             Ok(value) => {
                 record_count += 1;
-                validate_training_record(&value, relative, record_count, false, issues);
+                if excluded_rows.contains(&record_count) {
+                    stats.source_records += 1;
+                    stats.excluded_records += 1;
+                    continue;
+                }
+                validate_training_record(
+                    &value,
+                    relative,
+                    record_count,
+                    true,
+                    excluded_issue_codes,
+                    issues,
+                    stats,
+                );
             }
             Err(error) => {
                 let format = if extension == "jsonl" || record_count > 0 {
@@ -736,20 +839,25 @@ fn validate_structured_file(
                 } else {
                     "JSON"
                 };
-                push_validation_issue(
-                    issues,
-                    issue(
-                        "error",
-                        "invalid_json",
-                        format!(
-                            "{relative} line {}: invalid {format} record ({error})",
-                            error.line()
+                stats.source_records += 1;
+                if excluded_issue_codes.contains("invalid_json") {
+                    stats.excluded_records += 1;
+                } else {
+                    push_validation_issue(
+                        issues,
+                        issue(
+                            "error",
+                            "invalid_json",
+                            format!(
+                                "{relative} line {}: invalid {format} record ({error})",
+                                error.line()
+                            ),
+                            Some(relative),
+                            Some(error.line()),
+                            record_count > 0,
                         ),
-                        Some(relative),
-                        Some(error.line()),
-                        record_count > 0,
-                    ),
-                );
+                    );
+                }
                 break;
             }
         }
@@ -782,9 +890,10 @@ fn write_dataset_file(
     path: &Path,
     relative: &str,
     excluded_rows: &HashSet<usize>,
+    excluded_issue_codes: &HashSet<String>,
     output: &mut impl Write,
 ) -> Result<(), String> {
-    if excluded_rows.is_empty() {
+    if excluded_rows.is_empty() && excluded_issue_codes.is_empty() {
         let mut source = File::open(path)
             .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
         std::io::copy(&mut source, output)
@@ -801,6 +910,38 @@ fn write_dataset_file(
             "Rows cannot be excluded from {relative}; exclude the complete file instead"
         ));
     }
+    if extension == "json" {
+        let source = File::open(path)
+            .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+        if let Ok(value) = serde_json::from_reader::<_, Value>(BufReader::new(source)) {
+            let cleaned = match value {
+                Value::Array(records) => Value::Array(
+                    records
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(index, record)| {
+                            let row = index + 1;
+                            let excluded_by_rule = training_record_issue_code(&record)
+                                .is_some_and(|code| excluded_issue_codes.contains(code));
+                            (!excluded_rows.contains(&row) && !excluded_by_rule).then_some(record)
+                        })
+                        .collect(),
+                ),
+                value => {
+                    let excluded_by_rule = training_record_issue_code(&value)
+                        .is_some_and(|code| excluded_issue_codes.contains(code));
+                    if excluded_rows.contains(&1) || excluded_by_rule {
+                        Value::Array(Vec::new())
+                    } else {
+                        value
+                    }
+                }
+            };
+            serde_json::to_writer(output, &cleaned)
+                .map_err(|error| format!("Could not write cleaned {relative}: {error}"))?;
+            return Ok(());
+        }
+    }
     let source =
         File::open(path).map_err(|error| format!("Could not read {}: {error}", path.display()))?;
     for (index, line) in BufReader::new(source).split(b'\n').enumerate() {
@@ -809,6 +950,18 @@ fn write_dataset_file(
             continue;
         }
         let line = line.map_err(|error| format!("Could not read {relative} row {row}: {error}"))?;
+        if !excluded_issue_codes.is_empty() && matches!(extension.as_str(), "jsonl" | "json") {
+            match serde_json::from_slice::<Value>(&line) {
+                Ok(value)
+                    if training_record_issue_code(&value)
+                        .is_some_and(|code| excluded_issue_codes.contains(code)) =>
+                {
+                    continue;
+                }
+                Err(_) if excluded_issue_codes.contains("invalid_json") => continue,
+                _ => {}
+            }
+        }
         output
             .write_all(&line)
             .and_then(|_| output.write_all(b"\n"))
@@ -874,11 +1027,12 @@ fn inspect_dataset(
     collect_dataset_files(root, source_path, formats, &mut files);
     let excluded_files = exclusions
         .iter()
-        .filter(|value| value.row.is_none())
+        .filter(|value| value.row.is_none() && value.issue_code.is_none())
         .map(|value| value.file.replace('\\', "/"))
         .collect::<HashSet<_>>();
     let excluded_rows = exclusions
         .iter()
+        .filter(|value| value.issue_code.is_none())
         .filter_map(|value| value.row.map(|row| (value.file.replace('\\', "/"), row)))
         .fold(
             HashMap::<String, HashSet<usize>>::new(),
@@ -887,6 +1041,11 @@ fn inspect_dataset(
                 rows
             },
         );
+    let excluded_issue_codes = exclusions
+        .iter()
+        .filter_map(|value| value.issue_code.as_deref())
+        .map(ToOwned::to_owned)
+        .collect::<HashSet<_>>();
     files.retain(|(_, relative)| !excluded_files.contains(&relative.replace('\\', "/")));
     on_progress(InspectionProgress {
         stage: "Counting Files",
@@ -924,6 +1083,7 @@ fn inspect_dataset(
     let mut extensions = Vec::new();
     let mut preview = None;
     let mut file_sizes = Vec::with_capacity(files.len());
+    let mut record_stats = DatasetRecordStats::default();
     for (index, (path, relative)) in files.iter().enumerate() {
         let metadata = fs::metadata(path)
             .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
@@ -969,7 +1129,9 @@ fn inspect_dataset(
             relative,
             &extension,
             &rows,
+            &excluded_issue_codes,
             &mut issues,
+            &mut record_stats,
         ));
         if preview.is_none()
             && matches!(extension.as_str(), "jsonl" | "json" | "csv" | "txt" | "md")
@@ -997,6 +1159,22 @@ fn inspect_dataset(
     }
     extensions.sort();
     extensions.dedup();
+    if record_stats.source_records > 0 && record_stats.usable_records == 0 {
+        push_validation_issue(
+            &mut issues,
+            issue(
+                "error",
+                "no_training_records",
+                format!(
+                    "No usable structured training records remain. {} source record(s) were inspected and {} were excluded. Transform the dataset into text, prompt/response, instruction/output, or messages records before training.",
+                    record_stats.source_records, record_stats.excluded_records
+                ),
+                None,
+                None,
+                false,
+            ),
+        );
+    }
     let format = if extensions.len() == 1 {
         extensions[0].clone()
     } else {
@@ -1024,7 +1202,7 @@ fn inspect_dataset(
                 .get(&relative.replace('\\', "/"))
                 .cloned()
                 .unwrap_or_default();
-            write_dataset_file(path, relative, &rows, &mut archive)?;
+            write_dataset_file(path, relative, &rows, &excluded_issue_codes, &mut archive)?;
             compressed_source_bytes = compressed_source_bytes.saturating_add(*file_size);
             let reporting_interval = (files.len() / 100).max(1);
             if index == 0 || index + 1 == files.len() || index % reporting_interval == 0 {
@@ -1085,7 +1263,10 @@ fn inspect_dataset(
         format,
         preview,
         size,
-        status: if issues.iter().all(|value| value.severity != "error") {
+        status: if issues
+            .iter()
+            .all(|value| value.severity != "error" && value.code != "unrecognized_training_fields")
+        {
             "valid".into()
         } else {
             "invalid".into()
@@ -3351,7 +3532,7 @@ mod tests {
         fs::create_dir_all(&root).expect("test directory should be created");
         fs::write(
             &dataset,
-            "{\"id\":\"1\",\"body\":\"first\u{2028}second\"}\n{\"id\":\"2\",\"type\":\"IssuesEvent\"}\n",
+            "{\"prompt\":\"Plan one\",\"response\":\"Step one\u{2028}Step two\"}\n{\"instruction\":\"Plan two\",\"output\":\"Review dependencies\"}\n",
         )
         .expect("test dataset should be written");
 
@@ -3436,6 +3617,7 @@ mod tests {
             &[DatasetExclusion {
                 file: "records.jsonl".into(),
                 row: Some(2),
+                issue_code: None,
             }],
             &root,
             |_| {},
@@ -3459,6 +3641,145 @@ mod tests {
         assert!(!content.contains("not-json"));
         assert!(content.contains("Plan A"));
         assert!(content.contains("Plan B"));
+        fs::remove_dir_all(&root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn excludes_all_rows_matching_a_validation_code() {
+        let root = std::env::temp_dir().join(format!("tome-dataset-test-{}", Uuid::new_v4()));
+        let dataset = root.join("mixed-records.jsonl");
+        fs::create_dir_all(&root).expect("test directory should be created");
+        fs::write(
+            &dataset,
+            "{\"instruction\":\"Plan release\",\"output\":\"Review dependencies\"}\n{\"id\":\"event-1\",\"type\":\"IssuesEvent\"}\n{\"id\":\"event-2\",\"type\":\"PullRequestEvent\"}\n",
+        )
+        .expect("test dataset should be written");
+
+        let repaired = inspect_dataset(
+            "bulk-repair",
+            &dataset,
+            &["jsonl".into()],
+            true,
+            &[DatasetExclusion {
+                file: "*".into(),
+                row: None,
+                issue_code: Some("unrecognized_training_fields".into()),
+            }],
+            &root,
+            |_| {},
+        )
+        .expect("dataset should be inspected");
+
+        assert_eq!(repaired.status, "valid");
+        assert!(repaired
+            .issues
+            .iter()
+            .all(|issue| issue.code != "unrecognized_training_fields"));
+        let artifact = fs::File::open(
+            repaired
+                .artifact_path
+                .as_deref()
+                .expect("repaired artifact should exist"),
+        )
+        .expect("artifact should open");
+        let mut archive = ZipArchive::new(artifact).expect("artifact should be a ZIP");
+        let mut content = String::new();
+        archive
+            .by_name("mixed-records.jsonl")
+            .expect("cleaned dataset file should exist")
+            .read_to_string(&mut content)
+            .expect("cleaned file should be readable");
+        assert!(content.contains("Plan release"));
+        assert!(!content.contains("event-1"));
+        assert!(!content.contains("event-2"));
+        fs::remove_dir_all(&root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn rejects_a_dataset_when_bulk_cleanup_removes_every_record() {
+        let root = std::env::temp_dir().join(format!("tome-dataset-test-{}", Uuid::new_v4()));
+        let dataset = root.join("events.jsonl");
+        fs::create_dir_all(&root).expect("test directory should be created");
+        fs::write(
+            &dataset,
+            "{\"id\":\"event-1\",\"type\":\"IssuesEvent\"}\n{\"id\":\"event-2\",\"type\":\"PushEvent\"}\n",
+        )
+        .expect("test dataset should be written");
+
+        let result = inspect_dataset(
+            "empty-after-cleanup",
+            &dataset,
+            &["jsonl".into()],
+            true,
+            &[DatasetExclusion {
+                file: "*".into(),
+                row: None,
+                issue_code: Some("unrecognized_training_fields".into()),
+            }],
+            &root,
+            |_| {},
+        )
+        .expect("dataset should be inspected");
+
+        assert_eq!(result.status, "invalid");
+        assert!(result
+            .issues
+            .iter()
+            .any(|issue| issue.code == "no_training_records"));
+        fs::remove_dir_all(&root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn excludes_a_logical_row_from_a_json_array_without_corrupting_json() {
+        let root = std::env::temp_dir().join(format!("tome-dataset-test-{}", Uuid::new_v4()));
+        let dataset = root.join("instructions.json");
+        fs::create_dir_all(&root).expect("test directory should be created");
+        fs::write(
+            &dataset,
+            r#"[
+              {"instruction":"Plan A","output":"Steps A"},
+              {"instruction":"Missing answer","output":""},
+              {"instruction":"Plan B","output":"Steps B"}
+            ]"#,
+        )
+        .expect("test dataset should be written");
+
+        let repaired = inspect_dataset(
+            "json-array-repair",
+            &dataset,
+            &["json".into()],
+            true,
+            &[DatasetExclusion {
+                file: "instructions.json".into(),
+                row: Some(2),
+                issue_code: None,
+            }],
+            &root,
+            |_| {},
+        )
+        .expect("dataset should be inspected");
+
+        assert_eq!(repaired.status, "valid");
+        let artifact = fs::File::open(
+            repaired
+                .artifact_path
+                .as_deref()
+                .expect("repaired artifact should exist"),
+        )
+        .expect("artifact should open");
+        let mut archive = ZipArchive::new(artifact).expect("artifact should be a ZIP");
+        let mut content = String::new();
+        archive
+            .by_name("instructions.json")
+            .expect("cleaned dataset file should exist")
+            .read_to_string(&mut content)
+            .expect("cleaned file should be readable");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("cleaned file should remain valid JSON");
+        assert_eq!(parsed.as_array().map(Vec::len), Some(2));
+        assert!(content.contains("Plan A"));
+        assert!(content.contains("Plan B"));
+        assert!(!content.contains("Missing answer"));
         fs::remove_dir_all(&root).expect("test directory should be removed");
     }
 }

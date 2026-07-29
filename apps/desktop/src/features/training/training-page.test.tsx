@@ -171,7 +171,7 @@ describe("Training dataset groups", () => {
         },
         {
           canExcludeFile: true,
-          canExcludeRow: false,
+          canExcludeRow: true,
           code: "unrecognized_training_fields",
           file: "metadata.json",
           id: "warning:unrecognized_training_fields:metadata.json:1",
@@ -188,8 +188,14 @@ describe("Training dataset groups", () => {
 
     expect(screen.getByText("1 error")).toBeInTheDocument();
     expect(screen.getByText("1 warning")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Exclude row" })).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "Exclude row" })).toHaveLength(2);
     expect(screen.getAllByRole("button", { name: "Exclude file" })).toHaveLength(2);
+    expect(
+      screen.getByRole("button", { name: "Exclude all error rows" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Exclude all warning rows" }),
+    ).toBeInTheDocument();
     expect(screen.getByText("records.jsonl · row 2")).toBeInTheDocument();
   });
 

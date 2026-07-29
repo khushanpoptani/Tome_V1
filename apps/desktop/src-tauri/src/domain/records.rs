@@ -196,6 +196,8 @@ pub struct TrainingDatasetRecord {
 pub struct DatasetExclusion {
     pub file: String,
     pub row: Option<usize>,
+    #[serde(default)]
+    pub issue_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
