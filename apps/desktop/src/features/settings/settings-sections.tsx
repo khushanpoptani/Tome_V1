@@ -923,8 +923,22 @@ function trainingServerSupportsDatabaseReset(capabilitiesJson: string): boolean 
   }
 }
 
+function trainingManagerUrlForOllama(ollamaUrl: string): string | null {
+  try {
+    const url = new URL(ollamaUrl);
+    url.port = "11435";
+    url.pathname = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return null;
+  }
+}
+
 export function SecuritySettings(): React.JSX.Element {
   const permissionMode = useShellStore((state) => state.permissionMode);
+  const activeOllamaServer = useShellStore((state) => state.activeServer);
   const setPermissionMode = useShellStore((state) => state.setPermissionMode);
   const setActiveConversation = useShellStore((state) => state.setActiveConversation);
   const setActiveProject = useShellStore((state) => state.setActiveProject);
@@ -941,13 +955,81 @@ export function SecuritySettings(): React.JSX.Element {
   const [resetTarget, setResetTarget] = useState<DatabaseResetTarget | null>(null);
   const [resetConfirmation, setResetConfirmation] = useState("");
   const [resetting, setResetting] = useState(false);
+  const [connectingTrainingServer, setConnectingTrainingServer] = useState(false);
   const activeTrainingServer =
     trainingServers.data?.find((server) => server.isActive) ??
     trainingServers.data?.[0] ??
     null;
+  const suggestedTrainingManagerUrl =
+    activeOllamaServer === null
+      ? null
+      : trainingManagerUrlForOllama(activeOllamaServer.url);
   const remoteResetAvailable =
     activeTrainingServer !== null &&
     trainingServerSupportsDatabaseReset(activeTrainingServer.capabilitiesJson);
+
+  const connectTrainingManager = async (): Promise<void> => {
+    if (activeOllamaServer === null || suggestedTrainingManagerUrl === null) {
+      toast.error(
+        "Configure the Windows Ollama server before reconnecting its Training Manager.",
+      );
+      return;
+    }
+    setConnectingTrainingServer(true);
+    let savedServerId: string | null = null;
+    try {
+      const saved = await backend.saveTrainingServer({
+        adapter: "tome-training-v1",
+        isActive: true,
+        name: `${activeOllamaServer.name} Training Manager`,
+        url: suggestedTrainingManagerUrl,
+      });
+      savedServerId = saved.id;
+      const tested = await backend.testTrainingServer(saved.id);
+      if (tested.status !== "connected") {
+        throw new Error(
+          tested.lastError ??
+            `The Training Manager at ${suggestedTrainingManagerUrl} did not pass its connection test.`,
+        );
+      }
+      await backend.setActiveTrainingServer(saved.id);
+      await queryClient.invalidateQueries({ queryKey: ["training-servers"] });
+      toast.success(
+        `Training Manager ${tested.version ?? ""} connected. Server database reset is now available.`,
+      );
+    } catch (error) {
+      if (savedServerId !== null) {
+        await backend.deleteTrainingServer(savedServerId).catch(() => undefined);
+        await queryClient.invalidateQueries({ queryKey: ["training-servers"] });
+      }
+      toast.error(errorMessage(error));
+    } finally {
+      setConnectingTrainingServer(false);
+    }
+  };
+
+  const testTrainingManager = async (): Promise<void> => {
+    if (activeTrainingServer === null) return;
+    setConnectingTrainingServer(true);
+    try {
+      const tested = await backend.testTrainingServer(activeTrainingServer.id);
+      if (tested.status !== "connected") {
+        throw new Error(
+          tested.lastError ??
+            `The Training Manager at ${activeTrainingServer.url} did not pass its connection test.`,
+        );
+      }
+      await backend.setActiveTrainingServer(tested.id);
+      await queryClient.invalidateQueries({ queryKey: ["training-servers"] });
+      toast.success(
+        `Training Manager ${tested.version ?? ""} connected. Server database reset is now available.`,
+      );
+    } catch (error) {
+      toast.error(errorMessage(error));
+    } finally {
+      setConnectingTrainingServer(false);
+    }
+  };
 
   const closeReset = (): void => {
     if (resetting) return;
@@ -1088,22 +1170,52 @@ export function SecuritySettings(): React.JSX.Element {
         />
         <SettingRow
           control={
-            <Button
-              disabled={!remoteResetAvailable}
-              onClick={() => {
-                setResetConfirmation("");
-                setResetTarget("server");
-              }}
-              size="sm"
-              variant="outline"
-            >
-              <Server className="size-3.5" />
-              Reset server
-            </Button>
+            activeTrainingServer === null ? (
+              <Button
+                disabled={
+                  suggestedTrainingManagerUrl === null || connectingTrainingServer
+                }
+                onClick={() => void connectTrainingManager()}
+                size="sm"
+                variant="outline"
+              >
+                <RefreshCw
+                  className={`size-3.5 ${connectingTrainingServer ? "animate-spin" : ""}`}
+                />
+                {connectingTrainingServer ? "Connecting..." : "Connect server"}
+              </Button>
+            ) : !remoteResetAvailable ? (
+              <Button
+                disabled={connectingTrainingServer}
+                onClick={() => void testTrainingManager()}
+                size="sm"
+                variant="outline"
+              >
+                <RefreshCw
+                  className={`size-3.5 ${connectingTrainingServer ? "animate-spin" : ""}`}
+                />
+                {connectingTrainingServer ? "Testing..." : "Test server"}
+              </Button>
+            ) : (
+              <Button
+                disabled={!remoteResetAvailable}
+                onClick={() => {
+                  setResetConfirmation("");
+                  setResetTarget("server");
+                }}
+                size="sm"
+                variant="outline"
+              >
+                <Server className="size-3.5" />
+                Reset server
+              </Button>
+            )
           }
           description={
             activeTrainingServer === null
-              ? "Configure a Training Manager to enable remote reset."
+              ? suggestedTrainingManagerUrl === null
+                ? "Configure the Windows Ollama server to reconnect its Training Manager."
+                : `Reconnect the installed Training Manager at ${suggestedTrainingManagerUrl}.`
               : !remoteResetAvailable
                 ? "Upgrade this server to Training Manager 0.1.12 or later, then run Test to enable remote reset."
                 : `Clears datasets, uploads, jobs, job logs, and managed training outputs on ${activeTrainingServer.name}. Ollama models are preserved.`
