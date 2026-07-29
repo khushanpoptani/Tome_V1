@@ -45,7 +45,7 @@ pub async fn register_adapter(
             adapter_path.display()
         )));
     }
-    let adapter = adapter_path.to_string_lossy().replace('\\', "/");
+    let adapter = adapter_reference(adapter_path, job_dir);
     let modelfile = job_dir.join("Modelfile");
     fs::write(
         &modelfile,
@@ -55,8 +55,6 @@ pub async fn register_adapter(
     let output = Command::new(&config.ollama_executable)
         .arg("create")
         .arg(&job.model)
-        .arg("-f")
-        .arg(&modelfile)
         .current_dir(job_dir)
         .output()
         .await
@@ -73,6 +71,13 @@ pub async fn register_adapter(
         )));
     }
     verify_registered(config, &job.model).await
+}
+
+fn adapter_reference(adapter_path: &Path, job_dir: &Path) -> String {
+    adapter_path
+        .strip_prefix(job_dir)
+        .map(|path| format!("./{}", path.to_string_lossy().replace('\\', "/")))
+        .unwrap_or_else(|_| adapter_path.to_string_lossy().replace('\\', "/"))
 }
 
 async fn verify_registered(config: &Config, model: &str) -> ApiResult<()> {
@@ -129,7 +134,27 @@ fn validate_model_name(value: &str) -> ApiResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_adapter_compatibility, validate_model_name};
+    use std::path::Path;
+
+    use super::{adapter_reference, validate_adapter_compatibility, validate_model_name};
+
+    #[test]
+    fn uses_a_modelfile_relative_adapter_reference_when_possible() {
+        assert_eq!(
+            adapter_reference(
+                Path::new("/training/jobs/job-1/output"),
+                Path::new("/training/jobs/job-1"),
+            ),
+            "./output"
+        );
+        assert_eq!(
+            adapter_reference(
+                Path::new("/different-volume/job-1/output"),
+                Path::new("/training/jobs/job-1"),
+            ),
+            "/different-volume/job-1/output"
+        );
+    }
 
     #[test]
     fn validates_registry_model_names() {
