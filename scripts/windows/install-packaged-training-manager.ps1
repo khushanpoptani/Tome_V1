@@ -80,6 +80,33 @@ function Wait-ForServiceStop {
     }
 }
 
+function Remove-ExistingServiceRegistration {
+    $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+    if ($null -eq $service) {
+        return
+    }
+
+    Write-InstallLog "Removing the existing Windows service registration."
+    & sc.exe delete $serviceName | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not remove the existing Windows service registration. Exit code: $LASTEXITCODE."
+    }
+
+    $service = $null
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ($null -eq (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
+            return
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    throw "Windows did not release the previous service registration within 30 seconds. Restart Windows and run setup again."
+}
+
 function Wait-ForHealth {
     $deadline = [DateTime]::UtcNow.AddSeconds(60)
     $lastError = ""
@@ -212,30 +239,15 @@ try {
     )
 
     Wait-ForServiceStop
-    $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+    Remove-ExistingServiceRegistration
     $serviceCommand = "`"$BinaryPath`" --service"
-    if ($null -eq $service) {
-        Write-InstallLog "Registering the Windows service."
-        & sc.exe create $serviceName `
-            "binPath=" $serviceCommand `
-            "start=" "auto" `
-            "DisplayName=" "Tome Training Server" | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            throw "Could not register the Windows service. Exit code: $LASTEXITCODE."
-        }
-    }
-    else {
-        Write-InstallLog "Updating the existing Windows service."
-        & sc.exe config $serviceName `
-            "binPath=" $serviceCommand `
-            "start=" "auto" `
-            "DisplayName=" "Tome Training Server" | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            throw "Could not update the Windows service. Exit code: $LASTEXITCODE."
-        }
-    }
-    & sc.exe description $serviceName `
-        "Receives Tome datasets, manages AI training jobs, and registers completed models with Ollama." |
+    Write-InstallLog "Registering the Windows service."
+    New-Service `
+        -Name $serviceName `
+        -BinaryPathName $serviceCommand `
+        -DisplayName "Tome Training Server" `
+        -Description "Receives Tome datasets, manages AI training jobs, and registers completed models with Ollama." `
+        -StartupType Automatic |
         Out-Null
     & sc.exe failure $serviceName `
         "reset=" "86400" `
