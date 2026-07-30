@@ -82,6 +82,7 @@ pub fn run() {
             interface::commands::training::refresh_training_job,
             interface::commands::training::cancel_training_job,
             interface::commands::training::retry_training_job,
+            interface::commands::training::retry_training_registration,
             interface::commands::training::list_training_logs,
             interface::commands::training::refresh_training_resources,
             interface::commands::training::get_training_resources

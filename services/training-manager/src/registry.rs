@@ -88,6 +88,8 @@ pub async fn register_adapter(
     let output = Command::new(&config.ollama_executable)
         .arg("create")
         .arg(&job.model)
+        .arg("--file")
+        .arg(&modelfile)
         .current_dir(job_dir)
         .output()
         .await
@@ -98,12 +100,44 @@ pub async fn register_adapter(
             ))
         })?;
     if !output.status.success() {
+        let stderr = clean_terminal_output(&String::from_utf8_lossy(&output.stderr));
+        let stdout = clean_terminal_output(&String::from_utf8_lossy(&output.stdout));
+        let detail = if stderr.is_empty() { stdout } else { stderr };
         return Err(ApiError::internal(format!(
             "Ollama model registration failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            if detail.is_empty() {
+                format!(
+                    "{} exited with {}",
+                    config.ollama_executable.display(),
+                    output.status
+                )
+            } else {
+                detail
+            }
         )));
     }
     verify_registered(config, &job.model).await
+}
+
+fn clean_terminal_output(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '\u{1b}' {
+            if character != '\r' {
+                output.push(character);
+            }
+            continue;
+        }
+        if characters.next_if_eq(&'[').is_some() {
+            for value in characters.by_ref() {
+                if ('@'..='~').contains(&value) {
+                    break;
+                }
+            }
+        }
+    }
+    output.trim().to_string()
 }
 
 fn adapter_reference(adapter_path: &Path, job_dir: &Path) -> String {
@@ -169,7 +203,10 @@ fn validate_model_name(value: &str) -> ApiResult<()> {
 mod tests {
     use std::path::Path;
 
-    use super::{adapter_reference, validate_adapter_compatibility, validate_model_name};
+    use super::{
+        adapter_reference, clean_terminal_output, validate_adapter_compatibility,
+        validate_model_name,
+    };
 
     #[test]
     fn uses_a_modelfile_relative_adapter_reference_when_possible() {
@@ -194,6 +231,17 @@ mod tests {
         assert!(validate_model_name("team/model-name:latest").is_ok());
         assert!(validate_model_name("model; shutdown").is_err());
         assert!(validate_model_name("").is_err());
+    }
+
+    #[test]
+    fn removes_ollama_terminal_control_sequences_from_errors() {
+        assert_eq!(
+            clean_terminal_output(
+                "\u{1b}[?2026h\u{1b}[?25l\u{1b}[1GGathering model components\r\n\
+                 Error: no Modelfile or safetensors files found\u{1b}[?25h"
+            ),
+            "Gathering model components\nError: no Modelfile or safetensors files found"
+        );
     }
 
     #[test]

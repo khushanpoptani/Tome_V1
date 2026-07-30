@@ -1288,13 +1288,17 @@ export function TrainingPage(): React.JSX.Element {
       action,
       id,
     }: {
-      readonly action: "cancel" | "delete" | "dispatch" | "refresh" | "retry";
+      readonly action:
+        "cancel" | "delete" | "dispatch" | "refresh" | "retry" | "retry-registration";
       readonly id: string;
     }) => {
       if (action === "cancel") return backend.cancelTrainingJob(id);
       if (action === "delete") return backend.deleteTrainingJob(id);
       if (action === "dispatch") return backend.dispatchTrainingJob(id);
       if (action === "refresh") return backend.refreshTrainingJob(id);
+      if (action === "retry-registration") {
+        return backend.retryTrainingRegistration(id);
+      }
       return backend.retryTrainingJob(id);
     },
     onError: (error, value) => {
@@ -4173,14 +4177,15 @@ function JobCard({
   readonly datasets: readonly TrainingDatasetRecord[];
   readonly job: TrainingJobRecord;
   readonly onAction: (
-    action: "cancel" | "delete" | "dispatch" | "refresh" | "retry",
+    action: "cancel" | "delete" | "dispatch" | "refresh" | "retry" | "retry-registration",
   ) => void;
   readonly onCheckReadiness: () => void;
   readonly onRequestDelete: () => void;
   readonly onReviewDatasets: () => void;
   readonly onUseOpenBase: () => void;
   readonly onViewLogs: () => void;
-  readonly pendingAction: "cancel" | "delete" | "dispatch" | "refresh" | "retry" | null;
+  readonly pendingAction:
+    "cancel" | "delete" | "dispatch" | "refresh" | "retry" | "retry-registration" | null;
 }): React.JSX.Element {
   const active = ["queued", "running", "paused", "cancelling", "unreachable"].includes(
     job.status,
@@ -4201,6 +4206,11 @@ function JobCard({
   const needsOpenBaseRepair =
     job.status === "failed" &&
     job.error?.includes("Automatic open-base training is not available") === true;
+  const canRetryRegistration =
+    job.status === "failed" &&
+    job.remoteJobId !== null &&
+    job.progress >= 97 &&
+    job.error?.includes("Ollama model registration failed") === true;
   return (
     <Card className="p-4">
       <div className="flex flex-wrap items-start gap-3">
@@ -4266,7 +4276,17 @@ function JobCard({
               </Button>
             </>
           ) : null}
-          {["failed", "cancelled"].includes(job.status) && job.remoteJobId !== null ? (
+          {canRetryRegistration ? (
+            <Button
+              disabled={pendingAction !== null}
+              onClick={() => onAction("retry-registration")}
+              size="sm"
+              variant="outline"
+            >
+              <RotateCcw className="size-3" />
+              Retry registration
+            </Button>
+          ) : ["failed", "cancelled"].includes(job.status) && job.remoteJobId !== null ? (
             <Button
               disabled={pendingAction !== null}
               onClick={() => onAction("retry")}

@@ -144,6 +144,71 @@ pub async fn retry_job(
     ))
 }
 
+pub async fn retry_registration(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<JobSnapshot>> {
+    let job = state.database.job_record(&id)?;
+    let snapshot = state.database.job_snapshot(&id)?;
+    if job.status != "failed" || snapshot.progress < 97.0 {
+        return Err(ApiError::conflict(
+            "Registration can only be retried for a failed job whose training artifacts were exported",
+        ));
+    }
+    let job_dir = state.config.data_dir.join("jobs").join(&id);
+    let adapter_path = job_dir.join("output");
+    if !adapter_path.join("adapter_config.json").is_file()
+        || !adapter_path.join("adapter_model.safetensors").is_file()
+    {
+        return Err(ApiError::conflict(format!(
+            "The trained adapter artifacts are incomplete at {}. Run a full training retry.",
+            adapter_path.display()
+        )));
+    }
+    state.database.update_job(
+        &id,
+        "running",
+        "Registering with Ollama",
+        98.0,
+        None,
+        Some(job.total_epochs),
+        snapshot.loss,
+        snapshot.learning_rate,
+        snapshot.training_speed,
+        None,
+        None,
+    )?;
+    append_log(
+        &state,
+        &id,
+        "info",
+        "Retrying Ollama registration with the existing trained adapter",
+    )?;
+    emit_job(&state, &id)?;
+    if let Err(error) =
+        registry::register_adapter(&state.config, &job, &adapter_path, &job_dir).await
+    {
+        state.database.update_job(
+            &id,
+            "failed",
+            "Registration failed",
+            98.0,
+            None,
+            Some(job.total_epochs),
+            snapshot.loss,
+            snapshot.learning_rate,
+            snapshot.training_speed,
+            None,
+            Some(&error.message),
+        )?;
+        append_log(&state, &id, "error", &error.message)?;
+        emit_job(&state, &id)?;
+        return Err(error);
+    }
+    complete_registration(&state, &job).await?;
+    Ok(Json(state.database.job_snapshot(&id)?))
+}
+
 pub async fn get_logs(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -343,6 +408,14 @@ async fn run_job(state: Arc<AppState>, id: &str) -> ApiResult<()> {
     )?;
     emit_job(&state, id)?;
     registry::register_adapter(&state.config, &job, &adapter_path, &job_dir).await?;
+    complete_registration(&state, &job).await
+}
+
+async fn complete_registration(
+    state: &AppState,
+    job: &crate::database::JobRecord,
+) -> ApiResult<()> {
+    let id = &job.id;
     state.database.mark_registered(id, &job.model)?;
     state.database.update_job(
         id,
@@ -358,16 +431,16 @@ async fn run_job(state: Arc<AppState>, id: &str) -> ApiResult<()> {
         None,
     )?;
     append_log(
-        &state,
+        state,
         id,
         "info",
         &format!("Model {} registered with Ollama", job.model),
     )?;
     let _ = state.events.send(ServerEvent::ModelRegistered {
         job_id: id.to_string(),
-        model: job.model,
+        model: job.model.clone(),
     });
-    emit_job(&state, id)?;
+    emit_job(state, id)?;
     Ok(())
 }
 

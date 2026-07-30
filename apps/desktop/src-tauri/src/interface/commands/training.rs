@@ -3412,6 +3412,39 @@ pub async fn retry_training_job(
 }
 
 #[tauri::command]
+pub async fn retry_training_registration(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<TrainingJobRecord, String> {
+    let job = list_training_jobs(state.clone())?
+        .into_iter()
+        .find(|job| job.id == id)
+        .ok_or_else(|| "The selected training job no longer exists".to_string())?;
+    if job.status != "failed" {
+        return Err("Only failed training jobs can retry model registration".into());
+    }
+    let remote_id = job
+        .remote_job_id
+        .clone()
+        .ok_or_else(|| "The failed job has no remote identifier".to_string())?;
+    let server = active_training_server(state.clone(), job.training_server_id.as_deref())?;
+    let response = state
+        .http
+        .post(api_url(
+            &server.url,
+            &format!("/v1/jobs/{remote_id}/retry-registration"),
+        ))
+        .header("Idempotency-Key", format!("{}:retry-registration", job.id))
+        .send()
+        .await
+        .map_err(|error| format!("Could not retry Ollama model registration: {error}"))?;
+    if !response.status().is_success() {
+        return Err(response_failure(response, "Retrying model registration").await);
+    }
+    refresh_training_job(state, id).await
+}
+
+#[tauri::command]
 pub fn list_training_logs(
     state: State<'_, AppState>,
     training_job_id: Option<String>,

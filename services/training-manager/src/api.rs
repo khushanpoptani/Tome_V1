@@ -101,6 +101,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/jobs/{id}", get(jobs::get_job))
         .route("/v1/jobs/{id}/cancel", post(jobs::cancel_job))
         .route("/v1/jobs/{id}/retry", post(jobs::retry_job))
+        .route(
+            "/v1/jobs/{id}/retry-registration",
+            post(jobs::retry_registration),
+        )
         .route("/v1/jobs/{id}/logs", get(jobs::get_logs))
         .route("/v1/admin/database/reset", post(reset_database))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))

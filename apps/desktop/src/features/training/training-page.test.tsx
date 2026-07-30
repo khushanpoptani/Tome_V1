@@ -184,6 +184,32 @@ describe("Training deletion confirmations", () => {
 });
 
 describe("Training readiness", () => {
+  it("retries only Ollama registration when trained artifacts already exist", async () => {
+    const failedRegistration: TrainingJobRecord = {
+      ...job,
+      error:
+        "Ollama model registration failed: Error: no Modelfile or safetensors files found",
+      progress: 98,
+      remoteJobId: "remote-planning-job",
+      stage: "Failed",
+      status: "failed",
+      trainingServerId: server.id,
+    };
+    const retryRegistration = vi
+      .spyOn(backend, "retryTrainingRegistration")
+      .mockResolvedValue({ ...failedRegistration, progress: 100, status: "completed" });
+    const retryTraining = vi.spyOn(backend, "retryTrainingJob");
+    renderTrainingPage([dataset], [failedRegistration]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Training Jobs" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry registration" }));
+
+    await waitFor(() =>
+      expect(retryRegistration).toHaveBeenCalledWith(failedRegistration.id),
+    );
+    expect(retryTraining).not.toHaveBeenCalled();
+  });
+
   it("checks the worker and source model before training is dispatched", async () => {
     const preflight = vi.spyOn(backend, "preflightTrainingJob").mockResolvedValue({
       checks: [

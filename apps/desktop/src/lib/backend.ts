@@ -171,6 +171,8 @@ export const backend = {
     command<TrainingJobRecord>("cancel_training_job", { id }),
   retryTrainingJob: (id: string) =>
     command<TrainingJobRecord>("retry_training_job", { id }),
+  retryTrainingRegistration: (id: string) =>
+    command<TrainingJobRecord>("retry_training_registration", { id }),
   listTrainingLogs: (trainingJobId?: string, limit = 500) =>
     command<TrainingLogRecord[]>("list_training_logs", { trainingJobId, limit }),
   refreshTrainingResources: (trainingServerId: string) =>
