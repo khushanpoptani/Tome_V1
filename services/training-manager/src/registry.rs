@@ -78,7 +78,8 @@ pub async fn register_adapter(
             adapter_path.display()
         )));
     }
-    let adapter = adapter_reference(adapter_path, job_dir);
+    let staged_adapter = stage_adapter_for_ollama(adapter_path, job_dir).await?;
+    let adapter = adapter_reference(&staged_adapter, job_dir);
     let modelfile = job_dir.join("Modelfile");
     fs::write(
         &modelfile,
@@ -117,6 +118,40 @@ pub async fn register_adapter(
         )));
     }
     verify_registered(config, &job.model).await
+}
+
+async fn stage_adapter_for_ollama(
+    adapter_path: &Path,
+    job_dir: &Path,
+) -> ApiResult<std::path::PathBuf> {
+    let source_weights = adapter_path.join("adapter_model.safetensors");
+    let source_config = adapter_path.join("adapter_config.json");
+    for source in [&source_weights, &source_config] {
+        if !source.is_file() {
+            return Err(ApiError::internal(format!(
+                "Training adapter is missing required artifact {}",
+                source.display()
+            )));
+        }
+    }
+
+    // Ollama 0.32.x discovers `model*.safetensors`, while PEFT exports
+    // `adapter_model.safetensors`. Stage compatible names without modifying the
+    // original worker output so registration can be retried safely.
+    let staged = job_dir.join("ollama-adapter");
+    if staged.exists() {
+        fs::remove_dir_all(&staged).await?;
+    }
+    fs::create_dir_all(&staged).await?;
+    fs::copy(&source_config, staged.join("adapter_config.json")).await?;
+    let staged_weights = staged.join("model.safetensors");
+    if fs::hard_link(&source_weights, &staged_weights)
+        .await
+        .is_err()
+    {
+        fs::copy(&source_weights, &staged_weights).await?;
+    }
+    Ok(staged)
 }
 
 fn clean_terminal_output(value: &str) -> String {
@@ -204,8 +239,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        adapter_reference, clean_terminal_output, validate_adapter_compatibility,
-        validate_model_name,
+        adapter_reference, clean_terminal_output, stage_adapter_for_ollama,
+        validate_adapter_compatibility, validate_model_name,
     };
 
     #[test]
@@ -242,6 +277,28 @@ mod tests {
             ),
             "Gathering model components\nError: no Modelfile or safetensors files found"
         );
+    }
+
+    #[tokio::test]
+    async fn stages_peft_weights_under_the_name_ollama_discovers() {
+        let root = std::env::temp_dir().join(format!("tome-registry-{}", uuid::Uuid::new_v4()));
+        let adapter = root.join("output");
+        std::fs::create_dir_all(&adapter).expect("adapter directory");
+        std::fs::write(adapter.join("adapter_config.json"), b"{}").expect("adapter config");
+        std::fs::write(adapter.join("adapter_model.safetensors"), b"adapter")
+            .expect("adapter weights");
+
+        let staged = stage_adapter_for_ollama(&adapter, &root)
+            .await
+            .expect("staged adapter");
+
+        assert_eq!(
+            std::fs::read(staged.join("model.safetensors")).expect("staged weights"),
+            b"adapter"
+        );
+        assert!(staged.join("adapter_config.json").is_file());
+        assert!(!staged.join("adapter_model.safetensors").exists());
+        std::fs::remove_dir_all(root).expect("temporary registry directory");
     }
 
     #[test]
