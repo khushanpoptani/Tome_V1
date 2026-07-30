@@ -2850,6 +2850,18 @@ pub fn save_training_job(
     {
         return Err("Training parameters must include a non-empty sourceModel".into());
     }
+    if let Some(system_prompt) = parameters["systemPrompt"].as_str() {
+        if system_prompt.chars().count() > 16_000 {
+            return Err("System prompt cannot exceed 16,000 characters".into());
+        }
+        if system_prompt.contains("\"\"\"") {
+            return Err(
+                "System prompt cannot contain three consecutive double-quote characters".into(),
+            );
+        }
+    } else if !parameters["systemPrompt"].is_null() {
+        return Err("systemPrompt must be a string".into());
+    }
     validate_open_training_pair(input.base_model.trim(), &parameters)?;
     if input.total_epochs < 1 {
         return Err("Training epochs must be at least 1".into());

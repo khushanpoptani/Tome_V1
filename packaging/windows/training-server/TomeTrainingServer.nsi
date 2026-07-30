@@ -5,7 +5,7 @@ Unicode True
 !include "x64.nsh"
 
 !ifndef APP_VERSION
-  !define APP_VERSION "0.1.20"
+  !define APP_VERSION "0.1.21"
 !endif
 
 !ifndef PYTHON_VERSION

@@ -1,4 +1,5 @@
 import { EmptyState, inputClassName, Modal, PageHeader } from "@/components/common/page";
+import { PathPickerInput } from "@/components/common/path-picker-input";
 import { backend, isTauriRuntime } from "@/lib/backend";
 import { errorMessage, formatDate } from "@/lib/format";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -264,19 +265,24 @@ export function ProjectsPage(): React.JSX.Element {
                 value={form.name}
               />
             </label>
-            <label className="block space-y-1.5 text-xs">
+            <div className="block space-y-1.5 text-xs">
               <span>Directory path</span>
-              <input
-                className={inputClassName}
+              <PathPickerInput
+                ariaLabel="Project directory path"
                 disabled={form.id !== undefined}
-                onChange={(event) => {
-                  setForm({ ...form, path: event.target.value });
+                kind="directory"
+                onChange={(path) => {
+                  const name =
+                    form.name.trim() === ""
+                      ? (path.split(/[\\/]/).filter(Boolean).at(-1) ?? form.name)
+                      : form.name;
+                  setForm({ ...form, name, path });
                 }}
                 placeholder="/Users/you/Projects/my-project"
                 required
                 value={form.path}
               />
-            </label>
+            </div>
             <p className="text-[10px] text-muted-foreground">
               {form.createDirectory
                 ? "Tome will create the directory if it does not exist."

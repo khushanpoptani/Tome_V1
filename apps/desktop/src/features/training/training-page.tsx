@@ -5,6 +5,7 @@ import {
   PageHeader,
   textAreaClassName,
 } from "@/components/common/page";
+import { PathPickerInput } from "@/components/common/path-picker-input";
 import {
   backend,
   deleteTrainingDataset,
@@ -451,6 +452,7 @@ function createOpenBaseJobForm(
     parametersJson: JSON.stringify(
       {
         sourceModel: profile.sourceModel,
+        systemPrompt: "",
         trainingRecipe: "open-base-lora",
         ollamaAdapterArchitecture: profile.architecture,
         learningRate: 0.0002,
@@ -3562,18 +3564,24 @@ export function TrainingPage(): React.JSX.Element {
                 for training in one action.
               </FieldHelp>
             </label>
-            <label className="block space-y-1.5 text-xs">
+            <div className="block space-y-1.5 text-xs">
               <span>Local file or directory path</span>
-              <input
-                className={inputClassName}
-                onChange={(event) =>
-                  setDatasetForm({ ...datasetForm, sourcePath: event.target.value })
-                }
+              <PathPickerInput
+                ariaLabel="Local file or directory path"
+                kind="file-or-directory"
+                onChange={(sourcePath) => {
+                  const name =
+                    datasetForm.name.trim() === ""
+                      ? (sourcePath.split(/[\\/]/).filter(Boolean).at(-1) ??
+                        datasetForm.name)
+                      : datasetForm.name;
+                  setDatasetForm({ ...datasetForm, name, sourcePath });
+                }}
                 placeholder="/Users/me/datasets/instructions.jsonl"
                 required
                 value={datasetForm.sourcePath}
               />
-            </label>
+            </div>
             <label className="block space-y-1.5 text-xs">
               <span>Allowed extensions (comma separated)</span>
               <input
@@ -4089,6 +4097,30 @@ export function TrainingPage(): React.JSX.Element {
                 </FieldHelp>
               </label>
             </div>
+            <label className="block space-y-1.5 text-xs">
+              <span>System prompt</span>
+              <textarea
+                aria-label="System prompt"
+                className={`${textAreaClassName} min-h-28`}
+                maxLength={16_000}
+                onChange={(event) =>
+                  setJobForm({
+                    ...jobForm,
+                    parametersJson: writeJobParameter(
+                      jobForm.parametersJson,
+                      "systemPrompt",
+                      event.target.value,
+                    ),
+                  })
+                }
+                placeholder="Define the model's role, behavior, constraints, and preferred response style."
+                value={readJobParameter(jobForm.parametersJson, "systemPrompt")}
+              />
+              <FieldHelp>
+                Saved into the generated Ollama model as its default SYSTEM instruction.
+                It applies automatically whenever this trained model is used.
+              </FieldHelp>
+            </label>
             <label className="block space-y-1.5 text-xs">
               <span>Training parameters (JSON)</span>
               <textarea

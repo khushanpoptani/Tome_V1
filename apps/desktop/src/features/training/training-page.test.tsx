@@ -321,6 +321,11 @@ describe("Training readiness", () => {
         }),
       },
     });
+    fireEvent.change(within(dialog).getByLabelText("System prompt"), {
+      target: {
+        value: "You are Tome's planning agent. Return concise, actionable plans.",
+      },
+    });
     fireEvent.click(within(dialog).getByRole("button", { name: "Save draft" }));
 
     await waitFor(() => expect(save).toHaveBeenCalled());
@@ -329,6 +334,7 @@ describe("Training readiness", () => {
     expect(JSON.parse(input?.parametersJson ?? "{}")).toMatchObject({
       ollamaAdapterArchitecture: "llama",
       sourceModel: "TinyLlama/TinyLlama-1.1B-Chat-v0.6",
+      systemPrompt: "You are Tome's planning agent. Return concise, actionable plans.",
       trainingRecipe: "open-base-lora",
     });
   });

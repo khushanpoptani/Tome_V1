@@ -9,6 +9,30 @@ use crate::{
 };
 
 const OLLAMA_ADAPTER_ARCHITECTURES: &[&str] = &["llama", "mistral", "mixtral", "gemma"];
+const MAX_SYSTEM_PROMPT_CHARACTERS: usize = 16_000;
+
+pub fn validate_system_prompt(parameters: &serde_json::Value) -> ApiResult<()> {
+    let Some(value) = parameters.get("systemPrompt") else {
+        return Ok(());
+    };
+    if value.is_null() {
+        return Ok(());
+    }
+    let prompt = value
+        .as_str()
+        .ok_or_else(|| ApiError::invalid("systemPrompt must be a string"))?;
+    if prompt.chars().count() > MAX_SYSTEM_PROMPT_CHARACTERS {
+        return Err(ApiError::invalid(format!(
+            "System prompt cannot exceed {MAX_SYSTEM_PROMPT_CHARACTERS} characters"
+        )));
+    }
+    if prompt.contains("\"\"\"") {
+        return Err(ApiError::invalid(
+            "System prompt cannot contain three consecutive double-quote characters",
+        ));
+    }
+    Ok(())
+}
 
 pub fn validate_adapter_compatibility(
     base_model: &str,
@@ -72,6 +96,7 @@ pub async fn register_adapter(
 ) -> ApiResult<()> {
     validate_model_name(&job.model)?;
     validate_model_name(&job.base_model)?;
+    validate_system_prompt(&job.parameters)?;
     if !adapter_path.is_dir() {
         return Err(ApiError::internal(format!(
             "Training completed without an adapter directory at {}",
@@ -81,11 +106,7 @@ pub async fn register_adapter(
     let staged_adapter = stage_adapter_for_ollama(adapter_path, job_dir).await?;
     let adapter = adapter_reference(&staged_adapter, job_dir);
     let modelfile = job_dir.join("Modelfile");
-    fs::write(
-        &modelfile,
-        format!("FROM {}\nADAPTER \"{}\"\n", job.base_model, adapter),
-    )
-    .await?;
+    fs::write(&modelfile, render_modelfile(job, &adapter)?).await?;
     let output = Command::new(&config.ollama_executable)
         .arg("create")
         .arg(&job.model)
@@ -118,6 +139,21 @@ pub async fn register_adapter(
         )));
     }
     verify_registered(config, &job.model).await
+}
+
+fn render_modelfile(job: &JobRecord, adapter: &str) -> ApiResult<String> {
+    validate_system_prompt(&job.parameters)?;
+    let mut content = format!("FROM {}\nADAPTER \"{}\"\n", job.base_model, adapter);
+    if let Some(prompt) = job.parameters["systemPrompt"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        content.push_str("SYSTEM \"\"\"\n");
+        content.push_str(&prompt.replace("\r\n", "\n"));
+        content.push_str("\n\"\"\"\n");
+    }
+    Ok(content)
 }
 
 async fn stage_adapter_for_ollama(
@@ -239,9 +275,10 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        adapter_reference, clean_terminal_output, stage_adapter_for_ollama,
-        validate_adapter_compatibility, validate_model_name,
+        adapter_reference, clean_terminal_output, render_modelfile, stage_adapter_for_ollama,
+        validate_adapter_compatibility, validate_model_name, validate_system_prompt,
     };
+    use crate::database::JobRecord;
 
     #[test]
     fn uses_a_modelfile_relative_adapter_reference_when_possible() {
@@ -266,6 +303,42 @@ mod tests {
         assert!(validate_model_name("team/model-name:latest").is_ok());
         assert!(validate_model_name("model; shutdown").is_err());
         assert!(validate_model_name("").is_err());
+    }
+
+    #[test]
+    fn writes_the_system_prompt_into_the_registered_ollama_model() {
+        let mut job = JobRecord {
+            id: "job-1".into(),
+            client_job_id: "client-job-1".into(),
+            dataset_id: "dataset-1".into(),
+            dataset_ids: vec!["dataset-1".into()],
+            model: "planning-agent:v1".into(),
+            base_model: "tinyllama:latest".into(),
+            backend: "auto".into(),
+            parameters: serde_json::json!({
+                "systemPrompt": "You are Tome's planning agent.\nReturn actionable plans."
+            }),
+            status: "completed".into(),
+            total_epochs: 1,
+        };
+        let rendered = render_modelfile(&job, "./ollama-adapter").expect("Modelfile");
+        assert!(rendered.contains(
+            "SYSTEM \"\"\"\nYou are Tome's planning agent.\nReturn actionable plans.\n\"\"\""
+        ));
+
+        job.parameters = serde_json::json!({"systemPrompt": ""});
+        assert!(!render_modelfile(&job, "./ollama-adapter")
+            .expect("Modelfile without system prompt")
+            .contains("SYSTEM"));
+    }
+
+    #[test]
+    fn rejects_a_system_prompt_that_can_terminate_the_modelfile_block() {
+        let error = validate_system_prompt(&serde_json::json!({
+            "systemPrompt": "Unsafe \"\"\" content"
+        }))
+        .expect_err("triple quotes must be rejected");
+        assert!(error.message.contains("three consecutive"));
     }
 
     #[test]

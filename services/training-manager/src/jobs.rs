@@ -42,6 +42,7 @@ pub async fn create_job(
             "huggingFaceToken is a secret and must be supplied through the training preflight endpoint",
         ));
     }
+    registry::validate_system_prompt(&request.parameters)?;
     registry::validate_adapter_compatibility(&request.base_model, &request.parameters)?;
     let (job, inserted) = state.database.create_job(&request)?;
     if inserted {
