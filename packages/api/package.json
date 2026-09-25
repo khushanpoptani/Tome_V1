@@ -11,9 +11,9 @@
   },
   "dependencies": {
     "@tome/types": "workspace:*",
-    "zod": "^4.0.10"
+    "zod": "^4.6.5"
   },
   "devDependencies": {
-    "typescript": "^5.8.3"
+    "typescript": "^7.0.2"
   }
 }
