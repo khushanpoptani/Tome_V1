@@ -48,7 +48,7 @@ jobs:
               .\target\release\bundle\windows-training-server\SHA256SUMS.txt
 
       - name: Upload installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: Tome-Windows-Training-Server
           path: |
